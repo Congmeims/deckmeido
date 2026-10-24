@@ -4,10 +4,10 @@
 [server]
 host = "0.0.0.0"
 port = 18765
-# 访问令牌：留空则首次启动自动生成（5 位数字+字母）
+# 访问令牌：首次启动默认 meido
 # 也可以在网页「设置」里随机生成或自定义，保存后立即生效
 # 局域网访问地址: http://<deck-ip>:18765/?token=<token>
-token = ""
+token = "meido"
 
 [llm]
 # OpenAI 兼容接口，可切换 GPT / Claude(代理) / DeepSeek / Qwen / LM Studio 等

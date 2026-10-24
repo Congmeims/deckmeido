@@ -21,7 +21,6 @@ PORT="${DECKMEIDO_PORT:-18765}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UNIT="deckmeido.service"
-MDNS_UNIT="deckmeido-mdns.service"
 DESKTOP_DIR="$HOME/.local/share/applications"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -126,25 +125,11 @@ install_service() {
   sed "s|%h/deckmeido|$INSTALL_DIR|g; s|--port 18765|--port $PORT|g" \
     "$INSTALL_DIR/deploy/$UNIT" > "$UNIT_DIR/$UNIT"
   systemctl --user daemon-reload
-  systemctl --user enable --now "$UNIT" >/dev/null 2>&1 ||
-    systemctl --user restart "$UNIT"
+  # 必须先 enable 再 restart：服务已在跑时 `enable --now` 不会重新拉起进程，
+  # 升级后还在跑旧代码
+  systemctl --user enable "$UNIT" >/dev/null 2>&1 || true
+  systemctl --user restart "$UNIT"
   dim "用户服务已启用：systemctl --user status $UNIT"
-}
-
-# mDNS：让局域网设备用 deckmeido.local 访问，省得记 IP（需要 zeroconf，装失败就跳过）
-install_mdns() {
-  need_cmd systemctl || return 0
-  if ! "$INSTALL_DIR/.venv/bin/python" -c "import zeroconf" >/dev/null 2>&1; then
-    warn "没有 zeroconf，跳过 deckmeido.local 域名（不影响 IP 访问）"
-    return 0
-  fi
-  mkdir -p "$UNIT_DIR"
-  sed "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
-    "$INSTALL_DIR/deploy/$MDNS_UNIT" > "$UNIT_DIR/$MDNS_UNIT"
-  systemctl --user daemon-reload
-  systemctl --user enable --now "$MDNS_UNIT" >/dev/null 2>&1 ||
-    systemctl --user restart "$MDNS_UNIT"
-  dim "局域网域名已启用：http://deckmeido.local:$PORT"
 }
 
 install_desktop() {
@@ -172,18 +157,41 @@ wait_ready() {
 }
 
 lan_ip() {
-  # 复用 mdns_publish.py 里的网卡选择逻辑，避免拿到代理虚拟网卡（198.18.x.x）
-  "$INSTALL_DIR/.venv/bin/python" - "$INSTALL_DIR" <<'PY' 2>/dev/null || true
-import sys, types
-from pathlib import Path
+  # 优先挑私有网段的物理网卡：开了 Clash 等代理后，默认路由出口会是
+  # 198.18.x.x 的虚拟地址，别的设备连不上
+  "$INSTALL_DIR/.venv/bin/python" - <<'PY' 2>/dev/null || true
+import socket
 
-root = Path(sys.argv[1])
-src = (root / "deploy" / "mdns_publish.py").read_text(encoding="utf-8")
-# 只执行到 lan_ip 定义为止，不触发实际的 zeroconf 注册
-code = src.split("\nip = lan_ip()")[0]
-mod = types.ModuleType("mdns")
-exec(compile(code, "mdns_publish.py", "exec"), mod.__dict__)
-print(mod.lan_ip())
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+best = None
+if psutil:
+    for name, addrs in psutil.net_if_addrs().items():
+        low = name.lower()
+        if any(k in low for k in ("meta", "tun", "tap", "docker", "veth",
+                                  "br-", "virbr", "vmnet", "wg", "zt")):
+            continue
+        for a in addrs:
+            if a.family != socket.AF_INET or not a.address:
+                continue
+            ip = a.address
+            if ip.startswith(("192.168.", "10.")) or ip.startswith("172."):
+                rank = 0 if low.startswith(("wlan", "wlp", "wl")) else 1
+                if best is None or rank < best[0]:
+                    best = (rank, ip)
+
+if best:
+    print(best[1])
+else:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        print(s.getsockname()[0])
+    finally:
+        s.close()
 PY
 }
 
@@ -211,7 +219,6 @@ do_install() {
   venv_install
   prepare_config
   install_service
-  install_mdns
   install_desktop
   system_notes
   if need_cmd curl && wait_ready; then
@@ -227,7 +234,6 @@ do_upgrade() {
   sync_files
   venv_install
   install_service
-  install_mdns
   install_desktop
   if need_cmd curl && wait_ready; then
     print_done
@@ -242,9 +248,8 @@ do_uninstall() {
   check_user
   if need_cmd systemctl; then
     info "停止并移除用户服务"
-    systemctl --user disable --now "$MDNS_UNIT" >/dev/null 2>&1 || true
     systemctl --user disable --now "$UNIT" >/dev/null 2>&1 || true
-    rm -f "$UNIT_DIR/$UNIT" "$UNIT_DIR/$MDNS_UNIT"
+    rm -f "$UNIT_DIR/$UNIT"
     systemctl --user daemon-reload || true
   fi
   rm -f "$DESKTOP_DIR/DeckMeido.desktop"

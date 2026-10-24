@@ -121,7 +121,7 @@ git clone https://github.com/Congmeims/deckmeido.git
 cd deckmeido && bash install.sh
 ```
 
-脚本会：建虚拟环境 → 装依赖（含 PySide6）→ 生成配置 → 注册 `deckmeido.service` 用户服务并开机自启 → 启用 `deckmeido.local` 局域网域名 → 装好应用菜单快捷方式，最后打印带令牌的访问地址。
+脚本会：建虚拟环境 → 装依赖（含 PySide6）→ 生成配置 → 注册 `deckmeido.service` 用户服务并开机自启 → 装好应用菜单快捷方式，最后打印带令牌的访问地址。
 
 **不要用 `sudo` / root 执行。** 程序装到当前用户家目录（默认 `~/deckmeido`）、服务注册在用户级别，用 root 装会落到 `/root` 下，桌面会话里起不来。脚本检测到 root 会直接退出。
 
@@ -143,9 +143,9 @@ bash install.sh uninstall --purge   # 连配置与工作区一起删
 
 ### 第一次使用
 
-1. 打开 `http://<deck-ip>:18765/?token=<令牌>`（安装脚本会把完整地址打出来；同一局域网也可以直接用 `http://deckmeido.local:18765/`）
+1. 打开 `http://<deck-ip>:18765/?token=meido`（安装脚本会把完整地址打出来；默认令牌 `meido`）
 2. 首次连接会自动弹出设置页——填 **API 地址** 与 **Key**，保存即可开始对话；不配也能进，只是对话不可用
-3. 设置页里可以「随机生成」或自定义访问令牌（5 位字母数字，校验不分大小写，保存后立即生效）
+3. 设置页里可以「随机生成」或自定义访问令牌（4-32 位字母数字，校验不分大小写，保存后立即生效）
 4. 想用手机连？点设置页里的「二维码」，手机扫码直接带令牌进入
 
 不跑脚本时的手动启动方式：
@@ -159,7 +159,7 @@ bash install.sh uninstall --purge   # 连配置与工作区一起删
 
 | 段落 | 键 | 说明 |
 | --- | --- | --- |
-| `[server]` | `port` / `token` | 监听端口；访问令牌，留空自动生成（5 位字母数字） |
+| `[server]` | `port` / `token` | 监听端口；访问令牌，默认 `meido`，留空则自动生成 |
 | `[llm]` | `base_url` / `api_key` / `model` | OpenAI 兼容接口 |
 | | `reasoning_effort` | `low` / `medium` / `high`，留空则不发送 |
 | `[agent]` | `max_tool_rounds` | 单轮最多连续调用工具次数，默认 12 |
@@ -181,9 +181,6 @@ deckmeido/
 ├── client/main.py             PySide6 原生客户端（含托盘）
 ├── deploy/
 │   ├── deckmeido.service      systemd 用户服务（后端）
-│   ├── deckmeido-mdns.service systemd 用户服务（deckmeido.local 域名）
-│   ├── mdns_publish.py        mDNS 发布，自动跳过代理虚拟网卡
-│   ├── setup_https.sh         可选：mkcert 生成局域网 HTTPS 证书
 │   └── DeckMeido.desktop      桌面快捷方式模板
 ├── server/
 │   ├── main.py                FastAPI 服务、会话、approval、遮罩调度

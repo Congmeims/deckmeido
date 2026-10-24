@@ -8,7 +8,6 @@ pillow
 python-multipart
 psutil        # 系统信息（/api/sysinfo）
 qrcode        # 设置页扫码连接（/api/qrcode）
-zeroconf      # 局域网域名 deckmeido.local（deploy/mdns_publish.py）
 
 # PySide6：遮罩层（overlay.py）与原生客户端都依赖，install.sh 默认安装
 PySide6

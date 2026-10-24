@@ -43,11 +43,11 @@ def load_config() -> dict:
     if not CONFIG_PATH.exists():
         shutil.copy(BASE_DIR / "config.example.toml", CONFIG_PATH)
     cfg = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    # token 为空则生成并写回配置文件，方便用户查看
+    # token 留空（用户手动清空）时补一个，并写回配置文件方便查看
     if not cfg["server"].get("token"):
         token = gen_token()
         text = CONFIG_PATH.read_text(encoding="utf-8")
-        text = text.replace('token = ""', f'token = "{token}"', 1)
+        text = re.sub(r'^token\s*=\s*""', f'token = "{token}"', text, count=1, flags=re.M)
         CONFIG_PATH.write_text(text, encoding="utf-8")
         cfg["server"]["token"] = token
     return cfg
