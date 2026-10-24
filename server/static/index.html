@@ -110,7 +110,16 @@
   .ev.tool { background: rgba(26,159,255,.12); color: #9fd4ff; font-family: ui-monospace, monospace; font-size: 12.5px; word-break: break-all; }
   .ev.tool .ev-name { font-weight: 700; color: var(--brand); margin-right: 6px; }
   .ev.tool.approved { background: rgba(232,179,57,.12); color: #e8b339; }
+  .ev.tool .term {
+    display: block; margin-top: 6px;
+    background: #0b0d13; color: #c8d3e0;
+    padding: 8px 10px; border-radius: 7px;
+    font-size: 12px; line-height: 1.5;
+    white-space: pre-wrap; word-break: break-all;
+    max-height: 220px; overflow-y: auto;
+  }
   .ev.file { background: rgba(46,204,113,.1); color: #7ddba3; font-family: ui-monospace, monospace; font-size: 12px; margin-left: 18px; }
+  .stream-body { white-space: pre-wrap; word-break: break-word; }
 
   /* 正在输入 */
   .typing { display: inline-flex; gap: 4px; padding: 4px 2px; }
@@ -389,42 +398,51 @@
     scrollBottomSafe();
   }
 
-  // 渲染思维链 / 工具调用 / 文件改动事件
+  // 渲染单个事件（思维链 / 工具调用+终端输出 / 文件改动）到容器
+  function renderEvent(ev, box) {
+    if (ev.type === 'thought') {
+      var d = document.createElement('details');
+      d.className = 'ev thought';
+      var sum = document.createElement('summary');
+      sum.textContent = '🧠 思维链（点击展开）';
+      var body = document.createElement('div');
+      body.className = 'thought-body';
+      body.textContent = ev.text;
+      d.appendChild(sum);
+      d.appendChild(body);
+      box.appendChild(d);
+    } else if (ev.type === 'tool') {
+      var t = document.createElement('div');
+      t.className = 'ev tool' + (ev.approved ? ' approved' : '');
+      var name = document.createElement('span');
+      name.className = 'ev-name';
+      name.textContent = (ev.approved ? '✓ ' : '🔧 ') + ev.name;
+      var summary = document.createElement('span');
+      summary.textContent = ev.summary || '';
+      t.appendChild(name);
+      t.appendChild(summary);
+      if (ev.output) {
+        var term = document.createElement('pre');
+        term.className = 'term';
+        term.textContent = ev.output;
+        t.appendChild(term);
+      }
+      box.appendChild(t);
+      (ev.files || []).forEach(function (f) {
+        var fc = document.createElement('div');
+        fc.className = 'ev file';
+        fc.textContent = '📄 写入 ' + f;
+        box.appendChild(fc);
+      });
+    }
+  }
+
+  // 渲染整批事件（历史/兜底用）
   function renderEvents(events) {
     if (!events || !events.length) return;
     var box = document.createElement('div');
     box.className = 'events';
-    events.forEach(function (ev) {
-      if (ev.type === 'thought') {
-        var d = document.createElement('details');
-        d.className = 'ev thought';
-        var sum = document.createElement('summary');
-        sum.textContent = '🧠 思维链（点击展开）';
-        var body = document.createElement('div');
-        body.className = 'thought-body';
-        body.textContent = ev.text;
-        d.appendChild(sum);
-        d.appendChild(body);
-        box.appendChild(d);
-      } else if (ev.type === 'tool') {
-        var t = document.createElement('div');
-        t.className = 'ev tool' + (ev.approved ? ' approved' : '');
-        var name = document.createElement('span');
-        name.className = 'ev-name';
-        name.textContent = (ev.approved ? '✓ ' : '🔧 ') + ev.name;
-        var summary = document.createElement('span');
-        summary.textContent = ev.summary || '';
-        t.appendChild(name);
-        t.appendChild(summary);
-        box.appendChild(t);
-        (ev.files || []).forEach(function (f) {
-          var fc = document.createElement('div');
-          fc.className = 'ev file';
-          fc.textContent = '📄 写入 ' + f;
-          box.appendChild(fc);
-        });
-      }
-    });
+    events.forEach(function (ev) { renderEvent(ev, box); });
     messages.appendChild(box);
     scrollBottomSafe();
   }
@@ -471,6 +489,11 @@
     sendBtn.disabled = !ok;
   }
 
+  var liveBox = null;      // 本轮对话的事件容器（实时渲染工具终端块）
+  var liveToolCount = 0;   // 已实时渲染的工具数，避免 assistant_message 重复渲染
+  var streamEl = null;     // 流式输出气泡
+  var streamBody = null;
+
   function connect() {
     if (!token) { authOverlay.classList.add('show'); return; }
     var proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -495,11 +518,55 @@
         case 'user_message':
           hideTyping();
           addMsg('user', msg.text, msg.ts);
+          liveBox = document.createElement('div');
+          liveBox.className = 'events';
+          messages.appendChild(liveBox);
+          liveToolCount = 0;
           showTyping();
+          break;
+        case 'stream_start':
+          hideTyping();
+          streamEl = document.createElement('div');
+          streamEl.className = 'msg assistant';
+          streamBody = document.createElement('div');
+          streamBody.className = 'stream-body';
+          streamEl.appendChild(streamBody);
+          messages.appendChild(streamEl);
+          scrollBottomSafe();
+          break;
+        case 'delta':
+          if (streamBody) {
+            streamBody.textContent += msg.text;
+            scrollBottomSafe();
+          }
+          break;
+        case 'tool_done':
+          if (liveBox && msg.event) {
+            renderEvent(msg.event, liveBox);
+            liveToolCount++;
+            scrollBottomSafe();
+          }
           break;
         case 'assistant_message':
           hideTyping();
-          renderEvents(msg.events);
+          if (streamEl && streamEl.parentNode) streamEl.parentNode.removeChild(streamEl);
+          streamEl = null; streamBody = null;
+          if (msg.events && msg.events.length) {
+            if (liveBox) {
+              // 补渲染未实时显示的事件（思维链等），跳过已显示的工具块
+              var skip = liveToolCount;
+              msg.events.forEach(function (e) {
+                if (e.type === 'tool' && skip > 0) { skip--; return; }
+                renderEvent(e, liveBox);
+              });
+            } else {
+              renderEvents(msg.events);
+            }
+          }
+          if (liveBox && !liveBox.childNodes.length && liveBox.parentNode) {
+            liveBox.parentNode.removeChild(liveBox);
+          }
+          liveBox = null; liveToolCount = 0;
           addMsg('assistant', msg.text, msg.ts);
           break;
         case 'tool_activity':

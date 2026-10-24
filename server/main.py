@@ -320,23 +320,33 @@ def summarize_tool(name: str, args: dict) -> str:
 
 
 async def run_agent(events: list[dict]) -> str:
-    """LLM + 工具调用循环，思考链/工具调用写入 events 供 UI 展示"""
+    """LLM + 工具调用循环（流式），思考链/工具调用/终端输出写入 events 供 UI 展示"""
     global pending_action
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + list(history)
+    streaming = False  # 是否已开始向用户流式输出正文
+
+    async def on_delta(text: str):
+        nonlocal streaming
+        if not streaming:
+            streaming = True
+            await manager.broadcast({"type": "stream_start", "ts": time.time()})
+        await manager.broadcast({"type": "delta", "text": text})
+
     try:
         for _ in range(MAX_TOOL_ROUNDS):
-            msg = await llm.chat_with_tools(msgs, tools.TOOLS)
+            msg = await llm.chat_with_tools_stream(msgs, tools.TOOLS, on_delta=on_delta)
 
             # 思维链（reasoning_content，DeepSeek/Qwen 等支持）
             reasoning = (msg.get("reasoning_content") or "").strip()
             if reasoning:
                 events.append({"type": "thought", "text": reasoning})
-                await manager.broadcast({"type": "thought", "text": reasoning, "ts": time.time()})
 
             tool_calls = msg.get("tool_calls") or []
             if not tool_calls:
                 return msg.get("content") or "（没有回复内容）"
 
+            # 有工具调用：本轮流式输出的内容是中间话，作废（最终答复会重新流式）
+            streaming = False
             msgs.append(msg)
             for call in tool_calls:
                 name = call["function"]["name"]
@@ -362,10 +372,13 @@ async def run_agent(events: list[dict]) -> str:
                 # 文件改动识别（run_command）
                 files = tools.extract_writes(str(args.get("command", ""))) if name == "run_command" else []
                 event = {"type": "tool", "name": name, "summary": summarize_tool(name, args), "files": files}
-                events.append(event)
                 await manager.broadcast({"type": "tool_activity", "text": f"{name}：{event['summary']}", "ts": time.time()})
 
                 result = await tools.execute(name, args)
+                # 终端输出截断后随事件展示（网页端显示为终端块）
+                event["output"] = result[:1500] + ("\n…（截断）" if len(result) > 1500 else "")
+                events.append(event)
+                await manager.broadcast({"type": "tool_done", "event": event, "ts": time.time()})
                 msgs.append({"role": "tool", "tool_call_id": call["id"], "content": result})
         return "（工具调用次数超限，换个问法试试吧）"
     except Exception as e:

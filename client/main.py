@@ -258,6 +258,12 @@ class MainWindow(QMainWindow):
                     f'<div style="font-size:12.5px; color:#9fd4ff; margin:2px 0;">'
                     f'{icon} <b style="color:#1a9fff;">{ev.get("name")}</b> {summary}</div>'
                 )
+                out = html_escape(ev.get("output", "") or "")
+                if out:
+                    self.chat.append(
+                        f'<pre style="background:#0b0d13; color:#c8d3e0; font-size:12px;'
+                        f' padding:8px; border-radius:6px; margin:2px 0 4px 12px;">{out}</pre>'
+                    )
                 for f in ev.get("files") or []:
                     self.chat.append(
                         f'<div style="font-size:12px; color:#7ddba3; margin:0 0 2px 18px;">'
