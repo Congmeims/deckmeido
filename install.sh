@@ -114,11 +114,19 @@ deps_intro() {
 }
 
 ask_yes() {
-  # 无 tty（比如从客户端里跑）时默认不装，避免卡住
-  [ -t 0 ] || return 1
-  local ans
-  printf '%s?%s %s [y/N] ' "$C_WARN" "$C_END" "$1"
-  read -r ans
+  # 只有在 stdin 不是终端（例如被别处管道/程序调用）时才默认不装；
+  # 直接粘贴多行命令时 stdin 仍是终端，正常询问
+  if [ ! -t 0 ]; then
+    if [ -r /dev/tty ]; then
+      printf '%s?%s %s [y/N] ' "$C_WARN" "$C_END" "$1" > /dev/tty
+      read -r ans < /dev/tty || return 1
+    else
+      return 1
+    fi
+  else
+    printf '%s?%s %s [y/N] ' "$C_WARN" "$C_END" "$1"
+    read -r ans || return 1
+  fi
   case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
@@ -203,6 +211,7 @@ install_deps() {
 sync_files() {
   if [ "$HERE" = "$(cd "$INSTALL_DIR" 2>/dev/null && pwd -P)" ]; then
     info "已在使用目录 $INSTALL_DIR"
+    write_version_file
     return
   fi
   [ -f "$HERE/install.sh" ] || die "当前目录不像 DeckMeido 源码目录（缺 install.sh）"
