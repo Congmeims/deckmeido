@@ -110,6 +110,7 @@ TOOLS: list[dict] = [
                     "command": {"type": "string", "description": "要执行的 bash 命令"},
                     "reason": {"type": "string", "description": "一句话说明这条命令要干什么（用于审批展示）"},
                     "timeout": {"type": "integer", "description": "超时秒数，默认 60，最大 300"},
+                    "stdin": {"type": "string", "description": "可选，喂给命令标准输入的内容（用于 sudo -S 密码、交互确认 y 等）"},
                 },
                 "required": ["command", "reason"],
             },
@@ -159,12 +160,14 @@ def extract_writes(cmd: str) -> list[str]:
     return files[:10]
 
 
-async def _run_command(command: str, reason: str = "", timeout: int = 60) -> str:
+async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin: str = "") -> str:
     timeout = max(1, min(int(timeout or 60), 300))
     env = dict(os.environ)
     env.setdefault("DISPLAY", ":0")
+    feed = (stdin if stdin.endswith("\n") else stdin + "\n").encode() if stdin else None
     proc = await asyncio.create_subprocess_shell(
         command,
+        stdin=asyncio.subprocess.PIPE if feed else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         cwd=str(Path.home()),
@@ -172,11 +175,13 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60) -> str
         executable="/bin/bash",
     )
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+        out, _ = await asyncio.wait_for(proc.communicate(feed), timeout)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        return f"命令超时（{timeout}s），已强制终止"
+        return (f"命令超时（{timeout}s），已强制终止。\n"
+                "提示：若命令需要交互输入（密码/确认），请用 stdin 参数传入；"
+                "若是长任务，请用 nohup ... > /tmp/日志 2>&1 & 放后台")
     text = out.decode("utf-8", "replace").strip()
     if len(text) > 4000:
         text = text[:4000] + "\n…（输出过长已截断）"
