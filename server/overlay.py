@@ -13,10 +13,18 @@ import os
 import threading
 import time
 import urllib.request
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
-from PySide6.QtWidgets import QApplication, QFrame, QLabel, QVBoxLayout, QWidget
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import (
+    QApplication, QFrame, QGraphicsDropShadowEffect, QLabel, QVBoxLayout, QWidget,
+)
+
+ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
+LOGO_PX = 152     # 卡片上方 logo 的显示边长
+LOGO_GAP = 14     # logo 图形与卡片之间的实际间距（按可见图形算，不含透明留白）
+LOGO_DY = 10      # logo+卡片的整体在垂直居中基础上额外下移的像素
 
 API = os.environ.get("DECKMEIDO_API", "http://127.0.0.1:18765")
 TOKEN = os.environ.get("DECKMEIDO_TOKEN", "")
@@ -87,6 +95,16 @@ class Mask(QWidget):
         self.hint.setAlignment(Qt.AlignCenter)
         self.hint.setFixedHeight(34)
 
+        # logo 独立于卡片，浮在卡片正上方（进卡片会撑高卡片、挤乱排版）
+        self.logo = QLabel(self)
+        self._logo_inset_top = 0
+        self._logo_inset_bottom = 0
+        self.logo.setPixmap(self._load_logo())
+        self.logo.setFixedSize(LOGO_PX, LOGO_PX)
+        self.logo.setAlignment(Qt.AlignCenter)
+        self.logo.setStyleSheet("background: transparent;")
+        self.logo.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
         lay.addWidget(self.title)
         lay.addWidget(self.action, 0, Qt.AlignHCenter)
         lay.addSpacing(4)
@@ -127,6 +145,42 @@ class Mask(QWidget):
         self._text = text
         self.action.setText(text or "准备中")
         self._relayout()
+
+    def _load_logo(self) -> QPixmap:
+        """加载 assets/logo.png；缺失时留空 pixmap，遮罩照常工作。
+
+        logo 图四周带透明留白（原图 512 里图形只占 y≈90~381，下方约 1/4 是空的），
+        排版若按整张 pixmap 算间距，眼睛看到的空档会比参数值大得多。
+        这里顺便量出可见图形的上下留白，_relayout 只按可见部分占位。"""
+        self._logo_inset_top = 0
+        self._logo_inset_bottom = 0
+        path = ASSETS_DIR / "logo.png"
+        pm = QPixmap(str(path)) if path.exists() else QPixmap()
+        if pm.isNull():
+            return pm
+        pm = pm.scaled(
+            LOGO_PX, LOGO_PX, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._logo_inset_top, self._logo_inset_bottom = self._visual_insets(pm)
+        return pm
+
+    @staticmethod
+    def _visual_insets(pm: QPixmap) -> tuple[int, int]:
+        """可见图形相对整张 pixmap 的上下留白（像素）。
+
+        只在启动时扫一遍 152×152，成本可忽略；全透明时返回 (0, 0) 退化成整图排版。"""
+        img = pm.toImage()
+        w, h = img.width(), img.height()
+        top = bottom = None
+        for y in range(h):
+            for x in range(w):
+                if img.pixelColor(x, y).alpha() > 24:
+                    if top is None:
+                        top = y
+                    bottom = y
+                    break
+        if top is None:
+            return 0, 0
+        return top, h - 1 - bottom
 
     def _poll_urgent(self):
         """穿透期间每 25ms 问一次后端，保证 agent 点击前遮罩已经让开"""
@@ -208,13 +262,32 @@ class Mask(QWidget):
 
     def _relayout(self):
         """卡片宽度固定，高度跟随文字行数：手动 setFixedHeight 后居中摆放
-        （QFrame 放在顶层窗口里不会被自动布局管理）"""
+        （QFrame 放在顶层窗口里不会被自动布局管理）。
+
+        logo 与卡片作为一个整体垂直居中。间距按 logo 的「可见图形」算：
+        logo 图片自带透明留白，若按整张 pixmap 占位，参数 14px 会被撑成 50+px，
+        看着就像两块东西离得很远。"""
         self.card.setFixedWidth(min(620, self.width() - 60))
         self.card.layout().activate()
         h = self.card.layout().sizeHint().height()
         self.card.setFixedHeight(h)
-        self.card.move((self.width() - self.card.width()) // 2,
-                       (self.height() - h) // 2)
+
+        has_logo = not self.logo.pixmap().isNull()
+        # 可见图形在 pixmap 内的高度：整图减去透明留白
+        vis_h = LOGO_PX - self._logo_inset_top - self._logo_inset_bottom
+        gap = LOGO_GAP if has_logo else 0
+        total = (vis_h + gap if has_logo else 0) + h
+        top = (self.height() - total) // 2 + LOGO_DY
+
+        if has_logo:
+            self.logo.show()
+            # 让 pixmap 内的可见图形顶端正好落在 top，透明留白往上溢出即可
+            self.logo.move((self.width() - LOGO_PX) // 2, top - self._logo_inset_top)
+            top += vis_h + gap
+        else:
+            self.logo.hide()
+
+        self.card.move((self.width() - self.card.width()) // 2, top)
 
     # ---------- 绘制 ----------
     def _show_mask(self):
