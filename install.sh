@@ -392,12 +392,14 @@ print_done() {
   info "DeckMeido 已就绪"
   dim "本机控制台:  http://127.0.0.1:$PORT/?token=$token"
   dim "局域网访问:  http://$ip:$PORT/?token=$token"
-  dim "访问令牌:    $token   （可在网页设置页随机生成或自定义）"
+  dim "访问令牌默认为 meido，可在客户端设置页修改"
   dim "配置文件:    $INSTALL_DIR/server/config.toml"
   dim "卸载脚本:    bash $INSTALL_DIR/uninstall.sh   （加 --purge 连配置一起删）"
   echo
   dim "下一步：打开上面的地址，首次会弹出设置页，填 API 地址与 Key 即可对话"
   dim "以后升级：网页设置页点「检查更新」，或执行 bash $INSTALL_DIR/install.sh upgrade"
+  echo
+  dim "当前版本:    $(cat "$INSTALL_DIR/VERSION" 2>/dev/null || echo '未知')"
 }
 
 # ---------- 子命令 ----------
