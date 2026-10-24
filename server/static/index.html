@@ -476,6 +476,13 @@
     box-sizing: border-box;
   }
   .field-row { display: flex; align-items: center; justify-content: space-between; }
+  /* 开关里的 checkbox 要排除在 .field input 之外，否则会被撑成整行输入框，
+     把 .slider 挤到看不见，点上去像没反应 */
+  .field .switch { display: inline-block; flex: none; }
+  .field .switch input {
+    position: absolute; opacity: 0; width: 1px; height: 1px;
+    padding: 0; border: 0; margin: 0; pointer-events: none;
+  }
   /* 令牌一行：输入框 + 随机生成按钮 */
   .token-row { display: flex; gap: 8px; align-items: center; }
   .token-row input { flex: 1; font-family: ui-monospace, monospace; letter-spacing: 1px; }
@@ -501,7 +508,7 @@
   .switch input { opacity: 0; width: 0; height: 0; }
   .slider {
     position: absolute; inset: 0; border-radius: 999px;
-    background: var(--surface-2); transition: .15s;
+    background: var(--surface-2); transition: .15s; cursor: pointer;
   }
   .slider::before {
     content: ''; position: absolute; width: 20px; height: 20px;
