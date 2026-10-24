@@ -439,6 +439,22 @@
     box-sizing: border-box;
   }
   .field-row { display: flex; align-items: center; justify-content: space-between; }
+  /* 令牌一行：输入框 + 随机生成按钮 */
+  .token-row { display: flex; gap: 8px; align-items: center; }
+  .token-row input { flex: 1; font-family: ui-monospace, monospace; letter-spacing: 1px; }
+  .mini-btn {
+    flex: none;
+    height: 44px;
+    padding: 0 14px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--surface-2);
+    color: var(--text);
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .mini-btn:hover { border-color: var(--brand); color: var(--brand); }
+  .field-hint { font-size: 12px; color: var(--muted); margin-top: 6px; min-height: 16px; }
   .switch { position: relative; width: 46px; height: 26px; }
   .switch input { opacity: 0; width: 0; height: 0; }
   .slider {
@@ -662,7 +678,7 @@
 
 <div id="authOverlay">
   <h1>DeckMeido 控制台</h1>
-  <p>请输入访问令牌（token）。<br>令牌可在 Deck 的 ~/deckmate/server/config.toml 中查看。</p>
+  <p>请输入访问令牌（token）。<br>令牌可在 Deck 的 ~/deckmate/server/config.toml 中查看，<br>也可在设置页里随机生成或自定义。</p>
   <input id="tokenInput" type="password" placeholder="token" autocomplete="off">
   <button id="tokenBtn">连接</button>
 </div>
@@ -696,6 +712,14 @@
     <div class="field">
       <label>工作区目录（编程/文件任务默认位置）</label>
       <input id="cfgWorkspace" type="text" placeholder="/home/deck/deckmate_workspace" autocomplete="off">
+    </div>
+    <div class="field">
+      <label>访问令牌（连接这台 Deck 用，4-32 位数字或字母）</label>
+      <div class="token-row">
+        <input id="cfgToken" type="text" placeholder="例如 x7K2m" autocomplete="off" maxlength="32">
+        <button id="genToken" class="mini-btn" type="button">随机生成</button>
+      </div>
+      <div id="tokenHint" class="field-hint"></div>
     </div>
     <button id="saveCfg">保存</button>
     <div id="cfgHint"></div>
@@ -1155,6 +1179,14 @@
     ws.onerror = function () { try { ws.close(); } catch (e) {} };
   }
 
+  // 令牌变更后立即用新令牌重连（不等退避）
+  function reconnectNow() {
+    clearTimeout(reconnectTimer);
+    if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} }
+    backoff = 1000;
+    connect();
+  }
+
   // token 数简写：12345 → 12.3k，1234567 → 1.2M
   function fmtTokens(n) {
     if (!n) return '0';
@@ -1358,12 +1390,16 @@
   var cfgTts = document.getElementById('cfgTts');
   var cfgPerm = document.getElementById('cfgPerm');
   var cfgWorkspace = document.getElementById('cfgWorkspace');
+  var cfgToken = document.getElementById('cfgToken');
+  var genToken = document.getElementById('genToken');
+  var tokenHint = document.getElementById('tokenHint');
   var saveCfg = document.getElementById('saveCfg');
   var cfgHint = document.getElementById('cfgHint');
 
   function openSettings() {
     settingsPanel.classList.add('show');
     cfgHint.textContent = '';
+    tokenHint.textContent = '';
     fetch('/api/config?token=' + encodeURIComponent(token))
       .then(function (r) { return r.json(); })
       .then(function (c) {
@@ -1372,6 +1408,7 @@
         cfgTts.checked = c.tts_enable;
         cfgPerm.value = c.permission_mode || 'auto';
         cfgWorkspace.value = c.workspace || '';
+        cfgToken.value = c.token || '';
       })
       .catch(function () { cfgHint.textContent = '读取配置失败'; });
   }
@@ -1379,6 +1416,14 @@
   settingsBtn.addEventListener('click', openSettings);
   settingsPanel.addEventListener('click', function (e) {
     if (e.target === settingsPanel) settingsPanel.classList.remove('show');
+  });
+
+  // 随机生成一个新的 5 位令牌（只填入输入框，点保存才生效）
+  genToken.addEventListener('click', function () {
+    fetch('/api/token/gen?token=' + encodeURIComponent(token))
+      .then(function (r) { return r.json(); })
+      .then(function (res) { cfgToken.value = res.token; tokenHint.textContent = '已生成，点保存后生效'; })
+      .catch(function () { tokenHint.textContent = '生成失败'; });
   });
 
   // 拉取当前配置（已保存的地址和 Key）的模型列表，同步到底部下拉框
@@ -1391,6 +1436,12 @@
   }
 
   saveCfg.addEventListener('click', function () {
+    var newToken = cfgToken.value.trim();
+    if (!/^[A-Za-z0-9]{4,32}$/.test(newToken)) {
+      tokenHint.textContent = '令牌需为 4-32 位数字或字母';
+      return;
+    }
+    var tokenChanged = newToken !== token;
     cfgHint.textContent = '保存中…';
     fetch('/api/config?token=' + encodeURIComponent(token), {
       method: 'POST',
@@ -1400,11 +1451,19 @@
         api_key: cfgApiKey.value,
         tts_enable: cfgTts.checked,
         permission_mode: cfgPerm.value,
-        workspace: cfgWorkspace.value
+        workspace: cfgWorkspace.value,
+        token: newToken
       })
     })
       .then(function (r) { return r.json(); })
       .then(function (res) {
+        if (tokenChanged) {
+          // 令牌已换：本地存的还是旧的，直接续上会 401，这里先换成新令牌再重连
+          token = newToken;
+          localStorage.setItem('deckmate_token', newToken);
+          tokenHint.textContent = '令牌已更新，其他设备需用新令牌重新连接';
+          reconnectNow();
+        }
         cfgHint.textContent = res.llm_configured ? '已保存，正在拉取模型列表…' : '已保存（API Key 为空，对话暂不可用）';
         if (!res.llm_configured) {
           setTimeout(function () { settingsPanel.classList.remove('show'); }, 1200);

@@ -30,13 +30,22 @@ STATIC_DIR = BASE_DIR / "static"
 
 # ---------- 配置 ----------
 
+def gen_token(length: int = 5) -> str:
+    """生成访问令牌：数字 + 大小写字母混合，如 x7K2m。
+
+    去掉了容易看错的 0/O/1/l/I，方便在掌机上手动敲。
+    """
+    alphabet = "23456789abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
         shutil.copy(BASE_DIR / "config.example.toml", CONFIG_PATH)
     cfg = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     # token 为空则生成并写回配置文件，方便用户查看
     if not cfg["server"].get("token"):
-        token = secrets.token_urlsafe(16)
+        token = gen_token()
         text = CONFIG_PATH.read_text(encoding="utf-8")
         text = text.replace('token = ""', f'token = "{token}"', 1)
         CONFIG_PATH.write_text(text, encoding="utf-8")
@@ -206,9 +215,10 @@ tts = TTS(
 
 
 def apply_config(cfg: dict):
-    """热更新运行配置（LLM / TTS / 权限模式），无需重启"""
-    global CFG, PERMISSION_MODE, SYSTEM_PROMPT
+    """热更新运行配置（LLM / TTS / 权限模式 / 访问令牌），无需重启"""
+    global CFG, TOKEN, PERMISSION_MODE, SYSTEM_PROMPT
     CFG = cfg
+    TOKEN = cfg["server"].get("token", TOKEN)
     c = cfg["llm"]
     llm.base_url = c["base_url"].rstrip("/")
     llm.api_key = c["api_key"]
@@ -330,11 +340,25 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+# 设置页保存新令牌时的一次性通行证：允许旧令牌再完成这一次保存
+_pending_token: str | None = None
+
 
 # ---------- 认证 ----------
 
 def check_token(token: str | None = Query(default=None), x_token: str | None = Header(default=None)):
     if token != TOKEN and x_token != TOKEN:
+        raise HTTPException(status_code=401, detail="invalid token")
+
+
+def check_token_any(token: str | None = Query(default=None), x_token: str | None = Header(default=None)):
+    """改令牌专用：旧令牌或新令牌任一都能通过。
+
+    设置页保存新令牌时，前端还带着旧令牌，而校验已经换成新的了，
+    不放开这一条会导致「改完自己把自己锁在外面」。
+    """
+    ok = {TOKEN, _pending_token} - {None, ""}
+    if token not in ok and x_token not in ok:
         raise HTTPException(status_code=401, detail="invalid token")
 
 
@@ -507,6 +531,7 @@ class ConfigUpdate(BaseModel):
     tts_enable: bool | None = None
     permission_mode: str | None = None
     workspace: str | None = None
+    token: str | None = None
 
 
 @app.get("/api/config", dependencies=[Depends(check_token)])
@@ -518,7 +543,15 @@ async def api_get_config():
         "tts_enable": tts.enable,
         "permission_mode": PERMISSION_MODE,
         "workspace": str(tools.WORKSPACE),
+        "token": TOKEN,
+        "port": CFG["server"].get("port", 18765),
     }
+
+
+@app.get("/api/token/gen", dependencies=[Depends(check_token)])
+async def api_token_gen():
+    """给设置页的「随机生成」按钮用，只返回不保存"""
+    return {"token": gen_token()}
 
 
 async def _pick_model(base_url: str, api_key: str) -> str:
@@ -536,8 +569,9 @@ async def _pick_model(base_url: str, api_key: str) -> str:
     return names[0]
 
 
-@app.post("/api/config", dependencies=[Depends(check_token)])
+@app.post("/api/config", dependencies=[Depends(check_token_any)])
 async def api_set_config(req: ConfigUpdate):
+    global _pending_token
     llm_updates = {}
     if req.base_url is not None:
         llm_updates["base_url"] = req.base_url.strip()
@@ -557,9 +591,21 @@ async def api_set_config(req: ConfigUpdate):
         updates["security"] = {"permission_mode": req.permission_mode}
     if req.workspace is not None and req.workspace.strip():
         updates["workspace"] = {"dir": req.workspace.strip()}
+    if req.token is not None:
+        new_token = req.token.strip()
+        # 令牌只允许 4-32 位数字/字母，太短容易被猜，太长在掌机上不好敲
+        if not re.fullmatch(r"[A-Za-z0-9]{4,32}", new_token):
+            raise HTTPException(status_code=400, detail="令牌需为 4-32 位数字或字母")
+        updates["server"] = {"token": new_token}
     if updates:
-        update_config(updates)
-    return {"ok": True, "llm_configured": llm.configured, "workspace": str(tools.WORKSPACE)}
+        # 改令牌期间临时放行旧令牌，改完清掉
+        _pending_token = updates.get("server", {}).get("token")
+        try:
+            update_config(updates)
+        finally:
+            _pending_token = None
+    return {"ok": True, "llm_configured": llm.configured, "workspace": str(tools.WORKSPACE),
+            "token": TOKEN}
 
 
 @app.get("/api/models", dependencies=[Depends(check_token)])
