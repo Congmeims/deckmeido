@@ -127,6 +127,66 @@ TOOLS: list[dict] = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "列出目录内容（编程/文件任务先看结构）。默认列出工作区 ~/deckmate_workspace",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "目录路径，默认 ~/deckmate_workspace"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "读取文件内容（带行号，可分段读取大文件）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件路径"},
+                    "offset": {"type": "integer", "description": "起始行号，默认 1"},
+                    "limit": {"type": "integer", "description": "读取行数，默认 400"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "创建或整体覆盖写入文件（自动创建父目录）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件路径"},
+                    "content": {"type": "string", "description": "完整文件内容"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "精确替换文件中的一段文本（修改代码优先用这个，不要整体重写文件）。old 必须在文件里唯一",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件路径"},
+                    "old": {"type": "string", "description": "要被替换的原文（需唯一匹配）"},
+                    "new": {"type": "string", "description": "替换后的内容"},
+                },
+                "required": ["path", "old", "new"],
+            },
+        },
+    },
 ]
 
 # 危险操作：任何权限模式下都需确认
@@ -460,6 +520,59 @@ async def _screenshot() -> str:
     return f"截图完成：/shots/{name}（画面已展示给用户；你看不到图，只需告知已截取）"
 
 
+WORKSPACE = Path.home() / "deckmate_workspace"
+
+
+def _resolve(path: str) -> Path:
+    return Path(path).expanduser().resolve()
+
+
+async def _list_dir(path: str = "") -> str:
+    d = _resolve(path) if path else WORKSPACE
+    d.mkdir(parents=True, exist_ok=True) if not path else None
+    if not d.is_dir():
+        return f"不是目录：{d}"
+    entries = []
+    for p in sorted(d.iterdir(), key=lambda x: (x.is_file(), x.name)):
+        tag = "📁" if p.is_dir() else "📄"
+        size = f" ({p.stat().st_size}B)" if p.is_file() else ""
+        entries.append(f"{tag} {p.name}{size}")
+    return f"{d} 共 {len(entries)} 项：\n" + ("\n".join(entries[:200]) or "（空）")
+
+
+async def _read_file(path: str, offset: int = 1, limit: int = 400) -> str:
+    p = _resolve(path)
+    if not p.is_file():
+        return f"文件不存在：{p}"
+    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    offset = max(1, offset)
+    chunk = lines[offset - 1: offset - 1 + min(limit, 2000)]
+    body = "\n".join(f"{offset + i}→{line}" for i, line in enumerate(chunk))
+    note = f"（共 {len(lines)} 行，显示 {offset}-{offset - 1 + len(chunk)}）"
+    return f"{p} {note}\n{body}"
+
+
+async def _write_file(path: str, content: str) -> str:
+    p = _resolve(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+    return f"已写入 {p}（{len(content)} 字符）"
+
+
+async def _edit_file(path: str, old: str, new: str) -> str:
+    p = _resolve(path)
+    if not p.is_file():
+        return f"文件不存在：{p}"
+    text = p.read_text(encoding="utf-8")
+    count = text.count(old)
+    if count == 0:
+        return "替换失败：old 文本在文件中不存在（先用 read_file 确认原文）"
+    if count > 1:
+        return f"替换失败：old 文本出现了 {count} 次，请扩大范围使其唯一"
+    p.write_text(text.replace(old, new, 1), encoding="utf-8")
+    return f"已修改 {p}（替换 1 处）"
+
+
 EXECUTORS = {
     "get_weather": _get_weather,
     "web_search": _web_search,
@@ -470,6 +583,10 @@ EXECUTORS = {
     "list_emulator_roms": _list_emulator_roms,
     "run_command": _run_command,
     "screenshot": _screenshot,
+    "list_dir": _list_dir,
+    "read_file": _read_file,
+    "write_file": _write_file,
+    "edit_file": _edit_file,
 }
 
 

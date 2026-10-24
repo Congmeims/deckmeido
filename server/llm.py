@@ -69,8 +69,10 @@ class LLMClient:
                     content_parts.append(delta["content"])
                     if on_delta:
                         await on_delta(delta["content"])
-                if delta.get("reasoning_content"):
-                    reasoning_parts.append(delta["reasoning_content"])
+                # 不同供应商的思维链字段：reasoning_content / reasoning
+                rc = delta.get("reasoning_content") or delta.get("reasoning")
+                if rc:
+                    reasoning_parts.append(rc)
                 for tc in delta.get("tool_calls") or []:
                     i = tc.get("index", 0)
                     acc = tool_acc.setdefault(i, {"id": "", "type": "function",

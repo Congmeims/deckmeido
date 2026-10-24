@@ -101,6 +101,9 @@ def build_system_prompt() -> str:
         "文件管理、进程控制、xdotool 桌面操作（DISPLAY=:0）、截屏、Steam 控制、软件安装等，"
         "遇到任务先想 Shell 方案。另外还有便捷工具：查天气、搜索网页、查看已安装游戏、"
         "商店搜游戏、扫描模拟器 ROM、检查系统更新、安装游戏。\n"
+        "编程能力：你有自己的工作区 ~/deckmate_workspace。写代码/改文件用专用工具："
+        "list_dir 看结构、read_file 读文件（带行号）、write_file 创建、edit_file 精确替换；"
+        "运行测试/脚本再用 run_command。用户让做项目时，先规划再逐步实施，像一个编程搭档。\n"
         "screenshot 工具可截取当前桌面画面展示给用户：排查问题、确认状态或用户要求看屏幕时主动使用"
         "（画面会直接显示在聊天里，你自己看不到图，只需确认已截取）。\n"
         "环境：SteamOS holo、桌面模式 X11、家目录 /home/deck、SD 卡在 /run/media 下。\n"
@@ -315,8 +318,11 @@ async def handle_chat(text: str) -> dict:
     global pending_action
     await manager.broadcast({"type": "user_message", "text": text, "ts": time.time()})
     history.append({"role": "user", "content": text})
-    del history[:-HISTORY_LIMIT]
     events: list[dict] = []
+
+    # 上下文超长时自动压缩（摘要替换旧对话，不再直接丢弃）
+    if len(history) > HISTORY_LIMIT:
+        await compact_history(auto=True)
 
     try:
         if not llm.configured:
@@ -345,6 +351,47 @@ async def handle_chat(text: str) -> dict:
     # 语音播报：只播报最终回复，不播报思维链/工具过程（后台进行，不阻塞）
     asyncio.create_task(tts.speak(reply))
     return {"reply": reply, "events": events}
+
+
+async def compact_history(auto: bool = False) -> str:
+    """把较早的对话压缩成摘要，保留最近几轮原样。返回摘要文本"""
+    if len(history) <= 4:
+        return "对话还很短，无需压缩"
+    keep = 4
+    old = history[:-keep]
+    if not llm.configured:
+        # 没配 LLM 就退化为直接截断
+        history[:] = history[-keep:]
+        return "未配置 LLM，已直接截断旧对话"
+    transcript = "\n".join(
+        f"{'用户' if m['role'] == 'user' else '助手'}: {m['content'][:500]}" for m in old
+    )
+    try:
+        summary = await llm.chat([
+            {"role": "system", "content": "把下面的对话压缩成一份简洁摘要（中文），保留：用户的目标/偏好、已完成的操作及结果、待办事项、关键文件路径。直接输出摘要正文。"},
+            {"role": "user", "content": transcript},
+        ])
+    except Exception as e:
+        history[:] = history[-keep:]
+        return f"压缩失败，已截断旧对话：{e}"
+    history[:] = [{"role": "system", "content": f"【此前对话摘要，供上下文延续】\n{summary}"}] + history[-keep:]
+    await manager.broadcast({"type": "system", "text": f"{'🗜 已自动压缩上下文' if auto else '🗜 已压缩上下文'}（{len(old)} 条旧消息 → 摘要）", "ts": time.time()})
+    return summary
+
+
+@app.post("/api/compact", dependencies=[Depends(check_token)])
+async def api_compact():
+    summary = await compact_history()
+    return {"ok": True, "summary": summary[:300]}
+
+
+@app.post("/api/session/new", dependencies=[Depends(check_token)])
+async def api_new_session():
+    global pending_action
+    history.clear()
+    pending_action = None
+    await manager.broadcast({"type": "system", "text": "🆕 已开始新会话", "ts": time.time()})
+    return {"ok": True}
 
 
 def summarize_tool(name: str, args: dict) -> str:

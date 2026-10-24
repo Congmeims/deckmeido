@@ -54,6 +54,24 @@
     white-space: nowrap;
   }
 
+  /* 横向菜单栏 */
+  #menuBar {
+    flex: 0 0 auto;
+    display: flex; gap: 8px; align-items: center;
+    padding: 8px 12px;
+    background: var(--surface);
+    border-bottom: 1px solid rgba(255,255,255,.06);
+    overflow-x: auto;
+  }
+  .menu-btn {
+    flex: 0 0 auto;
+    border: 1px solid rgba(255,255,255,.1);
+    background: var(--surface-2); color: var(--text);
+    font-size: 13px; padding: 6px 12px; border-radius: 999px;
+    cursor: pointer; white-space: nowrap;
+  }
+  .menu-btn:active { opacity: .7; }
+
   /* 消息区 */
   #messages {
     flex: 1 1 auto;
@@ -277,6 +295,13 @@
   <span class="badge" id="modeBadge" hidden></span>
   <button id="settingsBtn" title="设置">⚙</button>
 </header>
+
+<nav id="menuBar">
+  <button class="menu-btn" id="btnNew">🆕 新会话</button>
+  <button class="menu-btn" id="btnCompact">🗜 压缩上下文</button>
+  <button class="menu-btn" id="btnShot">📷 截屏</button>
+  <span class="spacer"></span>
+</nav>
 
 <div id="messages"></div>
 
@@ -586,6 +611,9 @@
         case 'status':
           renderStatus(msg.data || {});
           break;
+        case 'system':
+          addSystem(msg.text || '');
+          break;
       }
     };
 
@@ -619,6 +647,26 @@
   }
 
   var busy = false;
+
+  // 菜单栏按钮
+  document.getElementById('btnNew').addEventListener('click', function () {
+    fetch('/api/session/new?token=' + encodeURIComponent(token), { method: 'POST' })
+      .then(function () { messages.innerHTML = ''; addSystem('🆕 已开始新会话'); })
+      .catch(function () { addSystem('操作失败'); });
+  });
+  document.getElementById('btnCompact').addEventListener('click', function () {
+    addSystem('🗜 正在压缩上下文…');
+    fetch('/api/compact?token=' + encodeURIComponent(token), { method: 'POST' })
+      .then(function (r) { return r.json(); })
+      .then(function (res) { addSystem('压缩完成：' + (res.summary || '').slice(0, 120)); })
+      .catch(function () { addSystem('压缩失败'); });
+  });
+  document.getElementById('btnShot').addEventListener('click', function () {
+    if (ws && ws.readyState === 1 && !busy) {
+      ws.send(JSON.stringify({ type: 'chat', text: '截屏，把当前桌面画面展示给我' }));
+      setBusy(true);
+    }
+  });
 
   function setBusy(b) {
     busy = b;
