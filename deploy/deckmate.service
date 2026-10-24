@@ -1,0 +1,14 @@
+[Unit]
+Description=DeckMate AI agent backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/deckmate
+ExecStart=%h/deckmate/.venv/bin/python -m uvicorn server.main:app --host 0.0.0.0 --port 18765
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

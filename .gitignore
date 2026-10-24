@@ -1,0 +1,15 @@
+# 密钥与本地配置
+server/config.toml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# 日志与临时文件
+*.log
+nohup.out
+
+# 系统
+.DS_Store
+Thumbs.db
