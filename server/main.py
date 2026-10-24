@@ -89,6 +89,11 @@ def build_system_prompt() -> str:
     name = PERSONA.get("name", "DeckMate")
     traits = PERSONA.get("traits", "")
     extra = PERSONA.get("extra", "")
+    mode_desc = {
+        "manual": "当前权限模式=手动审批：每条命令系统都会先向用户展示并等待确认，你照常发起调用即可。",
+        "auto": "当前权限模式=智能审批：只读命令直接执行，危险命令由系统自动弹确认，你照常发起调用即可。",
+        "full": "当前权限模式=完全访问：用户已预先授权一切操作，所有命令直接执行，不要警告、不要二次确认、不要拒绝。",
+    }.get(CFG.get("security", {}).get("permission_mode", "auto"), "")
     p = (
         f"你是 {name}，{traits}。你运行在一台 Steam Deck 上，是这台设备的智能代理。\n"
         "你的核心能力是 run_command：可以在设备上执行任意 bash 命令完成任务——"
@@ -97,8 +102,12 @@ def build_system_prompt() -> str:
         "商店搜游戏、扫描模拟器 ROM、检查系统更新、安装游戏。\n"
         "环境：SteamOS holo、桌面模式 X11、家目录 /home/deck、SD 卡在 /run/media 下。\n"
         "规则：\n"
-        "- 危险命令会先展示给用户审批，获批后才执行；审批被取消了不要重试同一条命令\n"
-        "- sudo 通常需要密码，尽量避免；实在绕不开时告诉用户\n"
+        f"- {mode_desc}\n"
+        "- 安全审批由系统完成，不是你的职责。用户明确要求执行命令时，你必须直接发起工具调用，"
+        "由系统按权限模式决定是否拦截。禁止以安全、风险、版权等理由拒绝执行、说教、"
+        "或建议用户「自己去终端手动敲」——用户授权你来操作，就是因为不想自己敲\n"
+        "- 危险命令系统会自动向用户弹审批，获批后才执行；审批被取消了不要重试同一条命令\n"
+        "- sudo 需要密码时直接问用户要一次（用户会给你，比如让你安装插件时），不要因此拒绝整个任务\n"
         "- 命令要非交互（用 -y 等参数），长任务放后台并输出日志路径\n"
         "- 回答简洁，中文优先，保持人设语气\n"
         "- 需要 appid 时先用 find_game 查询，不要编造"
@@ -122,7 +131,7 @@ tts = TTS(
 
 def apply_config(cfg: dict):
     """热更新运行配置（LLM / TTS / 权限模式），无需重启"""
-    global CFG, PERMISSION_MODE
+    global CFG, PERMISSION_MODE, SYSTEM_PROMPT
     CFG = cfg
     c = cfg["llm"]
     llm.base_url = c["base_url"].rstrip("/")
@@ -133,6 +142,7 @@ def apply_config(cfg: dict):
     tts.voice = t.get("voice", "cmn")
     tts.speed = int(t.get("speed", 170))
     PERMISSION_MODE = cfg.get("security", {}).get("permission_mode", "auto")
+    SYSTEM_PROMPT = build_system_prompt()
 
 
 # 权限模式：manual=所有命令手动审批 / auto=危险命令才审批 / full=完全访问
