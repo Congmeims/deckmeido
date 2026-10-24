@@ -20,8 +20,8 @@ timeout = 60
 reasoning_effort = "high"
 
 [agent]
-# agent 单轮最多连续调用工具次数
-max_tool_rounds = 12
+# agent 单轮最多连续调用工具次数（0 = 不限，直到模型自己收尾）
+max_tool_rounds = 0
 # 模型上下文窗口（tokens）。0 = 按模型名自动推断
 context_window = 0
 # 上下文占用达到该比例时自动压缩（0.95 = 95%）
