@@ -22,6 +22,9 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UNIT="deckmeido.service"
 DESKTOP_DIR="$HOME/.local/share/applications"
+# 真正的「桌面」目录：可能是 Desktop 也可能是 桌面，取 xdg 配置，没配置就默认 Desktop
+DESKTOP_FOLDER="$(command -v xdg-user-dir >/dev/null 2>&1 && xdg-user-dir DESKTOP 2>/dev/null || true)"
+[ -n "$DESKTOP_FOLDER" ] && [ "$DESKTOP_FOLDER" != "$HOME" ] || DESKTOP_FOLDER="$HOME/Desktop"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------- 输出 ----------
@@ -138,7 +141,16 @@ install_desktop() {
     "$INSTALL_DIR/deploy/DeckMeido.desktop" > "$DESKTOP_DIR/DeckMeido.desktop"
   chmod +x "$DESKTOP_DIR/DeckMeido.desktop"
   need_cmd update-desktop-database && update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
-  dim "桌面快捷方式已放到应用菜单（游戏模式下可加到非 Steam 游戏）"
+
+  # 同时放一份到桌面
+  if [ -d "$DESKTOP_FOLDER" ]; then
+    cp "$DESKTOP_DIR/DeckMeido.desktop" "$DESKTOP_FOLDER/DeckMeido.desktop"
+    chmod +x "$DESKTOP_FOLDER/DeckMeido.desktop"
+    # GNOME 系桌面需要标记为可信，否则双击会提示不安全
+    need_cmd gio && gio set "$DESKTOP_FOLDER/DeckMeido.desktop" metadata::trusted true >/dev/null 2>&1 || true
+  fi
+
+  dim "快捷方式已放到应用菜单和桌面（游戏模式下可加到非 Steam 游戏）"
 }
 
 read_token() {
@@ -253,6 +265,7 @@ do_uninstall() {
     systemctl --user daemon-reload || true
   fi
   rm -f "$DESKTOP_DIR/DeckMeido.desktop"
+  rm -f "$DESKTOP_FOLDER/DeckMeido.desktop"
   if [ "$purge" = 1 ]; then
     warn "删除配置与工作区（不可恢复）"
     rm -rf "$CONFIG_DIR"

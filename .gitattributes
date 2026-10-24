@@ -1,0 +1,9 @@
+# 仓库主要在 Windows 上编辑、在 SteamOS 上运行：统一用 LF，
+# 否则 .desktop 会校验失败、systemd 单元解析异常、shell 脚本报 \r 错误
+* text=auto eol=lf
+
+# 二进制资源不要做换行转换
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.gz   binary
