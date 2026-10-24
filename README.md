@@ -117,17 +117,13 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 ### 一键安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Congmeims/deckmeido/main/install.sh | bash
+git clone https://github.com/Congmeims/deckmeido.git
+cd deckmeido && bash install.sh
 ```
 
-或手动拉源码后执行：
+脚本会：建虚拟环境 → 装依赖（含 PySide6）→ 生成配置 → 注册 `deckmeido.service` 用户服务并开机自启 → 启用 `deckmeido.local` 局域网域名 → 装好应用菜单快捷方式，最后打印带令牌的访问地址。
 
-```bash
-git clone https://github.com/Congmeims/deckmeido.git ~/deckmeido
-cd ~/deckmeido && bash install.sh
-```
-
-脚本会：建虚拟环境 → 装依赖（含 PySide6）→ 生成配置 → 注册 `deckmeido.service` 用户服务并开机自启 → 装好应用菜单快捷方式，最后打印带令牌的访问地址。
+**不要用 `sudo` / root 执行。** 程序装到当前用户家目录（默认 `~/deckmeido`）、服务注册在用户级别，用 root 装会落到 `/root` 下，桌面会话里起不来。脚本检测到 root 会直接退出。
 
 不想用 git 的话，直接下载 Release 里的包：
 
@@ -147,7 +143,7 @@ bash install.sh uninstall --purge   # 连配置与工作区一起删
 
 ### 第一次使用
 
-1. 打开 `http://<deck-ip>:18765/?token=<令牌>`（安装脚本会把完整地址打出来）
+1. 打开 `http://<deck-ip>:18765/?token=<令牌>`（安装脚本会把完整地址打出来；同一局域网也可以直接用 `http://deckmeido.local:18765/`）
 2. 首次连接会自动弹出设置页——填 **API 地址** 与 **Key**，保存即可开始对话；不配也能进，只是对话不可用
 3. 设置页里可以「随机生成」或自定义访问令牌（5 位字母数字，校验不分大小写，保存后立即生效）
 4. 想用手机连？点设置页里的「二维码」，手机扫码直接带令牌进入
@@ -184,7 +180,10 @@ deckmeido/
 ├── assets/logo.png            应用图标（桌面快捷方式、托盘、网页 favicon）
 ├── client/main.py             PySide6 原生客户端（含托盘）
 ├── deploy/
-│   ├── deckmeido.service      systemd 用户服务
+│   ├── deckmeido.service      systemd 用户服务（后端）
+│   ├── deckmeido-mdns.service systemd 用户服务（deckmeido.local 域名）
+│   ├── mdns_publish.py        mDNS 发布，自动跳过代理虚拟网卡
+│   ├── setup_https.sh         可选：mkcert 生成局域网 HTTPS 证书
 │   └── DeckMeido.desktop      桌面快捷方式模板
 ├── server/
 │   ├── main.py                FastAPI 服务、会话、approval、遮罩调度

@@ -10,6 +10,9 @@
 # 环境变量：
 #   DECKMEIDO_DIR   安装目录，默认 ~/deckmeido
 #   DECKMEIDO_PORT  服务端口，默认 18765
+#
+# 注意：不要用 sudo 执行。脚本会把程序装到当前用户家目录、注册用户级服务，
+#       用 root 装会装到 /root 并注册到 root 名下，桌面会话里起不来。
 set -euo pipefail
 
 APP=deckmeido
@@ -18,6 +21,7 @@ PORT="${DECKMEIDO_PORT:-18765}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UNIT="deckmeido.service"
+MDNS_UNIT="deckmeido-mdns.service"
 DESKTOP_DIR="$HOME/.local/share/applications"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -35,7 +39,14 @@ dim()  { printf '%s    %s%s\n' "$C_DIM" "$*" "$C_END"; }
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 # ---------- 前置检查 ----------
+check_user() {
+  if [ "$(id -u)" = "0" ]; then
+    die "不要用 sudo / root 运行。请直接执行：bash install.sh（会自动装到 $HOME/$APP）"
+  fi
+}
+
 check_prereq() {
+  check_user
   need_cmd python3 || die "找不到 python3，请先在系统设置里开启开发者模式并安装 Python"
   python3 - <<'PY' || die "需要 Python 3.11 或更高版本"
 import sys
@@ -120,6 +131,22 @@ install_service() {
   dim "用户服务已启用：systemctl --user status $UNIT"
 }
 
+# mDNS：让局域网设备用 deckmeido.local 访问，省得记 IP（需要 zeroconf，装失败就跳过）
+install_mdns() {
+  need_cmd systemctl || return 0
+  if ! "$INSTALL_DIR/.venv/bin/python" -c "import zeroconf" >/dev/null 2>&1; then
+    warn "没有 zeroconf，跳过 deckmeido.local 域名（不影响 IP 访问）"
+    return 0
+  fi
+  mkdir -p "$UNIT_DIR"
+  sed "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
+    "$INSTALL_DIR/deploy/$MDNS_UNIT" > "$UNIT_DIR/$MDNS_UNIT"
+  systemctl --user daemon-reload
+  systemctl --user enable --now "$MDNS_UNIT" >/dev/null 2>&1 ||
+    systemctl --user restart "$MDNS_UNIT"
+  dim "局域网域名已启用：http://deckmeido.local:$PORT"
+}
+
 install_desktop() {
   mkdir -p "$DESKTOP_DIR"
   sed "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
@@ -144,9 +171,25 @@ wait_ready() {
   return 1
 }
 
+lan_ip() {
+  # 复用 mdns_publish.py 里的网卡选择逻辑，避免拿到代理虚拟网卡（198.18.x.x）
+  "$INSTALL_DIR/.venv/bin/python" - "$INSTALL_DIR" <<'PY' 2>/dev/null || true
+import sys, types
+from pathlib import Path
+
+root = Path(sys.argv[1])
+src = (root / "deploy" / "mdns_publish.py").read_text(encoding="utf-8")
+# 只执行到 lan_ip 定义为止，不触发实际的 zeroconf 注册
+code = src.split("\nip = lan_ip()")[0]
+mod = types.ModuleType("mdns")
+exec(compile(code, "mdns_publish.py", "exec"), mod.__dict__)
+print(mod.lan_ip())
+PY
+}
+
 print_done() {
   local ip token
-  ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -E '^(192|10)\.' | head -n1)
+  ip=$(lan_ip)
   [ -n "$ip" ] || ip=$(hostname -I 2>/dev/null | awk '{print $1}')
   [ -n "$ip" ] || ip="<deck-ip>"
   token=$(read_token)
@@ -168,6 +211,7 @@ do_install() {
   venv_install
   prepare_config
   install_service
+  install_mdns
   install_desktop
   system_notes
   if need_cmd curl && wait_ready; then
@@ -183,6 +227,7 @@ do_upgrade() {
   sync_files
   venv_install
   install_service
+  install_mdns
   install_desktop
   if need_cmd curl && wait_ready; then
     print_done
@@ -194,10 +239,12 @@ do_upgrade() {
 do_uninstall() {
   local purge=0
   [ "${1:-}" = "--purge" ] && purge=1
+  check_user
   if need_cmd systemctl; then
     info "停止并移除用户服务"
+    systemctl --user disable --now "$MDNS_UNIT" >/dev/null 2>&1 || true
     systemctl --user disable --now "$UNIT" >/dev/null 2>&1 || true
-    rm -f "$UNIT_DIR/$UNIT"
+    rm -f "$UNIT_DIR/$UNIT" "$UNIT_DIR/$MDNS_UNIT"
     systemctl --user daemon-reload || true
   fi
   rm -f "$DESKTOP_DIR/DeckMeido.desktop"
