@@ -145,9 +145,9 @@
   .tl-head.clickable { cursor: pointer; }
   .tl-head.clickable:hover { color: var(--text); background: var(--hover); }
   .tl-ico {
-    position: absolute; left: -24px; top: 4px;
-    width: 17px; text-align: center; font-size: 12px;
-    background: var(--bg); padding: 1px 0;
+    position: absolute; left: -19px; top: 8px;
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--muted); opacity: .55;
   }
   .tl-chip {
     background: var(--surface-2); border-radius: 6px;
@@ -226,7 +226,7 @@
   .cb-left { display: flex; gap: 8px; flex: 0 0 auto; }
   .cb-right { display: flex; gap: 8px; align-items: center; margin-left: auto; }
   .cb-btn {
-    width: 34px; height: 34px; border: none; border-radius: 10px;
+    min-width: 34px; padding: 0 10px; height: 34px; border: none; border-radius: 10px;
     background: var(--surface-2); color: var(--muted);
     font-size: 16px; cursor: pointer; flex: 0 0 auto;
   }
@@ -349,10 +349,10 @@
   /* 设置按钮与面板 */
   #settingsBtn {
     flex: 0 0 auto;
-    width: 36px; height: 36px;
-    border: none; border-radius: 50%;
+    height: 36px; padding: 0 14px;
+    border: 1px solid var(--line); border-radius: 10px;
     background: var(--surface-2); color: var(--muted);
-    font-size: 17px; cursor: pointer;
+    font-size: 13px; cursor: pointer;
   }
   #settingsPanel, #phonePanel {
     position: fixed; inset: 0;
@@ -501,28 +501,28 @@
   </div>
   <div class="sb-sess-head"><span>会话</span><button id="btnNewSess" title="新会话">＋</button></div>
   <div id="sessList"></div>
-  <div class="sb-foot"><button id="btnTheme">🌗 切换主题</button></div>
+  <div class="sb-foot"><button id="btnTheme">切换主题</button></div>
 </aside>
 <main id="main">
 
 <header>
-  <button class="cb-btn" id="btnMenu" title="菜单">☰</button>
+  <button class="cb-btn" id="btnMenu" title="菜单">菜单</button>
   <span class="dot" id="dot"></span>
   <span class="logo">DeckMate</span>
   <span class="status-text" id="statusText">连接中…</span>
   <span class="spacer"></span>
   <span class="badge" id="batteryBadge" hidden></span>
   <span class="badge" id="modeBadge" hidden></span>
-  <button id="settingsBtn" title="设置">⚙</button>
+  <button id="settingsBtn" title="设置">设置</button>
 </header>
 
 <nav id="menuBar">
-  <button class="menu-btn" id="btnNew">🆕 新会话</button>
-  <button class="menu-btn" id="btnCompact">🗜 压缩上下文</button>
-  <button class="menu-btn" id="btnShot">📷 截屏</button>
-  <button class="menu-btn" id="btnRetry">↻ 重试</button>
-  <button class="menu-btn" id="btnShare">↗ 分享</button>
-  <button class="menu-btn" id="btnPhone">📱 手机连接</button>
+  <button class="menu-btn" id="btnNew">新会话</button>
+  <button class="menu-btn" id="btnCompact">压缩上下文</button>
+  <button class="menu-btn" id="btnShot">截屏</button>
+  <button class="menu-btn" id="btnRetry">重试</button>
+  <button class="menu-btn" id="btnShare">分享</button>
+  <button class="menu-btn" id="btnPhone">手机连接</button>
   <span class="spacer"></span>
   <span class="badge" id="ctxBadge" hidden></span>
 </nav>
@@ -537,7 +537,7 @@
   <div class="share-box">
     <img id="shareImg" alt="对话分享图">
     <div style="display:flex; gap:10px; margin-top:12px;">
-      <a id="shareDownload" download="deckmate-chat.png"><button class="menu-btn" style="padding:10px 20px;">⬇ 下载图片</button></a>
+      <a id="shareDownload" download="deckmate-chat.png"><button class="menu-btn" style="padding:10px 20px;">下载图片</button></a>
       <button class="menu-btn" id="shareClose" style="padding:10px 20px;">关闭</button>
     </div>
   </div>
@@ -550,16 +550,16 @@
   <textarea id="input" rows="1" placeholder="@ 添加上下文，/ 使用命令" enterkeyhint="send"></textarea>
   <div id="composerBar">
     <div class="cb-left">
-      <button class="cb-btn" id="btnPlus" title="添加附件/引用">＋</button>
+      <button class="cb-btn" id="btnPlus" title="添加附件/引用" style="font-size:16px">＋</button>
       <select class="cb-select" id="permSelect" title="AI 控制权限">
-        <option value="manual">🛡 手动审批</option>
-        <option value="auto">🛡 智能审批</option>
-        <option value="full">🛡 完全访问</option>
+        <option value="manual">手动审批</option>
+        <option value="auto">智能审批</option>
+        <option value="full">完全访问</option>
       </select>
     </div>
     <div class="cb-right">
       <select class="cb-select" id="modelSelect" title="模型"></select>
-      <button class="cb-btn" id="btnMic" title="语音输入">🎤</button>
+      <button class="cb-btn" id="btnMic" title="语音输入" style="font-size:13px">语音</button>
       <button id="send">发送</button>
     </div>
   </div>
@@ -572,7 +572,7 @@
   <div id="codeBox">
     <div class="cv-bar">
       <span style="flex:1; color:var(--muted); font-size:13px;">代码预览</span>
-      <button class="menu-btn" id="cvCopy">📋 复制</button>
+      <button class="menu-btn" id="cvCopy">复制</button>
       <button class="menu-btn" id="cvClose">关闭</button>
     </div>
     <pre id="codePre"></pre>
@@ -580,9 +580,9 @@
 </div>
 
 <div id="plusMenu">
-  <button id="pmImage">🖼 附加图片</button>
-  <button id="pmFile">📄 引用工作区文件</button>
-  <button id="pmShot">📷 引用当前屏幕截图</button>
+  <button id="pmImage">附加图片</button>
+  <button id="pmFile">引用工作区文件</button>
+  <button id="pmShot">引用当前屏幕截图</button>
 </div>
 <div id="fileList"></div>
 <input type="file" id="imgInput" accept="image/*" hidden>
@@ -631,13 +631,13 @@
 
 <div id="phonePanel">
   <div class="sheet">
-    <h2>📱 手机连接</h2>
+    <h2>手机连接</h2>
     <p style="color:var(--muted); font-size:13px; margin-bottom:12px;">手机连同一局域网，扫码即开（地址里已带鉴权 token，免输入）</p>
     <div style="display:flex; justify-content:center; margin-bottom:12px;">
       <img id="qrImg" alt="连接二维码" style="width:210px; height:210px; background:#fff; border-radius:12px; padding:8px;">
     </div>
     <div id="phoneUrl" style="font-family:ui-monospace,monospace; font-size:13px; color:var(--brand); word-break:break-all; text-align:center; margin-bottom:14px;"></div>
-    <a href="/ca.crt" download style="display:block; text-align:center; background:var(--surface-2); border-radius:10px; padding:12px; color:var(--text); text-decoration:none; font-size:14px; margin-bottom:10px;">⬇ 下载根证书 ca.crt（开启麦克风需要）</a>
+    <a href="/ca.crt" download style="display:block; text-align:center; background:var(--surface-2); border-radius:10px; padding:12px; color:var(--text); text-decoration:none; font-size:14px; margin-bottom:10px;">下载根证书 ca.crt（开启麦克风需要）</a>
     <p style="color:var(--muted); font-size:12px; line-height:1.6;">想用语音输入：手机浏览器要求 HTTPS。安装上面的根证书后（iPhone：设置→通用→VPN与设备管理→安装描述文件，再到 关于本机→证书信任设置 里信任；安卓：设置→安全→更多安全设置→安装证书），用 https 地址打开即可。</p>
   </div>
 </div>
@@ -721,31 +721,31 @@
   function toolRowInfo(ev) {
     var fname = ev.path ? (ev.path.split(/[\\/]/).pop() || ev.path) : '';
     switch (ev.name) {
-      case 'read_file':   return { ico: '👓', text: '已读取', chip: fname || ev.summary };
-      case 'list_dir':    return { ico: '📂', text: '已查看目录', chip: fname || ev.summary };
+      case 'read_file':   return { text: '已读取', chip: fname || ev.summary };
+      case 'list_dir':    return { text: '已查看目录', chip: fname || ev.summary };
       case 'write_file':
-      case 'edit_file':   return { ico: '✏️', text: '已编辑 1个文件' };
-      case 'run_command': return { ico: '💻', text: '已运行', chip: ev.summary };
-      case 'screenshot':  return { ico: '📷', text: '已截屏' };
-      case 'get_weather': return { ico: '🌤', text: '已查询天气', chip: ev.summary };
-      case 'web_search':  return { ico: '🔍', text: '已搜索', chip: ev.summary };
-      case 'list_installed_games': return { ico: '🎮', text: '已查询游戏库' };
-      case 'find_game':   return { ico: '🎮', text: '已在商店搜索', chip: ev.summary };
-      case 'list_emulator_roms': return { ico: '🕹', text: '已扫描模拟器 ROM' };
-      case 'check_system_updates': return { ico: '⬆️', text: '已检查系统更新' };
-      case 'install_game': return { ico: '📥', text: '已安装游戏', chip: ev.summary };
-      default:            return { ico: '🔧', text: '已完成 ' + (ev.label || ev.name), chip: ev.summary };
+      case 'edit_file':   return { text: '已编辑 1个文件' };
+      case 'run_command': return { text: '已运行', chip: ev.summary };
+      case 'screenshot':  return { text: '已截屏' };
+      case 'get_weather': return { text: '已查询天气', chip: ev.summary };
+      case 'web_search':  return { text: '已搜索', chip: ev.summary };
+      case 'list_installed_games': return { text: '已查询游戏库' };
+      case 'find_game':   return { text: '已在商店搜索', chip: ev.summary };
+      case 'list_emulator_roms': return { text: '已扫描模拟器 ROM' };
+      case 'check_system_updates': return { text: '已检查系统更新' };
+      case 'install_game': return { text: '已安装游戏', chip: ev.summary };
+      default:            return { text: '已完成 ' + (ev.label || ev.name), chip: ev.summary };
     }
   }
 
-  // 通用时间线行：head（图标+文案+箭头）+ 可展开 body
-  function makeTlRow(ico, text, chip, open) {
+  // 通用时间线行：head（节点+文案+箭头）+ 可展开 body
+  function makeTlRow(text, chip, open) {
     var tl = document.createElement('div');
     tl.className = 'tl';
     var head = document.createElement('div');
     head.className = 'tl-head clickable';
     var ic = document.createElement('span');
-    ic.className = 'tl-ico'; ic.textContent = ico;
+    ic.className = 'tl-ico';
     var tx = document.createElement('span');
     tx.textContent = text;
     head.appendChild(ic); head.appendChild(tx);
@@ -760,7 +760,7 @@
 
   // 思维链行（live 流式与历史渲染共用）
   function makeThoughtRow(text, open) {
-    var r = makeTlRow('🧠', '思考', null, open);
+    var r = makeTlRow('思考', null, open);
     var arrow = document.createElement('span');
     arrow.className = 'tl-arrow';
     arrow.textContent = open ? '▾' : '▸';
@@ -782,8 +782,8 @@
     if (ev.type !== 'tool') return;
     var info = toolRowInfo(ev);
     var hasBody = !!(ev.output || ev.image || ev.diff || (ev.files && ev.files.length));
-    var r = makeTlRow(ev.approved ? '✓' : info.ico,
-                      ev.approved ? ('已批准：' + (ev.summary || '')) : info.text, null, false);
+    var r = makeTlRow(ev.approved ? ('已批准：' + (ev.summary || '')) : info.text,
+                      null, false);
     if (!ev.approved && info.chip) {
       var chipEl = document.createElement('span');
       chipEl.className = 'tl-chip';
@@ -831,7 +831,7 @@
       (ev.files || []).forEach(function (f) {
         var fr2 = document.createElement('div');
         fr2.className = 'tl-file';
-        fr2.textContent = '📄 写入 ';
+        fr2.textContent = '写入 ';
         var fn2 = document.createElement('span'); fn2.className = 'fname';
         fn2.textContent = f;
         fr2.appendChild(fn2);
@@ -1011,7 +1011,7 @@
           flushQueue(!!msg.cancelled);  // 有排队消息则自动发出
           break;
         case 'tool_activity':
-          showTyping('🔧 ' + msg.text);
+          showTyping(msg.text);
           break;
         case 'status':
           renderStatus(msg.data || {});
@@ -1043,7 +1043,7 @@
   function renderStatus(s) {
     if (s.battery != null) {
       batteryBadge.hidden = false;
-      batteryBadge.textContent = (s.charging === 'Charging' ? '⚡' : '🔋') + s.battery + '%';
+      batteryBadge.textContent = s.battery + '%' + (s.charging === 'Charging' ? ' 充电中' : '');
     }
     if (s.mode) {
       modeBadge.hidden = false;
@@ -1051,7 +1051,7 @@
     }
     if (s.context) {
       ctxBadge.hidden = false;
-      ctxBadge.textContent = '📦 上下文 ' + s.context.messages + '/' + s.context.limit;
+      ctxBadge.textContent = '上下文 ' + s.context.messages + '/' + s.context.limit;
       ctxBadge.title = '上下文约 ' + s.context.chars + ' 字符 · 工作区 ' + (s.workspace || '');
     }
     if (s.llm_configured === false) {
@@ -1083,10 +1083,10 @@
       menu.className = 'q-menu';
       var now = document.createElement('button');
       now.className = 'q-now';
-      now.textContent = '⚡ 立即发送（终止当前操作）';
+      now.textContent = '立即发送（终止当前操作）';
       now.addEventListener('click', function () { sendQueuedNow(i); });
       var drop = document.createElement('button');
-      drop.textContent = '✕ 取消等待（放回输入框）';
+      drop.textContent = '取消等待（放回输入框）';
       drop.addEventListener('click', function () {
         msgQueue.splice(i, 1);
         input.value = input.value ? input.value + '\n' + text : text;
@@ -1153,7 +1153,7 @@
       .catch(function () { addSystem('操作失败'); });
   });
   document.getElementById('btnCompact').addEventListener('click', function () {
-    addSystem('🗜 正在压缩上下文…');
+    addSystem('正在压缩上下文…');
     fetch('/api/compact?token=' + encodeURIComponent(token), { method: 'POST' })
       .then(function (r) { return r.json(); })
       .then(function (res) { addSystem('压缩完成：' + (res.summary || '').slice(0, 120)); refreshStatus(); })
@@ -1317,7 +1317,7 @@
           return null;
         }
         return reloadModels().then(function (list) {
-          cfgHint.textContent = list.length ? ('已保存并生效 ✓ 共 ' + list.length + ' 个模型') : '已保存，但没拉到模型列表';
+          cfgHint.textContent = list.length ? ('已保存并生效，共 ' + list.length + ' 个模型') : '已保存，但没拉到模型列表';
           loadToolbar();  // 刷新右上角当前模型显示
           setTimeout(function () { settingsPanel.classList.remove('show'); }, 1200);
         });
@@ -1535,7 +1535,7 @@
         }
         res.files.forEach(function (f) {
           var b = document.createElement('button');
-          b.textContent = '📄 ' + f;
+          b.textContent = f;
           b.addEventListener('click', function () {
             input.value += (input.value ? ' ' : '') + '@{' + f + '}';
             fileList.classList.remove('show');
@@ -1587,7 +1587,7 @@
   function applyTheme(t) {
     document.documentElement.setAttribute('data-theme', t);
     localStorage.setItem('deckmate_theme', t);
-    document.getElementById('btnTheme').textContent = t === 'light' ? '🌙 深色模式' : '☀️ 浅色模式';
+    document.getElementById('btnTheme').textContent = t === 'light' ? '深色模式' : '浅色模式';
   }
   applyTheme(localStorage.getItem('deckmate_theme') || 'dark');
   document.getElementById('btnTheme').addEventListener('click', function () {
@@ -1653,7 +1653,7 @@
           row.appendChild(title);
           var del = document.createElement('button');
           del.className = 's-del';
-          del.textContent = '🗑';
+          del.textContent = '删除';
           del.title = '删除会话';
           del.addEventListener('click', function (e) {
             e.stopPropagation();
@@ -1661,7 +1661,7 @@
             if (!del.classList.contains('confirm')) {
               del.classList.add('confirm');
               del.textContent = '确认?';
-              setTimeout(function () { del.classList.remove('confirm'); del.textContent = '🗑'; }, 2500);
+              setTimeout(function () { del.classList.remove('confirm'); del.textContent = '删除'; }, 2500);
               return;
             }
             fetch('/api/sessions/' + s.id + '?token=' + encodeURIComponent(token), { method: 'DELETE' })
@@ -1727,11 +1727,11 @@
 
   // ---------- / 快捷命令 ----------
   var COMMANDS = [
-    { cmd: 'shot', label: '📷 截屏并展示', run: function () { document.getElementById('pmShot').click(); } },
-    { cmd: 'new', label: '🆕 新会话', run: function () { document.getElementById('btnNew').click(); } },
-    { cmd: 'compact', label: '🗜 压缩上下文', run: function () { document.getElementById('btnCompact').click(); } },
-    { cmd: 'retry', label: '↻ 重试上一轮', run: function () { document.getElementById('btnRetry').click(); } },
-    { cmd: 'weather', label: '🌤 查天气（发送询问）', run: function () { input.value = '查一下现在上海的天气'; } }
+    { cmd: 'shot', label: '截屏并展示', run: function () { document.getElementById('pmShot').click(); } },
+    { cmd: 'new', label: '新会话', run: function () { document.getElementById('btnNew').click(); } },
+    { cmd: 'compact', label: '压缩上下文', run: function () { document.getElementById('btnCompact').click(); } },
+    { cmd: 'retry', label: '重试上一轮', run: function () { document.getElementById('btnRetry').click(); } },
+    { cmd: 'weather', label: '查天气（发送询问）', run: function () { input.value = '查一下现在上海的天气'; } }
   ];
   input.addEventListener('input', function () {
     var v = input.value;

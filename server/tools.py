@@ -760,7 +760,7 @@ async def _list_dir(path: str = "") -> str:
         return f"不是目录：{d}"
     entries = []
     for p in sorted(d.iterdir(), key=lambda x: (x.is_file(), x.name)):
-        tag = "📁" if p.is_dir() else "📄"
+        tag = "[目录]" if p.is_dir() else "[文件]"
         size = f" ({p.stat().st_size}B)" if p.is_file() else ""
         entries.append(f"{tag} {p.name}{size}")
     return f"{d} 共 {len(entries)} 项：\n" + ("\n".join(entries[:200]) or "（空）")
