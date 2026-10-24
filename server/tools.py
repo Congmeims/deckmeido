@@ -712,8 +712,53 @@ async def _list_emulator_roms(system: str = "") -> str:
     return f"共 {sum(counts.values())} 个游戏文件：\n" + "\n".join(lines)
 
 
+async def _gamescope_pw_node() -> str | None:
+    """游戏模式下找 gamescope 的 PipeWire 视频节点 id；找不到返回 None"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "pw-dump", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        nodes = json.loads(out or b"[]")
+        for o in nodes:
+            props = (o.get("info") or {}).get("props") or {}
+            if props.get("node.name") == "gamescope" and props.get("media.class") == "Video/Source":
+                return str(o.get("id"))
+    except Exception:
+        return None
+    return None
+
+
+async def _screenshot_gamescope(path: Path) -> bool:
+    """游戏模式：从 gamescope 的 PipeWire 视频节点直接抓一帧（不经过桌面会话）"""
+    node = await _gamescope_pw_node()
+    if not node or not shutil.which("gst-launch-1.0"):
+        return False
+    env = dict(os.environ)
+    env["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
+    raw = path.with_suffix(".raw.png")
+    cmd = [
+        "gst-launch-1.0", "-q", f"pipewiresrc path={node} num-buffers=6", "!",
+        "videoconvert", "!", "pngenc", "!", f"filesink location={raw}",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=env,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=25)
+        if not raw.exists() or raw.stat().st_size < 10000:
+            return False
+        # pngenc 连续 6 帧会覆盖同一文件，取到的就是最后一帧，直接搬过来
+        raw.replace(path)
+        return True
+    except Exception:
+        return False
+    finally:
+        raw.unlink(missing_ok=True)
+
+
 async def _screenshot() -> str:
-    """截取当前桌面画面（Wayland 优先用 KWin spectacle，X11 退回 mss）"""
+    """截取当前画面（游戏模式走 gamescope 的 PipeWire 节点，桌面模式用 spectacle/mss）"""
     import time
 
     shots_dir = Path(__file__).resolve().parent / "static" / "shots"
@@ -724,6 +769,12 @@ async def _screenshot() -> str:
         p.unlink(missing_ok=True)
     name = f"shot_{int(time.time())}.png"
     path = shots_dir / name
+
+    # 游戏模式：桌面会话已经结束，只能从 gamescope 抓
+    if await _gamescope_pw_node():
+        if await _screenshot_gamescope(path):
+            return await _finish_shot(path, name, shots_dir, time)
+        return "截图失败：检测到游戏模式，但从 gamescope 的 PipeWire 节点抓帧失败"
 
     env = dict(os.environ)
     _fix_display_env(env)
@@ -745,19 +796,23 @@ async def _screenshot() -> str:
         await _set_overlay_lift(False)
     if not path.exists():
         return "截图失败：spectacle 与 mss 都不可用"
-    # 压缩一份给多模态模型看（1280 宽 JPEG）
+    return await _finish_shot(path, name, shots_dir, time)
+
+
+async def _finish_shot(path: Path, name: str, shots_dir: Path, time_mod) -> str:
+    """压缩一份给多模态模型看（1280 宽 JPEG），并返回给模型的结果文本"""
     global LAST_VISION
     LAST_VISION = None
     try:
         from PIL import Image
         img = Image.open(path)
         img.thumbnail((1280, 1280))
-        vpath = shots_dir / f"vision_{int(time.time())}.jpg"
+        vpath = shots_dir / f"vision_{int(time_mod.time())}.jpg"
         img.convert("RGB").save(vpath, "JPEG", quality=70)
         LAST_VISION = vpath
     except Exception:
         pass
-    return f"截图完成：/shots/{name}。当前桌面画面已附上，你可以直接根据画面内容回答用户的问题。"
+    return f"截图完成：/shots/{name}。当前画面已附上，你可以直接根据画面内容回答用户的问题。"
 
 
 async def _kdotool(*args: str) -> tuple[int, str]:

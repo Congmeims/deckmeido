@@ -22,3 +22,7 @@ _sess.json
 
 # 发布打包产物
 dist/
+
+# 安装时生成的产物（由 install.sh 写入，不入库）
+VERSION
+uninstall.sh
