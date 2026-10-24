@@ -25,5 +25,19 @@ class LLMClient:
         data = resp.json()
         return data["choices"][0]["message"]["content"]
 
+    async def chat_with_tools(self, messages: list[dict], tools: list[dict]) -> dict:
+        """带工具调用的对话，返回完整 message（含 content / tool_calls）"""
+        payload = {"model": self.model, "messages": messages}
+        if tools:
+            payload["tools"] = tools
+        resp = await self._client.post(
+            f"{self.base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]
+
     async def close(self):
         await self._client.aclose()

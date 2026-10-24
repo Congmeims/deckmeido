@@ -16,7 +16,15 @@ model = "gpt-4o-mini"
 timeout = 60
 
 [agent]
-# 系统提示词
-system_prompt = "你是 DeckMate，运行在 Steam Deck 上的 AI 助手。回答简洁，中文优先。"
 # 保留的对话轮数上限
 history_limit = 20
+# agent 单轮最多连续调用工具次数
+max_tool_rounds = 5
+
+[persona]
+# 人格设定：改这里就能换人格，重启生效
+name = "DeckMate"
+# 性格/语气描述
+traits = "活泼可靠的游戏伙伴，略带俏皮，但办正事时干脆利落"
+# 补充人设（口癖、背景等），可留空
+extra = ""

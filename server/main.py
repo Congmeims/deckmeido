@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import secrets
 import shutil
 import subprocess
@@ -15,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .llm import LLMClient
+from . import tools
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.toml"
@@ -47,11 +49,36 @@ llm = LLMClient(
     timeout=CFG["llm"].get("timeout", 60),
 )
 
-SYSTEM_PROMPT = CFG["agent"]["system_prompt"]
+PERSONA = CFG.get("persona", {})
 HISTORY_LIMIT = int(CFG["agent"].get("history_limit", 20))
+MAX_TOOL_ROUNDS = int(CFG["agent"].get("max_tool_rounds", 5))
+
+
+def build_system_prompt() -> str:
+    name = PERSONA.get("name", "DeckMate")
+    traits = PERSONA.get("traits", "")
+    extra = PERSONA.get("extra", "")
+    p = (
+        f"你是 {name}，{traits}。你运行在一台 Steam Deck 上，是这台设备的智能代理。\n"
+        "你可以调用工具来完成任务：查天气、搜索网页、查看已安装游戏、在商店搜索游戏、"
+        "检查系统更新、下载安装游戏。\n"
+        "规则：\n"
+        "- 涉及真实变更的操作（如安装游戏）会先向用户描述，等用户确认后才执行\n"
+        "- 回答简洁，中文优先，保持人设语气\n"
+        "- 需要 appid 时先用 find_game 查询，不要编造"
+    )
+    if extra:
+        p += f"\n补充人设：{extra}"
+    return p
+
+
+SYSTEM_PROMPT = build_system_prompt()
 
 # 内存中的对话历史（单会话，MVP）
 history: list[dict] = []
+
+# 待确认的危险操作 {name, args, description}
+pending_action: dict | None = None
 
 
 # ---------- WebSocket 连接管理 ----------
@@ -141,22 +168,61 @@ async def api_chat(req: ChatRequest):
 
 
 async def handle_chat(text: str) -> str:
+    global pending_action
     await manager.broadcast({"type": "user_message", "text": text, "ts": time.time()})
     history.append({"role": "user", "content": text})
     del history[:-HISTORY_LIMIT]
 
     if not llm.configured:
         reply = "LLM 未配置 API Key。请编辑 Deck 上的 ~/deckmate/server/config.toml 填入 api_key 后重启服务。"
+    elif pending_action and tools.is_confirm(text):
+        # 用户确认了挂起的危险操作
+        action, pending_action = pending_action, None
+        await manager.broadcast({"type": "tool_activity", "text": f"正在执行：{action['description']}", "ts": time.time()})
+        result = await tools.execute(action["name"], action["args"])
+        reply = f"已完成：{action['description']}\n{result}"
+    elif pending_action:
+        # 有新消息但未确认，取消挂起操作
+        action, pending_action = pending_action, None
+        reply = f"已取消：{action['description']}。\n\n" + await run_agent()
     else:
-        try:
-            msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + history
-            reply = await llm.chat(msgs)
-        except Exception as e:
-            reply = f"LLM 调用失败：{e}"
+        reply = await run_agent()
 
     history.append({"role": "assistant", "content": reply})
     await manager.broadcast({"type": "assistant_message", "text": reply, "ts": time.time()})
     return reply
+
+
+async def run_agent() -> str:
+    """LLM + 工具调用循环"""
+    global pending_action
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + list(history)
+    try:
+        for _ in range(MAX_TOOL_ROUNDS):
+            msg = await llm.chat_with_tools(msgs, tools.TOOLS)
+            tool_calls = msg.get("tool_calls") or []
+            if not tool_calls:
+                return msg.get("content") or "（没有回复内容）"
+
+            msgs.append(msg)
+            for call in tool_calls:
+                name = call["function"]["name"]
+                try:
+                    args = json.loads(call["function"].get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+
+                if name in tools.DANGEROUS:
+                    # 挂起危险操作，等用户下一轮确认
+                    pending_action = {"name": name, "args": args, "description": tools.describe(name, args)}
+                    return f"我需要执行一个会影响设备的操作：\n\n**{pending_action['description']}**\n\n回复「确认」我就执行，说别的就当作取消。"
+
+                await manager.broadcast({"type": "tool_activity", "text": f"调用工具 {name}", "ts": time.time()})
+                result = await tools.execute(name, args)
+                msgs.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+        return "（工具调用次数超限，换个问法试试吧）"
+    except Exception as e:
+        return f"LLM 调用失败：{e}"
 
 
 @app.websocket("/ws")

@@ -306,6 +306,9 @@
           hideTyping();
           addMsg('assistant', msg.text, msg.ts);
           break;
+        case 'tool_activity':
+          addSystem('🔧 ' + msg.text);
+          break;
         case 'status':
           renderStatus(msg.data || {});
           break;
