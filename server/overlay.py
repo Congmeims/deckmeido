@@ -145,8 +145,9 @@ class Mask(QWidget):
         self._set_lifted(bool(state.get("lift")))
         # 正在显示、刚要求穿透、或刚要求抬高遮罩时，切到快速轮询
         self._urgent = bool(show or self._passthrough or self._lifted)
+        # 显示条件里不能再排除 passthrough：穿透只是不接鼠标，画面仍要留在屏幕上
         if show:
-            if not self.isVisible() and not self._passthrough and not self._lifted:
+            if not self.isVisible() and not self._lifted:
                 self._show_mask()
                 self._shown_at = now
                 self._cancelled = False
@@ -157,11 +158,13 @@ class Mask(QWidget):
         if on == self._passthrough:
             return
         self._passthrough = on
-        # 穿透期间直接把窗口藏起来：X11 下改 WA_TransparentForMouseEvents
-        # 需要重建窗口，隐藏再显示更简单可靠
-        if on:
-            self.hide()
+        # 穿透期间只让鼠标事件透过，窗口本身不能藏掉：遮罩要一直显示「正在操作」，
+        # 用户也还能看到进度。用属性而不是 hide()，重绘时保留半透明底
         self.setAttribute(Qt.WA_TransparentForMouseEvents, on)
+        if not on and self._show_wanted and not self._lifted and not self.isVisible():
+            self._show_mask()
+            self._shown_at = time.monotonic()
+        self.repaint()
 
     def _set_lifted(self, on: bool):
         """截图期间把遮罩藏起来，拍完立刻恢复，不影响「点一下终止」"""

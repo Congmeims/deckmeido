@@ -776,7 +776,8 @@ async def _desktop(action: str, target: str = "", x: int = 0, y: int = 0, text: 
         return f"已切到前台：{name}"
 
     if action in ("move", "click"):
-        # 点击会落在遮罩上变成「用户终止」，先让遮罩让开并等它确认
+        # 遮罩盖在桌面最上层：不打开穿透，光标会被挡在遮罩下面（移动也看不见落点），
+        # 点击更会被当成「用户终止」，所以 move 也要先让开
         await _set_overlay_passthrough(True)
         try:
             await _move_to(x, y)

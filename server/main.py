@@ -1179,7 +1179,11 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
         msg = await llm.chat_with_tools_stream(msgs, [], on_delta)
         if msg.get("reasoning_content"):
             events.append({"type": "thought", "text": msg["reasoning_content"]})
-        return msg.get("content") or "（操作步骤较多已执行完，以上是过程结果）"
+        answer = (msg.get("content") or "").strip()
+        limit_note = (f"（已经连续执行 {MAX_TOOL_ROUNDS} 步，到了单轮上限，后面的步骤没有继续。"
+                      f"要接着做的话说一声，或把 max_tool_rounds 调大）")
+        # 收尾时模型经常什么都不写：这不是正常答复，要把「为什么停」说清楚
+        return f"{answer}\n\n{limit_note}" if answer else limit_note
     except Exception as e:
         return f"LLM 调用失败：{e}"
 
