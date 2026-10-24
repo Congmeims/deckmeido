@@ -641,7 +641,8 @@ async def api_set_config(req: ConfigUpdate):
 
 # ---------- 版本与升级 ----------
 
-@app.get("/api/version", dependencies=[Depends(check_token)])
+# 不校验令牌：鉴权页在登录前就要显示版本号
+@app.get("/api/version")
 async def api_version():
     return {
         "version": VERSION,

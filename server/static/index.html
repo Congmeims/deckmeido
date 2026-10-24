@@ -791,11 +791,12 @@
     <img class="auth-logo" src="logo.png" alt="DeckMeido">
     <h1>DeckMeido <small>控制台</small></h1>
     <p>输入访问令牌即可连接这台 Steam Deck</p>
-    <input id="tokenInput" type="password" placeholder="访问令牌" autocomplete="off" spellcheck="false">
+    <input id="tokenInput" type="password" placeholder="访问令牌（默认 meido）" autocomplete="off" spellcheck="false">
     <div id="authErr" class="auth-err"></div>
     <button id="tokenBtn">连接</button>
     <div class="auth-tip">
-      令牌在客户端设置页随机生成或自定义
+      令牌默认为 meido，可在客户端设置页修改<br>
+      当前版本 <span id="authVer">…</span>
     </div>
   </div>
 </div>
@@ -874,6 +875,7 @@
   var tokenInput = document.getElementById('tokenInput');
   var tokenBtn = document.getElementById('tokenBtn');
   var authErr = document.getElementById('authErr');
+  var authVer = document.getElementById('authVer');
 
   // token：URL > localStorage
   var token = (new URLSearchParams(location.search).get('token') || localStorage.getItem('deckmeido_token') || '').trim().toLowerCase();
@@ -1341,7 +1343,19 @@
     authErr.textContent = err || '';
     authOverlay.classList.add('show');
     tokenInput.value = '';
+    loadAuthVersion();
     setTimeout(function () { tokenInput.focus(); }, 50);
+  }
+
+  // 鉴权页显示版本号：这个接口不校验令牌，未登录也能查
+  var authVerLoaded = false;
+  function loadAuthVersion() {
+    if (authVerLoaded) return;
+    authVerLoaded = true;
+    fetch('/api/version')
+      .then(function (r) { return r.json(); })
+      .then(function (v) { authVer.textContent = 'v' + (v.version || '?'); })
+      .catch(function () { authVer.textContent = '未知'; });
   }
 
   // 令牌变更后立即用新令牌重连（不等退避）
