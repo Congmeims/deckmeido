@@ -392,7 +392,7 @@ print_done() {
   info "DeckMeido 已就绪"
   dim "本机控制台:  http://127.0.0.1:$PORT/?token=$token"
   dim "局域网访问:  http://$ip:$PORT/?token=$token"
-  dim "访问令牌默认为 meido，可在客户端设置页修改"
+  dim "访问令牌默认为 meido 可在客户端设置页修改"
   dim "配置文件:    $INSTALL_DIR/server/config.toml"
   dim "卸载脚本:    bash $INSTALL_DIR/uninstall.sh   （加 --purge 连配置一起删）"
   echo
