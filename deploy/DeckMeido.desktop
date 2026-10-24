@@ -1,7 +1,9 @@
 [Desktop Entry]
 Name=DeckMeido
 Comment=DeckMeido AI 客户端
-Exec=/home/deck/deckmate/.venv/bin/python /home/deck/deckmate/client/main.py
-Icon=/home/deck/deckmate/assets/logo.png
+Exec=__INSTALL_DIR__/.venv/bin/python __INSTALL_DIR__/client/main.py
+Icon=__INSTALL_DIR__/assets/logo.png
 Type=Application
 Terminal=false
+Categories=Utility;
+StartupWMClass=DeckMeido

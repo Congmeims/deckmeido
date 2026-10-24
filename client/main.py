@@ -8,6 +8,7 @@ URL 带 native=1 标记，网页会据此把「点开图片」改为调用系统
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -19,9 +20,14 @@ from PySide6.QtCore import QEvent, QObject, Qt, QUrl
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
-DECKMATE_DIR = Path.home() / "deckmate"
-CONFIG_PATH = DECKMATE_DIR / "server" / "config.toml"
-API = "http://127.0.0.1:18765"
+# 安装目录：默认取本文件的两级上层（client/main.py → 仓库根），
+# 这样装到任意路径都能用；DECKMEIDO_DIR 可显式覆盖
+DECKMEIDO_DIR = Path(
+    os.environ.get("DECKMEIDO_DIR") or Path(__file__).resolve().parent.parent
+)
+CONFIG_PATH = DECKMEIDO_DIR / "server" / "config.toml"
+PORT = os.environ.get("DECKMEIDO_PORT", "18765")
+API = f"http://127.0.0.1:{PORT}"
 
 # Steam Deck 桌面 1280x800，窗口不超过它
 WINDOW_W, WINDOW_H = 1240, 760
@@ -42,9 +48,9 @@ def ensure_backend() -> bool:
     except Exception:
         pass
     subprocess.Popen(
-        [str(DECKMATE_DIR / ".venv/bin/python"), "-m", "uvicorn",
-         "server.main:app", "--host", "0.0.0.0", "--port", "18765"],
-        cwd=DECKMATE_DIR,
+        [str(DECKMEIDO_DIR / ".venv/bin/python"), "-m", "uvicorn",
+         "server.main:app", "--host", "0.0.0.0", "--port", PORT],
+        cwd=DECKMEIDO_DIR,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
@@ -66,7 +72,7 @@ def main() -> int:
         QMessageBox.critical(
             None, "DeckMeido",
             "缺少 PySide6-WebEngine 组件，请在终端运行：\n"
-            "~/deckmate/.venv/bin/pip install PySide6-WebEngine",
+            f"{DECKMEIDO_DIR}/.venv/bin/pip install PySide6-WebEngine",
         )
         return 1
 
@@ -90,14 +96,14 @@ def main() -> int:
     app.setQuitOnLastWindowClosed(False)
 
     if not ensure_backend():
-        QMessageBox.critical(None, "DeckMeido", "后端核心启动失败，请检查 ~/deckmate 是否完整。")
+        QMessageBox.critical(None, "DeckMeido", f"后端核心启动失败，请检查 {DECKMEIDO_DIR} 是否完整（可重跑 install.sh）。")
         return 1
 
     view = QWebEngineView()
     view.setPage(WebPage(view))
     view.setWindowTitle("DeckMeido")
     view.resize(WINDOW_W, WINDOW_H)
-    icon_path = DECKMATE_DIR / "assets" / "logo.png"
+    icon_path = DECKMEIDO_DIR / "assets" / "logo.png"
     icon = QIcon(str(icon_path)) if icon_path.exists() else QIcon()
     view.setWindowIcon(icon)
     view.load(QUrl(f"{API}/?token={load_token()}&native=1"))

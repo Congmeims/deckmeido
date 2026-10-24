@@ -132,7 +132,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_command",
-            "description": "在设备上执行 bash 命令（通用能力：文件/进程/桌面操作 xdotool/截屏/软件管理等）。环境：SteamOS、桌面模式 X11 DISPLAY=:0、家目录 /home/deck。避免交互式参数。启动浏览器/播放器/游戏这类常驻程序直接写命令即可，系统会自动判定已拉起并返回，不用加 nohup 或 &；需要拿到输出的命令才会等待执行完成",
+            "description": f"在设备上执行 bash 命令（通用能力：文件/进程/桌面操作 xdotool/截屏/软件管理等）。环境：SteamOS、桌面模式 X11 DISPLAY=:0、家目录 {Path.home()}。避免交互式参数。启动浏览器/播放器/游戏这类常驻程序直接写命令即可，系统会自动判定已拉起并返回，不用加 nohup 或 &；需要拿到输出的命令才会等待执行完成",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -178,11 +178,11 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "list_dir",
-            "description": "列出目录内容（编程/文件任务先看结构）。默认列出工作区 ~/deckmate_workspace",
+            "description": "列出目录内容（编程/文件任务先看结构）。默认列出工作区（家目录下的 deckmeido_workspace）",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "目录路径，默认 ~/deckmate_workspace"},
+                    "path": {"type": "string", "description": "目录路径，默认当前工作区"},
                 },
             },
         },
@@ -813,7 +813,7 @@ LAST_VISION: Path | None = None
 LAST_DIFF: dict | None = None
 
 
-WORKSPACE = Path.home() / "deckmate_workspace"
+WORKSPACE = Path.home() / "deckmeido_workspace"
 
 
 def set_workspace(path: str):

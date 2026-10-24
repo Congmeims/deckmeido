@@ -112,44 +112,52 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 
 - Steam Deck（SteamOS 桌面模式）或其他 Linux 桌面
 - Python 3.11+（用到 `tomllib`）
-- 桌面环境需可用：X11 下 `xdotool`，Wayland 下 `spectacle`（KWin 自带）
+- 可选：`spectacle`（KWin 截图，一般自带）、`kdotool` / `ydotool`（按窗口名聚焦与合成输入）、`espeak-ng`（语音播报）
 
-### 安装
+### 一键安装
 
 ```bash
-git clone https://github.com/Congmeims/deckmate.git ~/deckmate
-cd ~/deckmate
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/pip install PySide6 PySide6-WebEngine   # 仅原生客户端需要
+curl -fsSL https://raw.githubusercontent.com/Congmeims/deckmeido/main/install.sh | bash
 ```
 
-### 配置
-
-首次启动会从 `server/config.example.toml` 生成 `server/config.toml`，填入 `[llm]` 的 `base_url`、`api_key`、`model` 即可。`[server].token` 留空会自动生成。
-
-### 启动
+或手动拉源码后执行：
 
 ```bash
-# 后端
+git clone https://github.com/Congmeims/deckmeido.git ~/deckmeido
+cd ~/deckmeido && bash install.sh
+```
+
+脚本会：建虚拟环境 → 装依赖（含 PySide6）→ 生成配置 → 注册 `deckmeido.service` 用户服务并开机自启 → 装好应用菜单快捷方式，最后打印带令牌的访问地址。
+
+也可以下载 Release 里的 `deckmeido-*.tar.gz`，解压后执行其中的 `install.sh`（不需要 git）。
+
+```bash
+bash install.sh upgrade      # 升级：同步代码 + 依赖，保留配置与会话
+bash install.sh uninstall    # 卸载：停服务、删快捷方式，保留配置与工作区
+bash install.sh uninstall --purge   # 连配置与工作区一起删
+```
+
+自定义位置与端口：`DECKMEIDO_DIR=~/apps/deckmeido DECKMEIDO_PORT=18765 bash install.sh`
+
+### 第一次使用
+
+1. 打开 `http://<deck-ip>:18765/?token=<令牌>`（安装脚本会把完整地址打出来）
+2. 首次连接会自动弹出设置页——填 **API 地址** 与 **Key**，保存即可开始对话；不配也能进，只是对话不可用
+3. 设置页里可以「随机生成」或自定义访问令牌（5 位字母数字，校验不分大小写，保存后立即生效）
+4. 想用手机连？点设置页里的「二维码」，手机扫码直接带令牌进入
+
+不跑脚本时的手动启动方式：
+
+```bash
 .venv/bin/python -m uvicorn server.main:app --host 0.0.0.0 --port 18765
-
-# 或注册成用户服务（随登录自启）
-cp deploy/deckmate.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now deckmate
-
-# 原生客户端
-.venv/bin/python client/main.py
+.venv/bin/python client/main.py     # 原生客户端
 ```
-
-桌面快捷方式见 `deploy/DeckMeido.desktop`。浏览器访问 `http://<deck-ip>:18765/?token=<token>` 即可远程使用。
 
 ## 配置
 
 | 段落 | 键 | 说明 |
 | --- | --- | --- |
-| `[server]` | `port` / `token` | 监听端口；访问令牌，留空自动生成 |
+| `[server]` | `port` / `token` | 监听端口；访问令牌，留空自动生成（5 位字母数字） |
 | `[llm]` | `base_url` / `api_key` / `model` | OpenAI 兼容接口 |
 | | `reasoning_effort` | `low` / `medium` / `high`，留空则不发送 |
 | `[agent]` | `max_tool_rounds` | 单轮最多连续调用工具次数，默认 12 |
@@ -158,17 +166,20 @@ systemctl --user enable --now deckmate
 | `[persona]` | `name` / `traits` / `extra` | 人格名称与性格描述，改这里就换人格 |
 | `[tts]` | `enable` / `engine` / `voice` | 语音播报开关与引擎参数 |
 | `[security]` | `permission_mode` | `manual` / `auto` / `full` |
-| `[workspace]` | `dir` | 编程与文件任务的默认工作区 |
+| `[workspace]` | `dir` | 编程与文件任务的默认工作区，留空则用 `~/deckmeido_workspace` |
+
+配置文件位置：安装目录下的 `server/config.toml`（首次启动自动生成）。
 
 ## 目录结构
 
 ```
-deckmate/
+deckmeido/
+├── install.sh                 一键安装 / 升级 / 卸载
 ├── assets/logo.png            应用图标（桌面快捷方式、托盘、网页 favicon）
 ├── client/main.py             PySide6 原生客户端（含托盘）
 ├── deploy/
-│   ├── deckmate.service       systemd 用户服务
-│   └── DeckMeido.desktop      桌面快捷方式
+│   ├── deckmeido.service      systemd 用户服务
+│   └── DeckMeido.desktop      桌面快捷方式模板
 ├── server/
 │   ├── main.py                FastAPI 服务、会话、approval、遮罩调度
 │   ├── llm.py                 OpenAI 兼容流式客户端
@@ -179,7 +190,8 @@ deckmate/
 │   └── static/index.html      单文件 Web 控制台
 └── tools/
     ├── make_icon.py           由 SVG 渲染 PNG 图标
-    └── make_icon_png.py       由成品 PNG 生成各尺寸图标
+    ├── make_icon_png.py       由成品 PNG 生成各尺寸图标
+    └── make_release.sh        打 Release 用的 tar.gz
 ```
 
 ## 已知限制

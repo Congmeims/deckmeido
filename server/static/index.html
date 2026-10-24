@@ -367,31 +367,49 @@
     display: none;
     align-items: center;
     justify-content: center;
-    flex-direction: column;
-    gap: 14px;
     padding: 24px;
     z-index: 10;
   }
   #authOverlay.show { display: flex; }
-  #authOverlay h1 { font-size: 20px; }
-  #authOverlay p { color: var(--muted); font-size: 14px; text-align: center; line-height: 1.6; }
+  .auth-card {
+    display: flex; flex-direction: column; align-items: center;
+    gap: 14px; width: 100%; max-width: 360px;
+  }
+  .auth-logo {
+    width: 88px; height: 88px; border-radius: 22px;
+    box-shadow: 0 6px 20px rgba(0,0,0,.14);
+  }
+  .auth-card h1 {
+    font-size: 22px; letter-spacing: .5px; margin: 0;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .auth-card h1 small {
+    font-size: 12px; font-weight: 400; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px;
+  }
+  .auth-card p { color: var(--muted); font-size: 13.5px; text-align: center; line-height: 1.6; margin: 0; }
+  .auth-err { color: #e5484d; font-size: 13px; min-height: 18px; }
   #tokenInput {
-    width: 100%; max-width: 320px;
+    width: 100%;
     padding: 12px 14px;
     border: 1px solid var(--line);
     border-radius: 10px;
     background: var(--surface-2);
     color: var(--text);
-    font-size: 16px;
+    font-size: 18px;
+    letter-spacing: 2px;
     outline: none;
     text-align: center;
   }
+  #tokenInput:focus { border-color: var(--brand); }
   #tokenBtn {
+    width: 100%;
     padding: 12px 32px;
     border: none; border-radius: 10px;
     background: var(--brand); color: #fff;
     font-size: 16px; font-weight: 600;
   }
+  .auth-tip { font-size: 12px; color: var(--muted); text-align: center; line-height: 1.6; }
 
   /* 设置按钮与面板 */
   /* 主题与设置放在侧栏「会话」区域底部 */
@@ -455,6 +473,11 @@
   }
   .mini-btn:hover { border-color: var(--brand); color: var(--brand); }
   .field-hint { font-size: 12px; color: var(--muted); margin-top: 6px; min-height: 16px; }
+  /* 扫码连接 */
+  .qr-box { display: none; margin-top: 10px; text-align: center; }
+  .qr-box.show { display: block; }
+  .qr-box img { width: 180px; height: 180px; border-radius: 10px; background: #fff; padding: 8px; }
+  .qr-box p { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
   .switch { position: relative; width: 46px; height: 26px; }
   .switch input { opacity: 0; width: 0; height: 0; }
   .slider {
@@ -677,10 +700,18 @@
 <input type="file" id="imgInput" accept="image/*" hidden>
 
 <div id="authOverlay">
-  <h1>DeckMeido 控制台</h1>
-  <p>请输入访问令牌（token）。<br>令牌可在 Deck 的 ~/deckmate/server/config.toml 中查看，<br>也可在设置页里随机生成或自定义。</p>
-  <input id="tokenInput" type="password" placeholder="token" autocomplete="off">
-  <button id="tokenBtn">连接</button>
+  <div class="auth-card">
+    <img class="auth-logo" src="logo.png" alt="DeckMeido">
+    <h1>DeckMeido <small>控制台</small></h1>
+    <p>输入访问令牌即可连接这台 Steam Deck</p>
+    <input id="tokenInput" type="password" placeholder="访问令牌" autocomplete="off" spellcheck="false">
+    <div id="authErr" class="auth-err"></div>
+    <button id="tokenBtn">连接</button>
+    <div class="auth-tip">
+      令牌在 Deck 的 <code>~/deckmeido/server/config.toml</code> 里（<code>token =</code> 那一行），<br>
+      也可以在网页设置页随机生成或自定义
+    </div>
+  </div>
 </div>
 
 <div id="settingsPanel">
@@ -711,7 +742,7 @@
     </div>
     <div class="field">
       <label>工作区目录（编程/文件任务默认位置）</label>
-      <input id="cfgWorkspace" type="text" placeholder="/home/deck/deckmate_workspace" autocomplete="off">
+      <input id="cfgWorkspace" type="text" placeholder="~/deckmeido_workspace" autocomplete="off">
     </div>
     <div class="field">
       <label>访问令牌（连接这台 Deck 用，4-32 位数字或字母，不分大小写）</label>
@@ -720,6 +751,14 @@
         <button id="genToken" class="mini-btn" type="button">随机生成</button>
       </div>
       <div id="tokenHint" class="field-hint"></div>
+    </div>
+    <div class="field">
+      <label>手机/其他设备连接</label>
+      <div class="token-row">
+        <input id="cfgUrl" type="text" readonly autocomplete="off">
+        <button id="qrBtn" class="mini-btn" type="button">二维码</button>
+      </div>
+      <div id="qrBox" class="qr-box"></div>
     </div>
     <button id="saveCfg">保存</button>
     <div id="cfgHint"></div>
@@ -739,10 +778,18 @@
   var authOverlay = document.getElementById('authOverlay');
   var tokenInput = document.getElementById('tokenInput');
   var tokenBtn = document.getElementById('tokenBtn');
+  var authErr = document.getElementById('authErr');
 
   // token：URL > localStorage
-  var token = new URLSearchParams(location.search).get('token') || localStorage.getItem('deckmate_token') || '';
-  if (token) localStorage.setItem('deckmate_token', token);
+  var token = (new URLSearchParams(location.search).get('token') || localStorage.getItem('deckmeido_token') || localStorage.getItem('deckmate_token') || '').trim().toLowerCase();
+  if (token) {
+    localStorage.setItem('deckmeido_token', token);
+    localStorage.removeItem('deckmate_token');
+    // 令牌已存到本地，把 URL 里的抹掉，避免截图/分享时泄露
+    if (new URLSearchParams(location.search).has('token')) {
+      history.replaceState(null, '', location.pathname);
+    }
+  }
 
   var ws = null;
   var typingEl = null;
@@ -1035,7 +1082,7 @@
   var streamBody = null;
 
   function connect() {
-    if (!token) { authOverlay.classList.add('show'); return; }
+    if (!token) { showAuth(''); return; }
     var proto = location.protocol === 'https:' ? 'wss' : 'ws';
     ws = new WebSocket(proto + '://' + location.host + '/ws?token=' + encodeURIComponent(token));
 
@@ -1043,6 +1090,15 @@
       setConnected(true);
       backoff = 1000;
       authOverlay.classList.remove('show');
+      authErr.textContent = '';
+      // 首次使用（还没配模型）自动打开设置页，省得用户找不到入口
+      if (!onboarded) {
+        onboarded = true;
+        fetch('/api/config?token=' + encodeURIComponent(token))
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (c) { if (c && !c.llm_configured) openSettings(); })
+          .catch(function () {});
+      }
     };
 
     ws.onmessage = function (ev) {
@@ -1167,9 +1223,13 @@
     ws.onclose = function (ev) {
       setConnected(false);
       hideTyping();
+      if (suppressReconnect) return;
       if (ev.code === 4401) {
-        localStorage.removeItem('deckmate_token');
-        authOverlay.classList.add('show');
+        // 令牌被拒：清掉本地缓存并停在鉴权页，不要继续重连（否则会无限弹回）
+        token = '';
+        localStorage.removeItem('deckmeido_token');
+        clearTimeout(reconnectTimer);
+        showAuth('令牌不正确，请重新输入');
         return;
       }
       reconnectTimer = setTimeout(connect, backoff);
@@ -1179,10 +1239,20 @@
     ws.onerror = function () { try { ws.close(); } catch (e) {} };
   }
 
+  function showAuth(err) {
+    setConnected(false);
+    authErr.textContent = err || '';
+    authOverlay.classList.add('show');
+    tokenInput.value = '';
+    setTimeout(function () { tokenInput.focus(); }, 50);
+  }
+
   // 令牌变更后立即用新令牌重连（不等退避）
   function reconnectNow() {
     clearTimeout(reconnectTimer);
+    suppressReconnect = true;
     if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} }
+    suppressReconnect = false;
     backoff = 1000;
     connect();
   }
@@ -1376,11 +1446,19 @@
 
   tokenBtn.addEventListener('click', function () {
     var t = tokenInput.value.trim().toLowerCase();
-    if (!t) return;
+    if (!t) { authErr.textContent = '请先输入令牌'; return; }
     token = t;
-    localStorage.setItem('deckmate_token', t);
+    localStorage.setItem('deckmeido_token', t);
     connect();
   });
+  tokenInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); tokenBtn.click(); }
+  });
+
+  // 连接中临时关闭自动重连（改令牌时会被服务端踢下线，不能让旧逻辑又弹回鉴权页）
+  var suppressReconnect = false;
+  // 首次连接只做一次引导检查
+  var onboarded = false;
 
   // ---------- 设置面板 ----------
   var settingsBtn = document.getElementById('settingsBtn');
@@ -1395,13 +1473,21 @@
   var tokenHint = document.getElementById('tokenHint');
   var saveCfg = document.getElementById('saveCfg');
   var cfgHint = document.getElementById('cfgHint');
+  var cfgUrl = document.getElementById('cfgUrl');
+  var qrBtn = document.getElementById('qrBtn');
+  var qrBox = document.getElementById('qrBox');
 
   function openSettings() {
     settingsPanel.classList.add('show');
     cfgHint.textContent = '';
     tokenHint.textContent = '';
+    qrBox.classList.remove('show');
+    qrBox.innerHTML = '';
     fetch('/api/config?token=' + encodeURIComponent(token))
-      .then(function (r) { return r.json(); })
+      .then(function (r) {
+        if (!r.ok) throw new Error(r.status === 401 ? '旧令牌已失效，请重新登录' : '读取失败');
+        return r.json();
+      })
       .then(function (c) {
         cfgBaseUrl.value = c.base_url || '';
         cfgApiKey.value = c.api_key || '';
@@ -1409,13 +1495,37 @@
         cfgPerm.value = c.permission_mode || 'auto';
         cfgWorkspace.value = c.workspace || '';
         cfgToken.value = c.token || '';
+        cfgUrl.value = location.origin + '/?token=' + encodeURIComponent(c.token || '');
+        // 没配 Key 时直接把设置页顶到最显眼的位置当首次引导
+        if (!c.llm_configured) {
+          cfgHint.textContent = '还没有配置模型：填好上面的 API 地址和 Key 就能开始对话';
+        }
       })
-      .catch(function () { cfgHint.textContent = '读取配置失败'; });
+      .catch(function (e) {
+        if (e && /401/.test(e.message)) { showAuth('旧令牌已失效，请重新输入'); }
+        else { cfgHint.textContent = (e && e.message) || '读取配置失败'; }
+      });
   }
 
   settingsBtn.addEventListener('click', openSettings);
   settingsPanel.addEventListener('click', function (e) {
     if (e.target === settingsPanel) settingsPanel.classList.remove('show');
+  });
+
+  // 扫码连接：展示局域网地址对应的二维码，手机一扫即带上令牌
+  qrBtn.addEventListener('click', function () {
+    if (qrBox.classList.contains('show')) { qrBox.classList.remove('show'); return; }
+    qrBox.innerHTML = '<p>生成中…</p>';
+    qrBox.classList.add('show');
+    fetch('/api/qrcode?token=' + encodeURIComponent(token))
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        cfgUrl.value = res.url || cfgUrl.value;
+        qrBox.innerHTML = res.qr
+          ? '<img src="' + res.qr + '" alt="扫码连接"><p>手机扫码即可连接（同一局域网）</p>'
+          : '<p>二维码生成失败，可直接复制上面的地址</p>';
+      })
+      .catch(function () { qrBox.innerHTML = '<p>二维码生成失败，可直接复制上面的地址</p>'; });
   });
 
   // 随机生成一个新的 5 位令牌（只填入输入框，点保存才生效）
@@ -1461,7 +1571,7 @@
         if (tokenChanged) {
           // 令牌已换：本地存的还是旧的，直接续上会 401，这里先换成新令牌再重连
           token = newToken;
-          localStorage.setItem('deckmate_token', newToken);
+          localStorage.setItem('deckmeido_token', newToken);
           tokenHint.textContent = '令牌已更新，其他设备需用新令牌重新连接';
           reconnectNow();
         }
@@ -1476,7 +1586,7 @@
           setTimeout(function () { settingsPanel.classList.remove('show'); }, 1200);
         });
       })
-      .catch(function () { cfgHint.textContent = '保存失败'; });
+      .catch(function (err) { cfgHint.textContent = (err && err.message) || '保存失败'; });
   });
 
   // ---------- 分享：把一条消息生成图片 ----------

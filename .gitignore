@@ -19,3 +19,6 @@ server/sessions/
 server/static/shots/
 server/uploads/
 _sess.json
+
+# 发布打包产物
+dist/

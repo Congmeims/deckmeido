@@ -1,3 +1,4 @@
+# 服务端
 fastapi
 uvicorn
 websockets
@@ -5,7 +6,12 @@ httpx
 mss
 pillow
 python-multipart
+psutil        # 系统信息（/api/sysinfo）
+qrcode        # 设置页扫码连接（/api/qrcode）
 
-# 原生客户端（可选）
-# PySide6
-# PySide6-WebEngine
+# PySide6：遮罩层（overlay.py）与原生客户端都依赖，install.sh 默认安装
+PySide6
+PySide6-WebEngine
+
+# 可选：联网搜索工具
+# ddgs

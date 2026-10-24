@@ -175,7 +175,7 @@ def build_system_prompt() -> str:
         "运行测试/脚本再用 run_command。用户让做项目时，先规划再逐步实施，像一个编程搭档。\n"
         "screenshot 工具可截取当前桌面画面展示给用户：排查问题、确认状态或用户要求看屏幕时主动使用"
         "（画面会同时显示在聊天里并附给你，你可以直接看图回答用户问题）。\n"
-        "环境：SteamOS holo、Wayland 桌面会话（Xwayland 在 DISPLAY=:0）、家目录 /home/deck、SD 卡在 /run/media 下。\n"
+        f"环境：SteamOS holo、Wayland 桌面会话（Xwayland 在 DISPLAY=:0）、家目录 {Path.home()}、SD 卡在 /run/media 下。\n"
         "桌面操作分两种：Wayland 原生窗口（如 Flatpak 应用）只能用合成输入。\n"
         "点击/输入一律用 desktop 工具：先 desktop action=focus target=窗口标题关键词 把目标切到前台，\n"
         "截图确认按钮位置后用 action=click 点它，需要打字用 action=type。\n"
@@ -241,9 +241,10 @@ def apply_config(cfg: dict):
 # 权限模式：manual=所有命令手动审批 / auto=危险命令才审批 / full=完全访问
 PERMISSION_MODE = CFG.get("security", {}).get("permission_mode", "auto")
 
-# 工作区（默认 ~/deckmate_workspace，可在设置里改）
+# 工作区（默认 ~/deckmeido_workspace，可在设置里改）
+DEFAULT_WORKSPACE = Path.home() / "deckmeido_workspace"
 try:
-    tools.set_workspace(CFG.get("workspace", {}).get("dir", str(Path.home() / "deckmate_workspace")))
+    tools.set_workspace(CFG.get("workspace", {}).get("dir") or str(DEFAULT_WORKSPACE))
 except Exception:
     pass
 
@@ -336,6 +337,15 @@ class ConnectionManager:
                 dead.append(ws)
         for ws in dead:
             self.active.discard(ws)
+
+    async def close_all(self, code: int = 1000):
+        """按指定原因码断开所有连接（改令牌后用 4401，让前端回到鉴权页）"""
+        for ws in list(self.active):
+            try:
+                await ws.close(code=code)
+            except Exception:
+                pass
+        self.active.clear()
 
 
 manager = ConnectionManager()
@@ -551,6 +561,7 @@ async def api_get_config():
         "workspace": str(tools.WORKSPACE),
         "token": TOKEN,
         "port": CFG["server"].get("port", 18765),
+        "llm_configured": llm.configured,
     }
 
 
@@ -605,12 +616,15 @@ async def api_set_config(req: ConfigUpdate):
             raise HTTPException(status_code=400, detail="令牌需为 4-32 位数字或字母")
         updates["server"] = {"token": new_token}
     if updates:
-        # 改令牌期间临时放行旧令牌，改完清掉
+        # 改令牌期间临时放行旧令牌，改完清掉；令牌换掉后旧连接一并踢下线
         _pending_token = updates.get("server", {}).get("token")
         try:
+            old_token = TOKEN
             update_config(updates)
         finally:
             _pending_token = None
+        if TOKEN != old_token:
+            await manager.close_all(4401)
     return {"ok": True, "llm_configured": llm.configured, "workspace": str(tools.WORKSPACE),
             "token": TOKEN}
 
@@ -1173,6 +1187,8 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
     if not _norm_token(TOKEN) or _norm_token(token) != _norm_token(TOKEN):
+        # 先 accept 再 close，浏览器才能拿到 4401 这个原因码，否则只会看到 1006 而无限重连
+        await ws.accept()
         await ws.close(code=4401)
         return
     await manager.connect(ws)

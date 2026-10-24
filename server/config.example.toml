@@ -56,4 +56,5 @@ permission_mode = "auto"
 
 [workspace]
 # 编程/文件任务的默认工作区，可在设置面板修改
-dir = "/home/deck/deckmate_workspace"
+# 留空则使用 ~/deckmeido_workspace（自动创建，适配任意用户名）
+dir = ""
