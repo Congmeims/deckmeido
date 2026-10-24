@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
+import os
 import re
 import secrets
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -509,6 +512,7 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
             action, pending_action = pending_action, None
             events.append({"type": "tool", "name": action["name"],
                            "summary": action["description"], "files": [], "approved": True})
+            set_overlay(True, f"正在执行：{action['description'][:60]}")
             result = await tools.execute(action["name"], action["args"])
             reply = f"已完成：{action['description']}\n{result}"
         elif pending_action:
@@ -524,6 +528,8 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
         feed_push("assistant_message", text="⏹ 已终止当前操作", events=events)
         save_current_session()
         raise
+    finally:
+        set_overlay(False)
 
     history.append({"role": "assistant", "content": reply})
     save_current_session()
@@ -729,6 +735,66 @@ async def api_qrcode():
 _https_started = False
 
 
+# ---------- 操作遮罩 ----------
+# agent 真正操作设备时，桌面上盖一层可穿透遮罩；用户移动鼠标/触摸板即终止
+
+_overlay_proc = None
+_overlay_state = {"show": False, "text": ""}
+
+
+def _overlay_env() -> dict:
+    """桌面会话环境：systemd 用户服务里默认没有 DISPLAY / XAUTHORITY"""
+    env = os.environ.copy()
+    env.setdefault("DISPLAY", ":0")
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{os.getuid()}/bus")
+    if not env.get("XAUTHORITY"):
+        cands = sorted(glob.glob(f"/run/user/{os.getuid()}/xauth_*"))
+        if cands:
+            env["XAUTHORITY"] = cands[0]
+        elif (Path.home() / ".Xauthority").exists():
+            env["XAUTHORITY"] = str(Path.home() / ".Xauthority")
+    env["DECKMATE_API"] = f"http://127.0.0.1:{CFG['server'].get('port', 18765)}"
+    env["DECKMATE_TOKEN"] = str(CFG["server"].get("token", ""))
+    # 走 Xwayland（xcb）：Wayland 原生窗口没有「不进任务栏」的协议，遮罩必须走 X11 才能隐藏
+    env["QT_QPA_PLATFORM"] = "xcb"
+    return env
+
+
+def ensure_overlay() -> None:
+    """遮罩进程常驻，按需显示；崩溃后自动重启"""
+    global _overlay_proc
+    if _overlay_proc is not None and _overlay_proc.poll() is None:
+        return
+    log = open(BASE_DIR / "overlay.log", "ab")
+    try:
+        _overlay_proc = subprocess.Popen(
+            [sys.executable, str(BASE_DIR / "overlay.py")],
+            cwd=str(BASE_DIR), env=_overlay_env(),
+            stdout=log, stderr=log, start_new_session=True,
+        )
+    except Exception:
+        _overlay_proc = None
+
+
+def set_overlay(show: bool, text: str = "") -> None:
+    _overlay_state["show"] = show
+    if text:
+        _overlay_state["text"] = text
+    if show:
+        ensure_overlay()
+
+
+@app.get("/api/overlay_state", dependencies=[Depends(check_token)])
+async def api_overlay_state():
+    return _overlay_state
+
+
+@app.on_event("startup")
+async def _boot_overlay():
+    ensure_overlay()
+
+
 @app.on_event("startup")
 async def _start_https():
     """证书就绪时进程内再起一个 HTTPS 端口（HTTP 18765 不受影响）。守卫防止递归触发"""
@@ -851,6 +917,7 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
                     event["path"] = str(args.get("path", ""))
                 activity = f"正在{label}：{summary}" if summary else f"正在{label}"
                 await manager.broadcast({"type": "tool_activity", "text": activity, "ts": time.time()})
+                set_overlay(True, activity)
 
                 result = await tools.execute(name, args)
                 # 终端输出截断后随事件展示（网页端显示为终端块）
