@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from pathlib import Path
 
@@ -98,10 +99,65 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "在设备上执行 bash 命令（通用能力：文件/进程/桌面操作 xdotool/截屏/软件管理等）。环境：SteamOS、桌面模式 X11 DISPLAY=:0、家目录 /home/deck。避免交互式参数，长任务放后台",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "要执行的 bash 命令"},
+                    "reason": {"type": "string", "description": "一句话说明这条命令要干什么（用于审批展示）"},
+                    "timeout": {"type": "integer", "description": "超时秒数，默认 60，最大 300"},
+                },
+                "required": ["command", "reason"],
+            },
+        },
+    },
 ]
 
-# 危险操作：执行前需要用户明确确认
+# 危险操作：任何权限模式下都需确认
 DANGEROUS = {"install_game"}
+
+# 智能审批（auto）模式下的危险命令特征：命中则需要用户确认
+DANGER_PATTERNS = [
+    r"\bsudo\b", r"\brm\b", r"\bmv\b", r"\bdd\b", r"\bmkfs", r"\bshred\b",
+    r"\bpacman\b", r"\bflatpak\s+(install|uninstall|remove)",
+    r"\bsystemctl\s+(stop|disable|mask)", r"\breboot\b", r"\bshutdown\b",
+    r"\bpoweroff\b", r"\bchmod\b", r"\bchown\b", r"\bkill\b", r"\bkillall\b",
+    r"\bpkill\b", r"\bsteamos-", r"\bbtrfs\b", r"\bmount\b", r"\bumount\b",
+    r"\bfdisk\b", r"\bcurl\b[^|]*\|\s*(ba|z)?sh", r"\bwget\b[^|]*\|\s*(ba|z)?sh",
+    r">\s*/(etc|usr|boot|sys|proc)/", r"\bsteam\b[^|]*\binstall",
+]
+
+
+def is_dangerous(cmd: str) -> bool:
+    return any(re.search(p, cmd) for p in DANGER_PATTERNS)
+
+
+async def _run_command(command: str, reason: str = "", timeout: int = 60) -> str:
+    timeout = max(1, min(int(timeout or 60), 300))
+    env = dict(os.environ)
+    env.setdefault("DISPLAY", ":0")
+    proc = await asyncio.create_subprocess_shell(
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        cwd=str(Path.home()),
+        env=env,
+        executable="/bin/bash",
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return f"命令超时（{timeout}s），已强制终止"
+    text = out.decode("utf-8", "replace").strip()
+    if len(text) > 4000:
+        text = text[:4000] + "\n…（输出过长已截断）"
+    return f"exit={proc.returncode}\n{text}" if text else f"exit={proc.returncode}（无输出）"
 
 _CONFIRM_WORDS = {"确认", "好", "好的", "执行", "可以", "yes", "y", "ok"}
 
@@ -114,6 +170,8 @@ def describe(name: str, args: dict) -> str:
     """危险操作的人类可读描述"""
     if name == "install_game":
         return f"下载安装 Steam 游戏（appid: {args.get('appid')}）"
+    if name == "run_command":
+        return f"执行命令：{args.get('command', '')}\n目的：{args.get('reason', '')}"
     return f"执行 {name}({json.dumps(args, ensure_ascii=False)})"
 
 
@@ -314,6 +372,7 @@ EXECUTORS = {
     "check_system_updates": _check_system_updates,
     "install_game": _install_game,
     "list_emulator_roms": _list_emulator_roms,
+    "run_command": _run_command,
 }
 
 

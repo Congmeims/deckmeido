@@ -284,6 +284,14 @@
         <span class="slider"></span>
       </span>
     </div>
+    <div class="field">
+      <label>AI 控制权限</label>
+      <select id="cfgPerm" style="width:100%; padding:12px 14px; border:1px solid rgba(255,255,255,.12); border-radius:10px; background:var(--surface-2); color:var(--text); font-size:15px; outline:none;">
+        <option value="manual">手动审批（每条命令都问你）</option>
+        <option value="auto">智能审批（危险命令才问你）</option>
+        <option value="full">完全访问（不再询问）</option>
+      </select>
+    </div>
     <button id="saveCfg">保存</button>
     <div id="cfgHint"></div>
   </div>
@@ -469,6 +477,7 @@
   var cfgApiKey = document.getElementById('cfgApiKey');
   var cfgModel = document.getElementById('cfgModel');
   var cfgTts = document.getElementById('cfgTts');
+  var cfgPerm = document.getElementById('cfgPerm');
   var saveCfg = document.getElementById('saveCfg');
   var cfgHint = document.getElementById('cfgHint');
 
@@ -482,6 +491,7 @@
         cfgApiKey.value = c.api_key || '';
         cfgModel.value = c.model || '';
         cfgTts.checked = !!c.tts_enable;
+        cfgPerm.value = c.permission_mode || 'auto';
       })
       .catch(function () { cfgHint.textContent = '读取配置失败'; });
   }
@@ -500,7 +510,8 @@
         base_url: cfgBaseUrl.value,
         api_key: cfgApiKey.value,
         model: cfgModel.value,
-        tts_enable: cfgTts.checked
+        tts_enable: cfgTts.checked,
+        permission_mode: cfgPerm.value
       })
     })
       .then(function (r) { return r.json(); })

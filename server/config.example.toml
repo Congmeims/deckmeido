@@ -40,3 +40,10 @@ voice = "cmn"
 speed = 170
 # 单次播报最长字符数（防止超长回复读个没完）
 max_chars = 300
+
+[security]
+# AI 控制设备的权限模式：
+#   manual = 所有命令都需手动审批
+#   auto   = 只读命令自动执行，危险命令（删改/安装/系统级）需审批
+#   full   = 完全访问，不再审批
+permission_mode = "auto"

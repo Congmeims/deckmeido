@@ -91,10 +91,15 @@ def build_system_prompt() -> str:
     extra = PERSONA.get("extra", "")
     p = (
         f"你是 {name}，{traits}。你运行在一台 Steam Deck 上，是这台设备的智能代理。\n"
-        "你可以调用工具来完成任务：查天气、搜索网页、查看已安装游戏、在商店搜索游戏、"
-        "扫描模拟器 ROM 收藏（list_emulator_roms）、检查系统更新、下载安装游戏。\n"
+        "你的核心能力是 run_command：可以在设备上执行任意 bash 命令完成任务——"
+        "文件管理、进程控制、xdotool 桌面操作（DISPLAY=:0）、截屏、Steam 控制、软件安装等，"
+        "遇到任务先想 Shell 方案。另外还有便捷工具：查天气、搜索网页、查看已安装游戏、"
+        "商店搜游戏、扫描模拟器 ROM、检查系统更新、安装游戏。\n"
+        "环境：SteamOS holo、桌面模式 X11、家目录 /home/deck、SD 卡在 /run/media 下。\n"
         "规则：\n"
-        "- 涉及真实变更的操作（如安装游戏）会先向用户描述，等用户确认后才执行\n"
+        "- 危险命令会先展示给用户审批，获批后才执行；审批被取消了不要重试同一条命令\n"
+        "- sudo 通常需要密码，尽量避免；实在绕不开时告诉用户\n"
+        "- 命令要非交互（用 -y 等参数），长任务放后台并输出日志路径\n"
         "- 回答简洁，中文优先，保持人设语气\n"
         "- 需要 appid 时先用 find_game 查询，不要编造"
     )
@@ -116,8 +121,8 @@ tts = TTS(
 
 
 def apply_config(cfg: dict):
-    """热更新运行配置（LLM / TTS），无需重启"""
-    global CFG
+    """热更新运行配置（LLM / TTS / 权限模式），无需重启"""
+    global CFG, PERMISSION_MODE
     CFG = cfg
     c = cfg["llm"]
     llm.base_url = c["base_url"].rstrip("/")
@@ -127,6 +132,11 @@ def apply_config(cfg: dict):
     tts.enable = bool(t.get("enable", False))
     tts.voice = t.get("voice", "cmn")
     tts.speed = int(t.get("speed", 170))
+    PERMISSION_MODE = cfg.get("security", {}).get("permission_mode", "auto")
+
+
+# 权限模式：manual=所有命令手动审批 / auto=危险命令才审批 / full=完全访问
+PERMISSION_MODE = CFG.get("security", {}).get("permission_mode", "auto")
 
 # 内存中的对话历史（单会话，MVP）
 history: list[dict] = []
@@ -226,6 +236,7 @@ class ConfigUpdate(BaseModel):
     api_key: str | None = None
     model: str | None = None
     tts_enable: bool | None = None
+    permission_mode: str | None = None
 
 
 @app.get("/api/config", dependencies=[Depends(check_token)])
@@ -235,6 +246,7 @@ async def api_get_config():
         "api_key": llm.api_key,
         "model": llm.model,
         "tts_enable": tts.enable,
+        "permission_mode": PERMISSION_MODE,
     }
 
 
@@ -252,6 +264,8 @@ async def api_set_config(req: ConfigUpdate):
         updates["llm"] = llm_updates
     if req.tts_enable is not None:
         updates["tts"] = {"enable": req.tts_enable}
+    if req.permission_mode in ("manual", "auto", "full"):
+        updates["security"] = {"permission_mode": req.permission_mode}
     if updates:
         update_config(updates)
     return {"ok": True, "llm_configured": llm.configured}
@@ -304,7 +318,16 @@ async def run_agent() -> str:
                 except json.JSONDecodeError:
                     args = {}
 
-                if name in tools.DANGEROUS:
+                needs_approval = name in tools.DANGEROUS
+                if name == "run_command":
+                    cmd = str(args.get("command", ""))
+                    if PERMISSION_MODE == "manual":
+                        needs_approval = True
+                    elif PERMISSION_MODE == "auto":
+                        needs_approval = tools.is_dangerous(cmd)
+                    # full 模式下不拦截
+
+                if needs_approval:
                     # 挂起危险操作，等用户下一轮确认
                     pending_action = {"name": name, "args": args, "description": tools.describe(name, args)}
                     return f"我需要执行一个会影响设备的操作：\n\n**{pending_action['description']}**\n\n回复「确认」我就执行，说别的就当作取消。"

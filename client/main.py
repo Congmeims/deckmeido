@@ -16,7 +16,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPushButton, QCheckBox, QTextBrowser,
     QVBoxLayout, QWidget,
 )
@@ -117,9 +117,14 @@ class SettingsDialog(QDialog):
         self.api_key.setEchoMode(QLineEdit.Password)
         self.model = QLineEdit()
         self.tts = QCheckBox("语音播报回复")
+        self.perm = QComboBox()
+        self.perm.addItem("手动审批（每条命令都问你）", "manual")
+        self.perm.addItem("智能审批（危险命令才问你）", "auto")
+        self.perm.addItem("完全访问（不再询问）", "full")
         form.addRow("API 接口地址", self.base_url)
         form.addRow("API Key", self.api_key)
         form.addRow("模型", self.model)
+        form.addRow("控制权限", self.perm)
         form.addRow("", self.tts)
         layout.addLayout(form)
 
@@ -133,6 +138,9 @@ class SettingsDialog(QDialog):
             self.api_key.setText(cfg.get("api_key", ""))
             self.model.setText(cfg.get("model", ""))
             self.tts.setChecked(bool(cfg.get("tts_enable")))
+            idx = self.perm.findData(cfg.get("permission_mode", "auto"))
+            if idx >= 0:
+                self.perm.setCurrentIndex(idx)
         except Exception as e:
             QMessageBox.warning(self, "读取失败", str(e))
 
@@ -143,6 +151,7 @@ class SettingsDialog(QDialog):
                 "api_key": self.api_key.text(),
                 "model": self.model.text(),
                 "tts_enable": self.tts.isChecked(),
+                "permission_mode": self.perm.currentData(),
             })
             self.accept()
         except Exception as e:
