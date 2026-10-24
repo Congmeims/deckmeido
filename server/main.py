@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 import tomllib
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Header, HTTPException, Depends, UploadFile
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Header, HTTPException, Depends, UploadFile, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -164,6 +164,12 @@ def apply_config(cfg: dict):
 
 # 权限模式：manual=所有命令手动审批 / auto=危险命令才审批 / full=完全访问
 PERMISSION_MODE = CFG.get("security", {}).get("permission_mode", "auto")
+
+# HTTPS 副端口（手机浏览器麦克风需要安全上下文）：证书存在才启用，HTTP 18765 保留给本机客户端
+HTTPS_PORT = int(CFG["server"].get("https_port", 18766))
+CERT_FILE = BASE_DIR / "certs" / "cert.pem"
+KEY_FILE = BASE_DIR / "certs" / "key.pem"
+HTTPS_ENABLED = CERT_FILE.exists() and KEY_FILE.exists()
 
 # 工作区（默认 ~/deckmate_workspace，可在设置里改）
 try:
@@ -521,6 +527,76 @@ async def api_new_session():
     await manager.broadcast({"type": "system", "text": "🆕 已开始新会话", "ts": time.time()})
     feed_push("system", text="🆕 已开始新会话")
     return {"ok": True}
+
+
+def _lan_ip() -> str:
+    """取真实局域网 IP：枚举网卡，优先 192.168.x，避开 VPN/加速器 TUN 虚拟段"""
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                             capture_output=True, text=True, timeout=3).stdout
+        ips = re.findall(r"inet (\d+\.\d+\.\d+\.\d+)", out)
+    except Exception:
+        ips = []
+
+    def rank(a: str) -> int:
+        if a.startswith("192.168."):
+            return 0
+        if a.startswith("10."):
+            return 1
+        if re.match(r"172\.(1[6-9]|2\d|3[01])\.", a):
+            return 2
+        return 3
+
+    ips.sort(key=rank)
+    return ips[0] if ips else "127.0.0.1"
+
+
+def phone_url() -> str:
+    """手机扫码/直连用的完整地址（带 token 免输入）"""
+    scheme = "https" if HTTPS_ENABLED else "http"
+    port = HTTPS_PORT if HTTPS_ENABLED else int(CFG["server"].get("port", 18765))
+    return f"{scheme}://{_lan_ip()}:{port}/?token={TOKEN}"
+
+
+@app.get("/api/qrcode", dependencies=[Depends(check_token)])
+async def api_qrcode():
+    """手机连接信息 + 二维码 PNG（base64）"""
+    url = phone_url()
+    png_b64 = ""
+    try:
+        import base64
+        import io
+
+        import qrcode
+
+        img = qrcode.make(url)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        png_b64 = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        pass
+    return {
+        "url": url,
+        "qr": png_b64,
+        "https": HTTPS_ENABLED,
+    }
+
+
+_https_started = False
+
+
+@app.on_event("startup")
+async def _start_https():
+    """证书就绪时进程内再起一个 HTTPS 端口（HTTP 18765 不受影响）。守卫防止递归触发"""
+    global _https_started
+    if _https_started or not HTTPS_ENABLED:
+        return
+    _https_started = True
+    import uvicorn
+    cfg2 = uvicorn.Config(app, host="0.0.0.0", port=HTTPS_PORT,
+                          ssl_certfile=str(CERT_FILE), ssl_keyfile=str(KEY_FILE),
+                          log_level="warning")
+    asyncio.create_task(uvicorn.Server(cfg2).serve())
 
 
 def summarize_tool(name: str, args: dict) -> str:
