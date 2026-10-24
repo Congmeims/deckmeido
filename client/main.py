@@ -125,6 +125,37 @@ class StatusWorker(QThread):
             pass
 
 
+class FeedWorker(QThread):
+    """轮询 /api/feed，同步网页端/其他设备产生的消息"""
+    new_items = Signal(list)
+
+    def __init__(self, token: str):
+        super().__init__()
+        self.token = token
+        self.after = 0
+        self._running = True
+
+    def run(self):
+        while self._running:
+            try:
+                with urllib.request.urlopen(
+                        f"{BASE}/api/feed?after={self.after}&token={self.token}", timeout=10) as r:
+                    data = json.loads(r.read())
+                items = data.get("items", [])
+                self.after = data.get("seq", self.after)
+                if items:
+                    self.new_items.emit(items)
+            except Exception:
+                pass
+            for _ in range(30):  # 3 秒轮询，可快速退出
+                if not self._running:
+                    return
+                self.msleep(100)
+
+    def stop(self):
+        self._running = False
+
+
 class SettingsDialog(QDialog):
     def __init__(self, token: str, parent=None):
         super().__init__(parent)
@@ -208,6 +239,23 @@ class MainWindow(QMainWindow):
         top.addWidget(settings_btn)
         layout.addLayout(top)
 
+        # 横向菜单栏
+        menu = QHBoxLayout()
+        menu.setSpacing(6)
+        btn_style = (
+            "QPushButton { background:#232737; color:#e8eaf0; border:1px solid rgba(255,255,255,.1);"
+            " border-radius:12px; padding:5px 12px; font-size:13px; }"
+        )
+        for text, slot in (("🆕 新会话", self.new_session),
+                           ("🗜 压缩上下文", self.compact_ctx),
+                           ("📷 截屏", self.ask_screenshot)):
+            b = QPushButton(text)
+            b.setStyleSheet(btn_style)
+            b.clicked.connect(slot)
+            menu.addWidget(b)
+        menu.addStretch(1)
+        layout.addLayout(menu)
+
         # 消息区
         self.chat = QTextBrowser()
         self.chat.setOpenExternalLinks(True)
@@ -225,6 +273,60 @@ class MainWindow(QMainWindow):
         layout.addLayout(bottom)
 
         self.refresh_status()
+
+        # 启动消息同步轮询（网页端的消息也会出现在这里）
+        self.feed = FeedWorker(token)
+        self.feed.new_items.connect(self.on_feed)
+        self.feed.start()
+
+    def on_feed(self, items: list):
+        for item in items:
+            t = item.get("type")
+            text = item.get("text", "")
+            if t == "user_message":
+                # 自己刚发的消息已由 send() 本地显示，跳过避免重复
+                if self.worker and self.worker.isRunning() and text == getattr(self, "_last_sent", None):
+                    continue
+                self.append_msg("user", text)
+            elif t == "assistant_message":
+                # 自己发起的回复会经 on_reply 显示，跳过
+                if self.worker and self.worker.isRunning():
+                    continue
+                self.append_events(item.get("events"))
+                self.append_msg("assistant", text)
+            elif t == "system":
+                self.chat.append(
+                    f'<div style="text-align:center; color:#8b91a3; font-size:13px; margin:6px 0;">'
+                    f'{html_escape(text)}</div>'
+                )
+
+    def new_session(self):
+        try:
+            api_post("/api/session/new", self.token, {}, timeout=10)
+            self.chat.clear()
+            self.chat.append('<div style="text-align:center; color:#8b91a3;">🆕 已开始新会话</div>')
+        except Exception as e:
+            self.append_msg("assistant", f"新会话失败：{e}")
+
+    def compact_ctx(self):
+        self.chat.append('<div style="text-align:center; color:#8b91a3;">🗜 正在压缩上下文…</div>')
+        try:
+            res = api_post("/api/compact", self.token, {}, timeout=60)
+            self.chat.append(
+                f'<div style="text-align:center; color:#8b91a3; font-size:13px;">'
+                f'压缩完成：{html_escape((res.get("summary") or "")[:120])}</div>'
+            )
+        except Exception as e:
+            self.append_msg("assistant", f"压缩失败：{e}")
+
+    def ask_screenshot(self):
+        self.input.setText("截屏，把当前桌面画面展示给我")
+        self.send()
+
+    def closeEvent(self, event):
+        if hasattr(self, "feed"):
+            self.feed.stop()
+        super().closeEvent(event)
 
     def append_msg(self, role: str, text: str):
         if role == "user":
@@ -290,6 +392,7 @@ class MainWindow(QMainWindow):
         if not text:
             return
         self.input.clear()
+        self._last_sent = text
         self.append_msg("user", text)
         self.chat.append('<span style="color:#8b91a3; font-size:13px;">DeckMate 正在输入…</span>')
         self.send_btn.setText("⏹")

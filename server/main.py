@@ -162,6 +162,17 @@ PERMISSION_MODE = CFG.get("security", {}).get("permission_mode", "auto")
 # 内存中的对话历史（单会话，MVP）
 history: list[dict] = []
 
+# 消息 feed（供原生客户端轮询同步，增量拉取）
+feed: list[dict] = []
+_feed_seq = 0
+
+
+def feed_push(type_: str, **kw):
+    global _feed_seq
+    _feed_seq += 1
+    feed.append({"id": _feed_seq, "type": type_, "ts": time.time(), **kw})
+    del feed[:-200]  # 最多保留 200 条
+
 # 待确认的危险操作 {name, args, description}
 pending_action: dict | None = None
 
@@ -243,6 +254,12 @@ async def api_status():
     return get_status()
 
 
+@app.get("/api/feed", dependencies=[Depends(check_token)])
+async def api_feed(after: int = Query(default=0)):
+    """增量拉取新消息：返回 id > after 的条目和最新 seq"""
+    return {"items": [m for m in feed if m["id"] > after], "seq": _feed_seq}
+
+
 @app.post("/api/chat", dependencies=[Depends(check_token)])
 async def api_chat(req: ChatRequest):
     text = req.message.strip()
@@ -318,6 +335,7 @@ async def api_set_config(req: ConfigUpdate):
 async def handle_chat(text: str) -> dict:
     global pending_action
     await manager.broadcast({"type": "user_message", "text": text, "ts": time.time()})
+    feed_push("user_message", text=text)
     history.append({"role": "user", "content": text})
     events: list[dict] = []
 
@@ -345,10 +363,12 @@ async def handle_chat(text: str) -> dict:
         # 用户点了终止：广播终止消息并向上传递
         await manager.broadcast({"type": "assistant_message", "text": "⏹ 已终止当前操作",
                                  "ts": time.time(), "events": events, "cancelled": True})
+        feed_push("assistant_message", text="⏹ 已终止当前操作", events=events)
         raise
 
     history.append({"role": "assistant", "content": reply})
     await manager.broadcast({"type": "assistant_message", "text": reply, "ts": time.time(), "events": events})
+    feed_push("assistant_message", text=reply, events=events)
     # 语音播报：只播报最终回复，不播报思维链/工具过程（后台进行，不阻塞）
     asyncio.create_task(tts.speak(reply))
     return {"reply": reply, "events": events}
@@ -376,7 +396,9 @@ async def compact_history(auto: bool = False) -> str:
         history[:] = history[-keep:]
         return f"压缩失败，已截断旧对话：{e}"
     history[:] = [{"role": "system", "content": f"【此前对话摘要，供上下文延续】\n{summary}"}] + history[-keep:]
-    await manager.broadcast({"type": "system", "text": f"{'🗜 已自动压缩上下文' if auto else '🗜 已压缩上下文'}（{len(old)} 条旧消息 → 摘要）", "ts": time.time()})
+    note = f"{'🗜 已自动压缩上下文' if auto else '🗜 已压缩上下文'}（{len(old)} 条旧消息 → 摘要）"
+    await manager.broadcast({"type": "system", "text": note, "ts": time.time()})
+    feed_push("system", text=note)
     return summary
 
 
@@ -390,8 +412,10 @@ async def api_compact():
 async def api_new_session():
     global pending_action
     history.clear()
+    feed.clear()
     pending_action = None
     await manager.broadcast({"type": "system", "text": "🆕 已开始新会话", "ts": time.time()})
+    feed_push("system", text="🆕 已开始新会话")
     return {"ok": True}
 
 
