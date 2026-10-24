@@ -18,8 +18,8 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import QApplication, QFrame, QLabel, QVBoxLayout, QWidget
 
-API = os.environ.get("DECKMATE_API", "http://127.0.0.1:18765")
-TOKEN = os.environ.get("DECKMATE_TOKEN", "")
+API = os.environ.get("DECKMEIDO_API", "http://127.0.0.1:18765")
+TOKEN = os.environ.get("DECKMEIDO_TOKEN", "")
 
 POLL_MS = 100          # 向后端询问「是否在操作」的常规间隔
 URGENT_MS = 25         # 穿透期间的快速轮询间隔（后端马上要点，等不起）

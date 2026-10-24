@@ -780,10 +780,9 @@
   var authErr = document.getElementById('authErr');
 
   // token：URL > localStorage
-  var token = (new URLSearchParams(location.search).get('token') || localStorage.getItem('deckmeido_token') || localStorage.getItem('deckmate_token') || '').trim().toLowerCase();
+  var token = (new URLSearchParams(location.search).get('token') || localStorage.getItem('deckmeido_token') || '').trim().toLowerCase();
   if (token) {
     localStorage.setItem('deckmeido_token', token);
-    localStorage.removeItem('deckmate_token');
     // 令牌已存到本地，把 URL 里的抹掉，避免截图/分享时泄露
     if (new URLSearchParams(location.search).has('token')) {
       history.replaceState(null, '', location.pathname);
@@ -1861,10 +1860,10 @@
   // ---------- 亮暗主题 ----------
   function applyTheme(t) {
     document.documentElement.setAttribute('data-theme', t);
-    localStorage.setItem('deckmate_theme', t);
+    localStorage.setItem('deckmeido_theme', t);
     document.getElementById('btnTheme').textContent = t === 'light' ? '深色模式' : '浅色模式';
   }
-  applyTheme(localStorage.getItem('deckmate_theme') || 'dark');
+  applyTheme(localStorage.getItem('deckmeido_theme') || 'dark');
   document.getElementById('btnTheme').addEventListener('click', function () {
     applyTheme(document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light');
   });

@@ -938,8 +938,8 @@ def _overlay_env() -> dict:
             env["XAUTHORITY"] = cands[0]
         elif (Path.home() / ".Xauthority").exists():
             env["XAUTHORITY"] = str(Path.home() / ".Xauthority")
-    env["DECKMATE_API"] = f"http://127.0.0.1:{CFG['server'].get('port', 18765)}"
-    env["DECKMATE_TOKEN"] = str(CFG["server"].get("token", ""))
+    env["DECKMEIDO_API"] = f"http://127.0.0.1:{CFG['server'].get('port', 18765)}"
+    env["DECKMEIDO_TOKEN"] = str(CFG["server"].get("token", ""))
     # 走 Xwayland（xcb）：Wayland 原生窗口没有「不进任务栏」的协议，遮罩必须走 X11 才能隐藏
     env["QT_QPA_PLATFORM"] = "xcb"
     return env
