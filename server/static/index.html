@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0f1117">
-<link rel="icon" href="/logo.jpg">
+<link rel="icon" type="image/png" href="/favicon.png">
 <title>DeckMate</title>
 <style>
   :root {
@@ -20,10 +20,12 @@
   }
   * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
   html, body { height: 100%; }
+  /* 脚本回退字体在这里常常把字画成深色块，中文统一交给系统字体 */
   body {
     background: var(--bg);
     color: var(--text);
-    font-family: "PingFang SC", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-family: "PingFang SC", "Noto Sans CJK SC", "Source Han Sans SC",
+                 "Microsoft YaHei", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     font-size: 16px;
     display: flex;
     flex-direction: column;
@@ -46,7 +48,6 @@
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--danger); flex: 0 0 auto; }
   .dot.on { background: #2ecc71; }
   .status-text { color: var(--muted); font-size: 12px; }
-  .spacer { flex: 1; }
   .badge {
     font-size: 12px; color: var(--muted);
     background: var(--surface-2);
@@ -56,15 +57,7 @@
   .badge.warn { color: #b8860b; }
   .badge.danger { color: #d0492b; }
 
-  /* 横向菜单栏 */
-  #menuBar {
-    flex: 0 0 auto;
-    display: flex; gap: 8px; align-items: center;
-    padding: 8px 12px;
-    background: var(--surface);
-    border-bottom: 1px solid var(--line);
-    overflow-x: auto;
-  }
+  /* 通用胶囊按钮（分享弹窗等） */
   .menu-btn {
     flex: 0 0 auto;
     border: 1px solid var(--line);
@@ -92,6 +85,8 @@
     font-size: 15.5px;
     white-space: pre-wrap;
     word-break: break-word;
+    /* 自绘每个字的颜色，避免系统原生深色底把正文涂黑 */
+    -webkit-text-fill-color: currentColor;
   }
   .msg.user {
     align-self: flex-end;
@@ -112,10 +107,19 @@
     padding: 2px 8px;
   }
   .msg .time { display: block; margin-top: 4px; font-size: 11px; opacity: .55; }
+  /* 回复气泡底部：操作按钮在左，时间在右 */
+  .msg-foot { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+  .msg-foot .time { margin-top: 0; }
+  .msg-acts { display: flex; gap: 2px; }
+  .msg-act {
+    border: none; background: transparent; color: var(--muted);
+    font-size: 12px; padding: 2px 6px; border-radius: 6px; cursor: pointer;
+  }
+  .msg-act:hover { background: var(--hover); color: var(--text); }
 
   /* markdown 内容 */
-  .msg pre { background: #0b0d13; padding: 10px 12px; border-radius: 8px; overflow-x: auto; margin: 6px 0; font-size: 13px; }
-  .msg code { background: #0b0d13; padding: 2px 6px; border-radius: 5px; font-size: 13px; font-family: ui-monospace, monospace; }
+  .msg pre { background: var(--code-bg); padding: 10px 12px; border-radius: 8px; overflow-x: auto; margin: 6px 0; font-size: 13px; }
+  .msg code { background: var(--code-bg); padding: 2px 6px; border-radius: 5px; font-size: 13px; font-family: ui-monospace, monospace; }
   .msg pre code { background: none; padding: 0; }
   .msg h3, .msg h4 { margin: 8px 0 4px; color: var(--brand); }
   .msg ul { padding-left: 20px; margin: 4px 0; }
@@ -171,7 +175,7 @@
   }
   .tl.open .tl-body { display: block; }
   .tl-body.term {
-    background: #0b0d13; color: #c8d3e0;
+    background: var(--code-bg); color: var(--code-text);
     font-family: ui-monospace, monospace; font-size: 12px;
   }
   .tl-file {
@@ -185,33 +189,24 @@
   .stream-body { white-space: pre-wrap; word-break: break-word; }
   #send.stop { background: var(--danger); }
 
-  /* 分享模式 */
-  #shareBar {
-    display: none;
-    position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
-    background: var(--surface); border-top: 1px solid var(--line);
-    padding: 12px 16px; padding-bottom: calc(12px + env(safe-area-inset-bottom));
-    align-items: center; gap: 12px; font-size: 14px;
-  }
-  #shareBar.show { display: flex; }
-  #shareBar button { border: none; border-radius: 10px; padding: 9px 18px; font-size: 14px; background: var(--brand); color: #fff; }
-  #shareBar #shareCancel { background: var(--surface-2); color: var(--text); }
-  body.selecting .msg { cursor: pointer; }
-  body.selecting .msg.selected { outline: 2px solid var(--brand); outline-offset: 2px; }
+  /* 分享图片预览 */
   #shareOverlay {
     display: none; position: fixed; inset: 0; z-index: 40;
-    background: rgba(0,0,0,.85); align-items: center; justify-content: center;
+    background: var(--share-overlay); align-items: center; justify-content: center;
   }
   #shareOverlay.show { display: flex; }
   .share-box { max-width: 92vw; max-height: 92dvh; display: flex; flex-direction: column; align-items: center; }
   .share-box img { max-width: 100%; max-height: 78dvh; border-radius: 12px; }
 
   /* 正在输入 */
-  .typing { display: inline-flex; gap: 4px; padding: 4px 2px; }
+  .typing { display: inline-flex; gap: 4px; padding: 4px 2px; vertical-align: middle; }
   .typing i { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: blink 1.2s infinite; }
   .typing i:nth-child(2) { animation-delay: .2s; }
   .typing i:nth-child(3) { animation-delay: .4s; }
   @keyframes blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
+  /* 工具动态提示：文字在前，动态点跟在文字后面 */
+  .typing-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .typing-label { color: var(--muted); font-size: 12.5px; line-height: 1.5; word-break: break-word; }
 
   /* 底部输入区（两行：输入框 + 工具栏） */
   #composer {
@@ -236,6 +231,11 @@
     height: 34px; border: 1px solid var(--line); border-radius: 10px;
     background: var(--surface-2); color: var(--muted);
     font-size: 12.5px; padding: 0 8px; outline: none; max-width: 130px;
+  }
+  /* 模型名普遍较长，单独放宽；窄屏时允许收缩但仍保底 180px */
+  #modelSelect {
+    max-width: none; width: 240px; min-width: 180px; flex: 0 1 auto;
+    text-overflow: ellipsis;
   }
   #input {
     width: 100%;
@@ -348,16 +348,27 @@
   }
 
   /* 设置按钮与面板 */
-  #settingsBtn {
+  /* 顶部右侧两个按钮并排：主题占 1/4，设置占 3/4，等距间隔 */
+  .hdr-acts {
     flex: 0 0 auto;
-    height: 36px; padding: 0 14px;
+    display: flex; align-items: center; gap: 8px;
+    width: 200px;
+  }
+  .hdr-acts > button {
+    height: 36px; padding: 0 6px;
     border: 1px solid var(--line); border-radius: 10px;
     background: var(--surface-2); color: var(--muted);
-    font-size: 13px; cursor: pointer;
+    font-size: 13px; cursor: pointer; white-space: nowrap;
+    min-width: 0;
+  }
+  #btnTheme { flex: 1 1 0; }
+  #settingsBtn { flex: 3 1 0; }
+  @media (max-width: 760px) {
+    .hdr-acts { width: 150px; }
   }
   #settingsPanel {
     position: fixed; inset: 0;
-    background: rgba(0,0,0,.5);
+    background: var(--overlay);
     display: none;
     align-items: flex-end;
     z-index: 20;
@@ -411,7 +422,16 @@
   #cfgHint { text-align: center; font-size: 13px; color: var(--muted); margin-top: 10px; min-height: 18px; }
 
   /* ===== 亮暗主题 + 分栏布局 ===== */
-  :root { --line: rgba(255,255,255,.08); --hover: rgba(255,255,255,.07); }
+  :root {
+    --line: rgba(255,255,255,.08); --hover: rgba(255,255,255,.07);
+    --code-bg: #0b0d13; --code-text: #c8d3e0;
+    --overlay: rgba(0,0,0,.5);
+    --share-overlay: rgba(0,0,0,.85);
+    /* 滚动条：深色主题下用半透明白滑块 */
+    --sb-thumb: rgba(255,255,255,.18); --sb-thumb-hover: rgba(255,255,255,.32);
+    /* 告诉浏览内核当前配色，原生滚动条/表单控件才会跟着走 */
+    color-scheme: dark;
+  }
   [data-theme=light] {
     --bg: #f2f4f8;
     --surface: #ffffff;
@@ -419,9 +439,31 @@
     --text: #1c2333;
     --muted: #67707f;
     --brand: #0b7fd4;
+    --user-bubble: #0b7fd4;
     --line: rgba(16,24,40,.1);
     --hover: rgba(16,24,40,.06);
+    /* 代码块 / 终端：深色底上必须是浅字，否则会被系统原生深色底涂黑 */
+    --code-bg: #f4f6fa; --code-text: #1c2333;
+    --overlay: rgba(16,24,40,.35);
+    --share-overlay: rgba(16,24,40,.6);
+    /* 滚动条 */
+    --sb-thumb: rgba(16,24,40,.22); --sb-thumb-hover: rgba(16,24,40,.38);
+    /* 告诉浏览内核当前配色，原生滚动条/表单控件才会跟着走 */
+    color-scheme: light;
   }
+  /* 滚动条跟随主题：WebView/Chromium 默认画系统深色条，在浅色下非常突兀 */
+  * { scrollbar-width: thin; scrollbar-color: var(--sb-thumb) transparent; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: var(--sb-thumb);
+    border-radius: 999px;
+    /* 用透明边框收窄视觉宽度，凹槽保持通透 */
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover { background: var(--sb-thumb-hover); background-clip: content-box; }
+  ::-webkit-scrollbar-corner { background: transparent; }
   #app { display: flex; height: 100dvh; }
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; height: 100dvh; }
   #sidebar {
@@ -465,11 +507,6 @@
   }
   .sess:hover .s-del { opacity: 1; }
   .sess .s-del.confirm { opacity: 1; color: #fff; background: var(--danger); }
-  .sb-foot { padding: 10px 14px; border-top: 1px solid var(--line); }
-  #btnTheme {
-    width: 100%; border: 1px solid var(--line); background: var(--surface-2);
-    color: var(--text); border-radius: 9px; padding: 8px; font-size: 13px; cursor: pointer;
-  }
   #btnMenu { display: none; }
   @media (max-width: 760px) {
     #sidebar {
@@ -481,11 +518,11 @@
     #btnMenu { display: block; }
   }
   /* 代码块全屏查看 */
-  #codeView { display: none; position: fixed; inset: 0; z-index: 45; background: rgba(0,0,0,.7); align-items: center; justify-content: center; }
+  #codeView { display: none; position: fixed; inset: 0; z-index: 45; background: var(--overlay); align-items: center; justify-content: center; }
   #codeView.show { display: flex; }
-  #codeBox { width: min(920px, 94vw); max-height: 86dvh; background: #0b0d13; border-radius: 12px; display: flex; flex-direction: column; overflow: hidden; }
+  #codeBox { width: min(920px, 94vw); max-height: 86dvh; background: var(--code-bg); border-radius: 12px; display: flex; flex-direction: column; overflow: hidden; }
   #codeBox .cv-bar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: var(--surface); }
-  #codePre { flex: 1; overflow: auto; padding: 14px; color: #c8d3e0; font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; word-break: break-word; margin: 0; }
+  #codePre { flex: 1; overflow: auto; padding: 14px; color: var(--code-text); font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; word-break: break-word; margin: 0; }
   .msg pre { cursor: pointer; }
 </style>
 </head>
@@ -502,7 +539,6 @@
   </div>
   <div class="sb-sess-head"><span>会话</span><button id="btnNewSess" title="新会话">＋</button></div>
   <div id="sessList"></div>
-  <div class="sb-foot"><button id="btnTheme">切换主题</button></div>
 </aside>
 <main id="main">
 
@@ -512,25 +548,14 @@
   <span class="logo">DeckMate</span>
   <span class="status-text" id="statusText">连接中…</span>
   <span class="spacer"></span>
+  <span class="badge" id="ctxBadge" hidden></span>
   <span class="badge" id="batteryBadge" hidden></span>
   <span class="badge" id="modeBadge" hidden></span>
-  <button id="settingsBtn" title="设置">设置</button>
+  <div class="hdr-acts">
+    <button id="btnTheme">深色模式</button>
+    <button id="settingsBtn" title="设置">设置</button>
+  </div>
 </header>
-
-<nav id="menuBar">
-  <button class="menu-btn" id="btnNew">新会话</button>
-  <button class="menu-btn" id="btnShot">截屏</button>
-  <button class="menu-btn" id="btnRetry">重试</button>
-  <button class="menu-btn" id="btnShare">分享</button>
-  <span class="spacer"></span>
-  <span class="badge" id="ctxBadge" hidden></span>
-</nav>
-
-<div id="shareBar">
-  <span>已选 <b id="shareCount">0</b> 条</span>
-  <button id="shareGo">生成图片</button>
-  <button id="shareCancel">取消</button>
-</div>
 
 <div id="shareOverlay">
   <div class="share-box">
@@ -681,10 +706,16 @@
     s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
     s = s.replace(/!\[([^\]]*)\]\((\/uploads\/[^)\s]+)\)/g, '<img class="chat-img" src="$2">');
     s = s.replace(/\n{2,}/g, '<br><br>').replace(/\n/g, '<br>');
+    // 行首缩进用不换行空格占位，避免连续半角空格被浏览器折叠/当作换行
+    s = s.replace(/(^|<br>)([ \t]+)/g, function (m, pre, sp) {
+      return pre + new Array(sp.length + 1).join('&nbsp;');
+    });
     return s;
   }
 
-  function addMsg(role, text, ts) {
+  function addMsg(role, text, ts, events) {
+    // 历史回放时先摆事件时间线（截屏/搜索/终端输出），与实时对话的阅读顺序一致
+    if (events && events.length) renderEvents(events);
     var el = document.createElement('div');
     el.className = 'msg ' + role;
     if (role === 'assistant' || role === 'user') {
@@ -697,9 +728,41 @@
     var t = document.createElement('span');
     t.className = 'time';
     t.textContent = fmtTime(ts);
-    el.appendChild(t);
+    if (role === 'assistant') {
+      addMsgFoot(el, ts);
+    } else {
+      el.appendChild(t);
+    }
     messages.appendChild(el);
     scrollBottomSafe();
+  }
+
+  // 回复气泡底部：重试 / 分享在左，时间在右
+  function addMsgFoot(el, ts) {
+    var foot = document.createElement('div');
+    foot.className = 'msg-foot';
+    var acts = document.createElement('div');
+    acts.className = 'msg-acts';
+    acts.appendChild(makeActBtn('重试', function () { retryMsg(el); }));
+    acts.appendChild(makeActBtn('分享', function () { shareMsg(el); }));
+    foot.appendChild(acts);
+    var t = document.createElement('span');
+    t.className = 'time';
+    t.textContent = ts ? fmtTime(ts) : fmtTime();
+    foot.appendChild(t);
+    el.appendChild(foot);
+  }
+
+  // 气泡底部的小操作按钮（重试 / 分享）
+  function makeActBtn(label, onClick) {
+    var b = document.createElement('button');
+    b.className = 'msg-act';
+    b.textContent = label;
+    b.addEventListener('click', function (e) {
+      e.stopPropagation();
+      onClick();
+    });
+    return b;
   }
 
   // 工具事件 → 时间线行文案（Trae 式：已读取/已编辑/已运行…）
@@ -846,16 +909,24 @@
   }
 
   function showTyping(label) {
+    // 已有提示时只更新文字，避免每次工具事件都重排、闪动
+    if (typingEl && label) {
+      var lbl = typingEl.querySelector('.typing-label');
+      if (lbl) { lbl.textContent = label; return; }
+    }
     hideTyping();
     typingEl = document.createElement('div');
-    typingEl.className = 'msg assistant';
-    typingEl.innerHTML = '<span class="typing"><i></i><i></i><i></i></span>';
-    if (label) {
-      var l = document.createElement('span');
-      l.style.cssText = 'color:var(--muted);font-size:12.5px;margin-left:8px;';
-      l.textContent = label;
-      typingEl.appendChild(l);
-    }
+    typingEl.className = 'msg assistant typing-row';
+    // 先文字，后动态点：读起来是「正在联网搜索：xxx ...」
+    var l = document.createElement('span');
+    l.className = 'typing-label';
+    l.textContent = label || '';
+    typingEl.appendChild(l);
+    var dots = document.createElement('span');
+    dots.className = 'typing';
+    dots.innerHTML = '<i></i><i></i><i></i>';
+    typingEl.appendChild(dots);
+    if (!label) l.remove();
     messages.appendChild(typingEl);
     scrollBottomSafe();
   }
@@ -904,7 +975,9 @@
         case 'history':
           messages.innerHTML = '';
           (msg.messages || []).forEach(function (m) {
-            addMsg(m.role === 'user' ? 'user' : 'assistant', m.content);
+            // 用户消息不落时间戳，助手消息带上事件（截屏图/搜索/终端输出），刷新后才不会丢
+            addMsg(m.role === 'user' ? 'user' : 'assistant', m.content, m.ts,
+                   m.role === 'assistant' ? m.events : null);
           });
           break;
         case 'user_message':
@@ -926,6 +999,7 @@
           streamBody.className = 'stream-body';
           streamEl.appendChild(streamBody);
           messages.appendChild(streamEl);
+          addMsgFoot(streamEl);
           scrollBottomSafe();
           break;
         case 'delta':
@@ -1146,34 +1220,23 @@
   }
   setInterval(refreshStatus, 30000);
 
-  // 菜单栏按钮
-  document.getElementById('btnNew').addEventListener('click', function () {
-    fetch('/api/sessions/create?token=' + encodeURIComponent(token), { method: 'POST' })
-      .then(function () { refreshStatus(); })
-      .catch(function () { addSystem('操作失败'); });
-  });
-  document.getElementById('btnShot').addEventListener('click', function () {
-    if (ws && ws.readyState === 1 && !busy) {
-      ws.send(JSON.stringify({ type: 'chat', text: '截屏，把当前桌面画面展示给我' }));
-      setBusy(true);
-    }
-  });
-  // 重试：撤掉上一条 AI 回复并让模型重新回答
-  document.getElementById('btnRetry').addEventListener('click', function () {
+  // 重试：撤掉这条 AI 回复并让模型重新回答
+  function retryMsg(el) {
     if (busy) return;
-    // 本地移除最后一条 assistant 气泡和它前面的事件容器
-    var last = messages.lastElementChild;
-    if (last && last.classList.contains('msg') && last.classList.contains('assistant')) {
-      messages.removeChild(last);
-      var prev = messages.lastElementChild;
-      if (prev && prev.classList.contains('events')) messages.removeChild(prev);
+    // 只对最后一条回复生效：撤掉气泡和它前面的事件容器
+    if (el !== messages.lastElementChild) {
+      addSystem('只能重试最后一条回复');
+      return;
     }
+    messages.removeChild(el);
+    var prev = messages.lastElementChild;
+    if (prev && prev.classList.contains('events')) messages.removeChild(prev);
     setBusy(true);
     showTyping();
     fetch('/api/retry?token=' + encodeURIComponent(token), { method: 'POST' })
       .then(function (r) { if (!r.ok) { hideTyping(); setBusy(false); addSystem('没有可重试的消息'); } })
       .catch(function () { hideTyping(); setBusy(false); });
-  });
+  }
 
   function setBusy(b) {
     busy = b;
@@ -1300,44 +1363,25 @@
       .catch(function () { cfgHint.textContent = '保存失败'; });
   });
 
-  // ---------- 分享：多选消息 → 生成图片 ----------
-  var selecting = false;
-  var shareBar = document.getElementById('shareBar');
-  var shareCount = document.getElementById('shareCount');
+  // ---------- 分享：把一条消息生成图片 ----------
   var shareOverlay = document.getElementById('shareOverlay');
   var shareImg = document.getElementById('shareImg');
   var shareDownload = document.getElementById('shareDownload');
 
-  function updateShareCount() {
-    shareCount.textContent = messages.querySelectorAll('.msg.selected').length;
+  function shareMsg(el) {
+    // 分享内容取这条回复 + 紧邻在它前面的事件容器，还原上下文
+    var picked = [el];
+    var prev = el.previousElementSibling;
+    if (prev && prev.classList.contains('events')) picked.unshift(prev);
+    renderShare(picked);
   }
-  document.getElementById('btnShare').addEventListener('click', function () {
-    selecting = !selecting;
-    document.body.classList.toggle('selecting', selecting);
-    shareBar.classList.toggle('show', selecting);
-    if (!selecting) {
-      messages.querySelectorAll('.msg.selected').forEach(function (el) { el.classList.remove('selected'); });
-    }
-    updateShareCount();
-  });
-  document.getElementById('shareCancel').addEventListener('click', function () {
-    document.getElementById('btnShare').click();
-  });
-  messages.addEventListener('click', function (e) {
-    if (!selecting) return;
-    var el = e.target.closest('.msg');
-    if (!el || el.classList.contains('system')) return;
-    el.classList.toggle('selected');
-    updateShareCount();
-  });
+
   document.getElementById('shareClose').addEventListener('click', function () {
     shareOverlay.classList.remove('show');
   });
 
-  // 把选中的消息画到 canvas（深色卡片风格）
-  document.getElementById('shareGo').addEventListener('click', function () {
-    var picked = Array.prototype.slice.call(messages.querySelectorAll('.msg.selected'));
-    if (!picked.length) return;
+  // 把消息画到 canvas（深色卡片风格）
+  function renderShare(picked) {
     var W = 760, PAD = 28, GAP = 14, BW = W - PAD * 2;
     var canvas = document.createElement('canvas');
     var ctx = canvas.getContext('2d');
@@ -1393,8 +1437,7 @@
     shareImg.src = url;
     shareDownload.href = url;
     shareOverlay.classList.add('show');
-    document.getElementById('btnShare').click();  // 退出选择模式
-  });
+  }
 
   // ---------- 输入框工具栏：＋附件 / 权限 / 模型 ----------
   var plusMenu = document.getElementById('plusMenu');
@@ -1664,7 +1707,6 @@
   });
   // 事件委托：消息区里的图片与代码块
   messages.addEventListener('click', function (e) {
-    if (selecting) return;  // 分享多选模式下不响应
     var img = e.target.closest('img.shot, img.chat-img');
     if (img) { openImage(img.src); return; }
     var pre = e.target.closest('.msg pre');
@@ -1678,9 +1720,8 @@
 
   // ---------- / 快捷命令 ----------
   var COMMANDS = [
-    { cmd: 'shot', label: '截屏并展示', run: function () { document.getElementById('pmShot').click(); } },
-    { cmd: 'new', label: '新会话', run: function () { document.getElementById('btnNew').click(); } },
-    { cmd: 'retry', label: '重试上一轮', run: function () { document.getElementById('btnRetry').click(); } },
+    { cmd: 'shot', label: '截屏并展示', run: function () { input.value = '截屏，把当前桌面画面展示给我'; } },
+    { cmd: 'new', label: '新会话', run: function () { document.getElementById('btnNewSess').click(); } },
     { cmd: 'weather', label: '查天气（发送询问）', run: function () { input.value = '查一下现在上海的天气'; } }
   ];
   input.addEventListener('input', function () {

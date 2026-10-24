@@ -24,13 +24,16 @@ def strip_tool_markup(text: str) -> str:
 
 class LLMClient:
     def __init__(self, base_url: str, api_key: str, model: str, timeout: float = 60.0,
-                 max_tokens: int = 4096):
+                 max_tokens: int = 4096, reasoning_effort: str = "high"):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         # 不传 max_tokens 时服务端默认值往往偏小，流式输出会在工具调用中途被硬截断，
         # 导致半截标记漏进正文、整轮操作中断
         self.max_tokens = max_tokens
+        # 实测 deepseek-v4.1-flash 等服务商默认不产出 reasoning_content，
+        # 必须显式传 reasoning_effort 才会返回思维链
+        self.reasoning_effort = reasoning_effort
         self._client = httpx.AsyncClient(timeout=timeout)
 
     @property
@@ -84,6 +87,8 @@ class LLMClient:
                    "tools": tools, "tool_choice": "auto", "stream": True,
                    "stream_options": {"include_usage": True},
                    "max_tokens": self.max_tokens}
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_acc: dict[int, dict] = {}

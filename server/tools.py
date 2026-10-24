@@ -238,6 +238,10 @@ TOOLS: list[dict] = [
 # 危险操作：任何权限模式下都需确认
 DANGEROUS = {"install_game"}
 
+# 会实际控制设备的工具：只有这些才弹出操作遮罩。
+# 联网搜索、查天气、读写文件等都只是后台任务，遮罩会白挡一层，还会被误当成「正在操作」
+DEVICE_TOOLS = {"desktop", "screenshot", "run_command"}
+
 # 智能审批（auto）模式下的危险命令特征：命中则需要用户确认
 DANGER_PATTERNS = [
     r"\bsudo\b", r"\brm\b", r"\bmv\b", r"\bdd\b", r"\bmkfs", r"\bshred\b",

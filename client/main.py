@@ -94,11 +94,13 @@ def main() -> int:
     view.setPage(WebPage(view))
     view.setWindowTitle("DeckMate")
     view.resize(WINDOW_W, WINDOW_H)
-    icon_path = DECKMATE_DIR / "assets" / "logo.jpg"
+    icon_path = DECKMATE_DIR / "assets" / "logo.png"
     if icon_path.exists():
         view.setWindowIcon(QIcon(str(icon_path)))
     view.load(QUrl(f"{API}/?token={load_token()}&native=1"))
     view.show()
+    # 只放大这个网页，不影响系统里其他 Qt 程序；网页端（浏览器打开）保持原样
+    view.setZoomFactor(2.0)
     return app.exec()
 
 

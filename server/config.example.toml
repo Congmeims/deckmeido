@@ -14,6 +14,9 @@ base_url = "https://api.openai.com/v1"
 api_key = ""
 model = "gpt-4o-mini"
 timeout = 60
+# 思维链强度：low / medium / high。多数服务商不传这个字段就不返回 reasoning_content，
+# 留空字符串则不发送该参数（由服务商默认决定）
+reasoning_effort = "high"
 
 [agent]
 # agent 单轮最多连续调用工具次数

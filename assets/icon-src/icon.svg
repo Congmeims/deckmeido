@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2B7BF3"/>
+      <stop offset="1" stop-color="#1550C4"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#EAF1FF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 底板：扁平圆角矩形，无描边、无阴影 -->
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#tile)"/>
+
+  <!-- 手柄轮廓：左右各一块圆角机身，中间收窄成握把 -->
+  <path fill="#FFFFFF" d="
+    M 156 152
+    H 356
+    Q 396 152 402 192
+    L 424 336
+    Q 430 388 380 392
+    Q 336 396 320 352
+    L 308 320
+    H 204
+    L 192 352
+    Q 176 396 132 392
+    Q 82 388 88 336
+    L 110 192
+    Q 116 152 156 152
+    Z"/>
+
+  <!-- 屏幕 -->
+  <rect x="196" y="196" width="120" height="96" rx="14" fill="url(#screen)"/>
+
+  <!-- 屏幕上的两只眼睛：人格化代理 -->
+  <circle cx="232" cy="240" r="14" fill="#1550C4"/>
+  <circle cx="280" cy="240" r="14" fill="#1550C4"/>
+  <rect x="232" y="264" width="48" height="9" rx="4.5" fill="#1550C4" opacity="0.45"/>
+
+  <!-- 左摇杆 -->
+  <circle cx="146" cy="216" r="26" fill="#1550C4" opacity="0.18"/>
+  <circle cx="146" cy="216" r="17" fill="#1550C4"/>
+
+  <!-- 右侧四向键 -->
+  <g fill="#1550C4">
+    <rect x="357" y="190" width="13" height="30" rx="4"/>
+    <rect x="357" y="236" width="13" height="30" rx="4"/>
+    <rect x="347" y="200" width="30" height="13" rx="4"/>
+    <rect x="347" y="243" width="30" height="13" rx="4"/>
+  </g>
+</svg>

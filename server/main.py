@@ -83,6 +83,8 @@ llm = LLMClient(
     model=CFG["llm"]["model"],
     timeout=CFG["llm"].get("timeout", 60),
     max_tokens=int(CFG["llm"].get("max_tokens", 4096)),
+    # 留空则完全不传，交由服务商默认行为
+    reasoning_effort=str(CFG["llm"].get("reasoning_effort", "high")),
 )
 
 PERSONA = CFG.get("persona", {})
@@ -211,6 +213,7 @@ def apply_config(cfg: dict):
     llm.base_url = c["base_url"].rstrip("/")
     llm.api_key = c["api_key"]
     llm.model = c["model"]
+    llm.reasoning_effort = str(c.get("reasoning_effort", "high"))
     t = cfg.get("tts", {})
     tts.enable = bool(t.get("enable", False))
     tts.voice = t.get("voice", "cmn")
@@ -603,7 +606,8 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
         await manager.broadcast({"type": "user_message", "text": text, "ts": time.time()})
         feed_push("user_message", text=text)
     # @{文件} 展开为内容；图片标记在 run_agent 里转成多模态 content
-    history.append({"role": "user", "content": text, "llm": _expand_context(text)})
+    history.append({"role": "user", "content": text, "llm": _expand_context(text),
+                    "ts": time.time()})
     events: list[dict] = []
     # 标题取自第一条用户消息，所以用户一发出就落盘并刷新侧栏，不必等整轮回答结束
     save_current_session()
@@ -640,7 +644,8 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
     finally:
         set_overlay(False)
 
-    history.append({"role": "assistant", "content": reply})
+    history.append({"role": "assistant", "content": reply, "events": events,
+                    "ts": time.time()})
     save_current_session()
     await manager.broadcast({"type": "assistant_message", "text": reply, "ts": time.time(), "events": events})
     feed_push("assistant_message", text=reply, events=events)
@@ -965,6 +970,7 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
         content = m.get("llm") or m.get("content", "")
         if m["role"] == "user":
             content = _to_vision_content(content) if isinstance(content, str) else content
+        # 历史里还存了 ts / events 供界面回放，发给模型时只保留 role 和 content
         msgs.append({"role": m["role"], "content": content})
     streaming = False  # 是否已开始向用户流式输出正文
 
@@ -1049,7 +1055,10 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
                     event["path"] = str(args.get("path", ""))
                 activity = f"正在{label}：{summary}" if summary else f"正在{label}"
                 await manager.broadcast({"type": "tool_activity", "text": activity, "ts": time.time()})
-                set_overlay(True, activity)
+                # 只有真正动设备（点鼠标、打字、截屏、跑命令）才压遮罩，
+                # 联网搜索这类后台工具不该挡住用户的屏幕
+                if name in tools.DEVICE_TOOLS:
+                    set_overlay(True, activity)
 
                 result = await tools.execute(name, args)
                 # 终端输出截断后随事件展示（网页端显示为终端块）
