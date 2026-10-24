@@ -605,15 +605,6 @@
       <label>API Key</label>
       <input id="cfgApiKey" type="password" placeholder="sk-…" autocomplete="off">
     </div>
-    <div class="field">
-      <label>模型</label>
-      <input id="cfgModel" type="text" list="cfgModelList" placeholder="填好地址和 Key 后点「拉取」自动列出" autocomplete="off">
-      <datalist id="cfgModelList"></datalist>
-      <div style="display:flex; gap:8px; margin-top:8px; align-items:center;">
-        <button id="fetchModels" type="button" style="margin:0; padding:8px 14px; font-size:13px; background:var(--surface-2); color:var(--text); border:1px solid var(--line);">拉取模型列表</button>
-        <span id="fetchModelsHint" style="font-size:12px; color:var(--muted);"></span>
-      </div>
-    </div>
     <div class="field field-row">
       <label style="margin:0">语音播报回复</label>
       <span class="switch">
@@ -1252,7 +1243,6 @@
   var settingsPanel = document.getElementById('settingsPanel');
   var cfgBaseUrl = document.getElementById('cfgBaseUrl');
   var cfgApiKey = document.getElementById('cfgApiKey');
-  var cfgModel = document.getElementById('cfgModel');
   var cfgTts = document.getElementById('cfgTts');
   var cfgPerm = document.getElementById('cfgPerm');
   var cfgWorkspace = document.getElementById('cfgWorkspace');
@@ -1267,7 +1257,6 @@
       .then(function (c) {
         cfgBaseUrl.value = c.base_url || '';
         cfgApiKey.value = c.api_key || '';
-        cfgModel.value = c.model || '';
         cfgTts.checked = c.tts_enable;
         cfgPerm.value = c.permission_mode || 'auto';
         cfgWorkspace.value = c.workspace || '';
@@ -1298,37 +1287,14 @@
     if (e.target === phonePanel) phonePanel.classList.remove('show');
   });
 
-  // 拉取模型列表：带上面板里刚填的地址和 Key 直接探测（不落盘），点保存才写入配置
-  document.getElementById('fetchModels').addEventListener('click', function () {
-    var hint = document.getElementById('fetchModelsHint');
-    var btn = this;
-    btn.disabled = true;
-    hint.textContent = '拉取中…';
-    var qs = 'token=' + encodeURIComponent(token)
-      + '&base_url=' + encodeURIComponent(cfgBaseUrl.value.trim())
-      + '&api_key=' + encodeURIComponent(cfgApiKey.value.trim());
-    fetch('/api/models?' + qs)
-      .then(function (r) { return r.json(); })
-      .then(function (d) {
-        if (d.detail) { hint.textContent = d.detail; return; }
-        var list = d.models || [];
-        var dl = document.getElementById('cfgModelList');
-        dl.innerHTML = '';
-        list.forEach(function (m) {
-          var o = document.createElement('option');
-          o.value = m;
-          dl.appendChild(o);
-        });
-        if (!cfgModel.value && list.length) cfgModel.value = list[0];
-        if (list.indexOf(cfgModel.value) < 0 && cfgModel.value) {
-          hint.textContent = '当前填的「' + cfgModel.value + '」不在返回列表里';
-          return;
-        }
-        hint.textContent = list.length ? ('共 ' + list.length + ' 个模型，点输入框选') : '没有返回模型';
-      })
-      .catch(function () { hint.textContent = '拉取失败，检查地址和 Key'; })
-      .finally(function () { btn.disabled = false; });
-  });
+  // 拉取当前配置（已保存的地址和 Key）的模型列表，同步到底部下拉框
+  function reloadModels() {
+    modelsPromise = null;
+    return fetchModels().then(function (list) {
+      if (list.length) fillModelSelect(list);
+      return list;
+    });
+  }
 
   saveCfg.addEventListener('click', function () {
     cfgHint.textContent = '保存中…';
@@ -1338,7 +1304,6 @@
       body: JSON.stringify({
         base_url: cfgBaseUrl.value,
         api_key: cfgApiKey.value,
-        model: cfgModel.value,
         tts_enable: cfgTts.checked,
         permission_mode: cfgPerm.value,
         workspace: cfgWorkspace.value
@@ -1346,8 +1311,16 @@
     })
       .then(function (r) { return r.json(); })
       .then(function (res) {
-        cfgHint.textContent = res.llm_configured ? '已保存并生效 ✓' : '已保存（API Key 为空，对话暂不可用）';
-        setTimeout(function () { settingsPanel.classList.remove('show'); }, 1200);
+        cfgHint.textContent = res.llm_configured ? '已保存，正在拉取模型列表…' : '已保存（API Key 为空，对话暂不可用）';
+        if (!res.llm_configured) {
+          setTimeout(function () { settingsPanel.classList.remove('show'); }, 1200);
+          return null;
+        }
+        return reloadModels().then(function (list) {
+          cfgHint.textContent = list.length ? ('已保存并生效 ✓ 共 ' + list.length + ' 个模型') : '已保存，但没拉到模型列表';
+          loadToolbar();  // 刷新右上角当前模型显示
+          setTimeout(function () { settingsPanel.classList.remove('show'); }, 1200);
+        });
       })
       .catch(function () { cfgHint.textContent = '保存失败'; });
   });
@@ -1485,6 +1458,8 @@
       if (!m || seen[m]) return;
       seen[m] = 1; opts.push(m);
     });
+    // 按名字首字母排序，忽略大小写
+    opts.sort(function (a, b) { return a.localeCompare(b, 'en', { sensitivity: 'base' }); });
     modelSelect.innerHTML = '';
     opts.forEach(function (m) {
       var o = document.createElement('option');

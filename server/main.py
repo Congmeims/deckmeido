@@ -463,6 +463,21 @@ async def api_get_config():
     }
 
 
+async def _pick_model(base_url: str, api_key: str) -> str:
+    """换了服务商后自动挑一个模型：原模型还在就用它，否则取列表里第一个"""
+    probe = LLMClient(base_url=base_url.strip().rstrip("/"), api_key=api_key,
+                      model=llm.model, timeout=30.0)
+    try:
+        names = await probe.list_models()
+    finally:
+        await probe.close()
+    if llm.model in names:
+        return llm.model
+    if not names:
+        raise HTTPException(status_code=502, detail="服务商没有返回任何模型")
+    return names[0]
+
+
 @app.post("/api/config", dependencies=[Depends(check_token)])
 async def api_set_config(req: ConfigUpdate):
     llm_updates = {}
@@ -472,6 +487,9 @@ async def api_set_config(req: ConfigUpdate):
         llm_updates["api_key"] = req.api_key.strip()
     if req.model is not None:
         llm_updates["model"] = req.model.strip()
+    elif req.api_key is not None and req.api_key.strip() and req.api_key.strip() != llm.api_key:
+        # 换了 Key 而没指定模型：保持原模型若它仍可用，否则挑列表里第一个正规模型名
+        llm_updates["model"] = await _pick_model(req.base_url or llm.base_url, req.api_key.strip())
     updates = {}
     if llm_updates:
         updates["llm"] = llm_updates
