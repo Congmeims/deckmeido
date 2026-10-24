@@ -44,15 +44,21 @@
     background: var(--surface);
     border-bottom: 1px solid var(--line);
   }
-  .logo { font-weight: 600; font-size: 17px; }
+  .logo { font-weight: 600; font-size: 17px; flex: 0 0 auto; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--danger); flex: 0 0 auto; }
   .dot.on { background: #2ecc71; }
-  .status-text { color: var(--muted); font-size: 12px; }
+  .status-text {
+    color: var(--muted); font-size: 12px;
+    flex: 0 1 auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .badge {
     font-size: 12px; color: var(--muted);
     background: var(--surface-2);
     padding: 4px 10px; border-radius: 999px;
     white-space: nowrap;
+    flex: 0 1 auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis;
   }
   .badge.warn { color: #b8860b; }
   .badge.danger { color: #d0492b; }
@@ -179,6 +185,8 @@
     font-size: 13px; color: var(--muted);
     padding: 3px 4px; border-radius: 7px;
     user-select: none; line-height: 1.4;
+    /* 标签不能被 chip 挤成竖排单字 */
+    white-space: nowrap;
   }
   .tl-head.clickable { cursor: pointer; }
   .tl-head.clickable:hover { color: var(--text); background: var(--hover); }
@@ -191,7 +199,10 @@
     background: var(--surface-2); border-radius: 6px;
     padding: 1px 7px; font-size: 12px;
     font-family: ui-monospace, monospace; color: var(--brand);
-    max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    /* 300px 是桌面宽度上限；窄屏用 vw 收窄，避免把左侧标签压成竖排 */
+    max-width: min(300px, 52vw);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    flex: 0 1 auto; min-width: 0;
   }
   .tl-arrow { font-size: 10px; opacity: .6; }
   .tl-body {
@@ -261,9 +272,9 @@
     border-top: 1px solid var(--line);
     position: relative;   /* 供 ＋ 菜单 / 命令菜单定位 */
   }
-  #composerBar { display: flex; align-items: center; gap: 8px; }
-  .cb-left { display: flex; gap: 8px; flex: 0 0 auto; }
-  .cb-right { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+  #composerBar { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .cb-left { display: flex; gap: 8px; flex: 0 0 auto; min-width: 0; }
+  .cb-right { display: flex; gap: 8px; align-items: center; margin-left: auto; min-width: 0; }
   .cb-btn {
     min-width: 34px; padding: 0 10px; height: 34px; border: none; border-radius: 10px;
     background: var(--surface-2); color: var(--muted);
@@ -274,7 +285,7 @@
     background: var(--surface-2); color: var(--muted);
     font-size: 12.5px; padding: 0 8px; outline: none; max-width: 130px;
   }
-  /* 模型名普遍较长，单独放宽；窄屏时允许收缩但仍保底 180px */
+  /* 模型名普遍较长，单独放宽；窄屏时由下面的媒体查询改成可收缩 */
   #modelSelect {
     max-width: none; width: 240px; min-width: 180px; flex: 0 1 auto;
     text-overflow: ellipsis;
@@ -440,7 +451,9 @@
     padding: 18px 16px;
     padding-bottom: calc(18px + env(safe-area-inset-bottom));
     max-height: 85dvh;
+    max-height: 85svh;
     overflow-y: auto;
+    overscroll-behavior: contain;
   }
   .sheet h2 { font-size: 17px; margin-bottom: 14px; }
   .field { margin-bottom: 14px; }
@@ -596,6 +609,42 @@
     }
     body.sb-open #sidebar { transform: none; }
     #btnMenu { display: block; }
+  }
+  /* 手机竖屏（≈390px）：顶栏、时间线、输入栏都要单独收窄，否则会被挤出屏幕 */
+  @media (max-width: 560px) {
+    header { gap: 7px; padding: 8px 10px; padding-top: calc(8px + env(safe-area-inset-top)); }
+    .logo { font-size: 15px; }
+    /* 状态文案只留“已连接 / 重连中”，避免和右侧徽章抢宽度 */
+    .status-text { max-width: 4em; }
+    .hdr-right { gap: 5px; flex: 0 1 auto; min-width: 0; flex-wrap: nowrap; }
+    .badge { padding: 3px 8px; font-size: 11px; }
+    /* 只保留电池这一个最重要的徽章，上下文与模式隐藏，信息可在侧边栏看到 */
+    #ctxBadge, #modeBadge { display: none !important; }
+    .hdr-right:has(#batteryBadge[hidden]) { display: none; }
+
+    #messages { padding: 10px 10px; gap: 8px; }
+    .msg { max-width: 92%; font-size: 15px; padding: 9px 12px; }
+    .events { max-width: 100%; padding-left: 18px; }
+    .events::before { left: 5px; }
+    .tl-ico { left: -15px; }
+    .tl-head { font-size: 12.5px; gap: 5px; }
+    .tl-chip { max-width: 56vw; font-size: 11.5px; }
+    .tl-body { font-size: 12px; }
+    /* 截图缩略图别顶满整行 */
+    .tl-body.pic .shot { width: 62vw; min-width: 0; }
+
+    #composer { padding: 8px 10px; padding-bottom: calc(8px + env(safe-area-inset-bottom)); gap: 6px; }
+    #input { font-size: 15px; padding: 10px 12px; min-height: 40px; }
+    #composerBar { gap: 6px; }
+    .cb-left, .cb-right { gap: 6px; }
+    /* 模型框改成吃剩余宽度，保证“发送”永远露出来 */
+    #modelSelect {
+      width: auto; min-width: 0; max-width: none;
+      flex: 1 1 auto; font-size: 12px; padding: 0 6px;
+    }
+    #permSelect { max-width: 88px; font-size: 12px; padding: 0 6px; }
+    #send { min-width: 48px; padding: 0 12px; font-size: 14px; }
+    .cb-btn { padding: 0 8px; }
   }
   /* 代码块全屏查看 */
   #codeView { display: none; position: fixed; inset: 0; z-index: 45; background: var(--overlay); align-items: center; justify-content: center; }
