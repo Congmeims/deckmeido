@@ -426,7 +426,7 @@ async def start_chat(text: str, announce: bool = True):
     try:
         return await current_task
     except asyncio.CancelledError:
-        return {"reply": "⏹ 已终止当前操作", "events": [], "cancelled": True}
+        return {"reply": "已终止当前操作", "events": [], "cancelled": True}
     finally:
         current_task = None
 
@@ -551,6 +551,9 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
     # @{文件} 展开为内容；图片标记在 run_agent 里转成多模态 content
     history.append({"role": "user", "content": text, "llm": _expand_context(text)})
     events: list[dict] = []
+    # 标题取自第一条用户消息，所以用户一发出就落盘并刷新侧栏，不必等整轮回答结束
+    save_current_session()
+    await manager.broadcast({"type": "session_changed", "current": current_sid})
 
     # 上下文超长时自动压缩（摘要替换旧对话，不再直接丢弃）
     if len(history) > HISTORY_LIMIT:
@@ -575,9 +578,9 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
             reply = await _run_agent_guarded(events)
     except asyncio.CancelledError:
         # 用户点了终止：广播终止消息并向上传递
-        await manager.broadcast({"type": "assistant_message", "text": "⏹ 已终止当前操作",
+        await manager.broadcast({"type": "assistant_message", "text": "已终止当前操作",
                                  "ts": time.time(), "events": events, "cancelled": True})
-        feed_push("assistant_message", text="⏹ 已终止当前操作", events=events)
+        feed_push("assistant_message", text="已终止当前操作", events=events)
         save_current_session()
         raise
     finally:
@@ -685,8 +688,8 @@ async def api_session_create():
     save_current_session()
     await manager.broadcast({"type": "history", "messages": history})
     await manager.broadcast({"type": "session_changed", "current": current_sid})
-    await manager.broadcast({"type": "system", "text": "🆕 已开始新会话", "ts": time.time()})
-    feed_push("system", text="🆕 已开始新会话")
+    await manager.broadcast({"type": "system", "text": "已开始新会话", "ts": time.time()})
+    feed_push("system", text="已开始新会话")
     return {"ok": True, "id": current_sid}
 
 
