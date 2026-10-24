@@ -241,6 +241,36 @@
   }
   #send:disabled { opacity: .4; }
 
+  /* 等待发送队列（agent 运行时排队的消息） */
+  #queueBox { display: none; flex-direction: column; gap: 6px; }
+  #queueBox.show { display: flex; }
+  .qchip {
+    background: var(--surface-2);
+    border: 1px solid rgba(255,255,255,.1);
+    border-radius: 12px;
+    padding: 8px 12px;
+    font-size: 13.5px;
+  }
+  .qchip .q-text {
+    overflow: hidden;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    word-break: break-word;
+    margin-bottom: 4px;
+  }
+  .qchip .q-wait {
+    border: none; background: none; color: var(--muted);
+    font-size: 12.5px; cursor: pointer; padding: 2px 0;
+  }
+  .qchip .q-menu { display: none; flex-direction: column; gap: 2px; margin-top: 4px; }
+  .qchip .q-menu.show { display: flex; }
+  .qchip .q-menu button {
+    border: none; background: none; color: var(--text);
+    text-align: left; padding: 6px 8px; border-radius: 7px;
+    font-size: 13px; cursor: pointer;
+  }
+  .qchip .q-menu button:hover { background: rgba(255,255,255,.08); }
+  .qchip .q-now { color: var(--brand); }
+
   /* token 输入遮罩 */
   #authOverlay {
     position: fixed; inset: 0;
@@ -379,6 +409,7 @@
 <div id="messages"></div>
 
 <div id="composer">
+  <div id="queueBox"></div>
   <textarea id="input" rows="1" placeholder="@ 添加上下文，/ 使用命令" enterkeyhint="send"></textarea>
   <div id="composerBar">
     <div class="cb-left">
@@ -745,6 +776,7 @@
           liveBox = null; liveToolCount = 0; liveThoughtShown = 0;
           addMsg('assistant', msg.text, msg.ts);
           refreshStatus();  // 更新上下文用量徽标
+          flushQueue(!!msg.cancelled);  // 有排队消息则自动发出
           break;
         case 'tool_activity':
           showTyping('🔧 ' + msg.text);
@@ -793,6 +825,83 @@
   }
 
   var busy = false;
+  var queueBox = document.getElementById('queueBox');
+  var msgQueue = [];              // 等待发送的消息
+  var forceSendAfterCancel = null; // 「立即发送」：终止当前后要立刻发出去的文本
+
+  // ---------- 等待发送队列 ----------
+  function renderQueue() {
+    queueBox.innerHTML = '';
+    queueBox.classList.toggle('show', msgQueue.length > 0);
+    msgQueue.forEach(function (text, i) {
+      var chip = document.createElement('div');
+      chip.className = 'qchip';
+      var t = document.createElement('div');
+      t.className = 'q-text';
+      t.textContent = text;
+      chip.appendChild(t);
+      var wait = document.createElement('button');
+      wait.className = 'q-wait';
+      wait.textContent = '⏳ 等待发送… ⌄';
+      chip.appendChild(wait);
+      var menu = document.createElement('div');
+      menu.className = 'q-menu';
+      var now = document.createElement('button');
+      now.className = 'q-now';
+      now.textContent = '⚡ 立即发送（终止当前操作）';
+      now.addEventListener('click', function () { sendQueuedNow(i); });
+      var drop = document.createElement('button');
+      drop.textContent = '✕ 取消等待（放回输入框）';
+      drop.addEventListener('click', function () {
+        msgQueue.splice(i, 1);
+        input.value = input.value ? input.value + '\n' + text : text;
+        input.dispatchEvent(new Event('input'));
+        renderQueue();
+        input.focus();
+      });
+      menu.appendChild(now);
+      menu.appendChild(drop);
+      chip.appendChild(menu);
+      wait.addEventListener('click', function () { menu.classList.toggle('show'); });
+      queueBox.appendChild(chip);
+    });
+  }
+
+  // 「立即发送」：终止当前操作，完成后发这条
+  function sendQueuedNow(i) {
+    var text = msgQueue[i];
+    msgQueue.splice(i, 1);
+    renderQueue();
+    if (!busy) { doSend(text); return; }
+    forceSendAfterCancel = text;
+    fetch('/api/cancel?token=' + encodeURIComponent(token), { method: 'POST' })
+      .catch(function () {});
+  }
+
+  // 一轮结束后：自动发出排队的下一条
+  function flushQueue(cancelled) {
+    if (forceSendAfterCancel) {
+      var ft = forceSendAfterCancel;
+      forceSendAfterCancel = null;
+      doSend(ft);
+      return;
+    }
+    // 手动终止后不自动发，保留队列等用户决定
+    if (cancelled || !msgQueue.length) return;
+    doSend(msgQueue.shift());
+    renderQueue();
+  }
+
+  function updateSendBtn() {
+    // 运行中且输入框为空 → ⏹ 终止；运行中但有文字 → 发送（排队）
+    if (busy && !input.value.trim()) {
+      sendBtn.textContent = '⏹';
+      sendBtn.classList.add('stop');
+    } else {
+      sendBtn.textContent = '发送';
+      sendBtn.classList.remove('stop');
+    }
+  }
 
   function refreshStatus() {
     fetch('/api/status?token=' + encodeURIComponent(token))
@@ -840,23 +949,37 @@
 
   function setBusy(b) {
     busy = b;
-    sendBtn.textContent = b ? '⏹' : '发送';
-    sendBtn.classList.toggle('stop', b);
+    updateSendBtn();
   }
 
-  function send() {
-    if (busy) {
-      // 终止当前操作
-      fetch('/api/cancel?token=' + encodeURIComponent(token), { method: 'POST' })
-        .catch(function () {});
-      setBusy(false);
-      hideTyping();
-      return;
-    }
-    var text = input.value.trim();
+  function doSend(text) {
     if (!text || !ws || ws.readyState !== 1) return;
     ws.send(JSON.stringify({ type: 'chat', text: text }));
     setBusy(true);
+  }
+
+  function send() {
+    var text = input.value.trim();
+    if (busy) {
+      if (text) {
+        // agent 运行中：排队等待发送（Trae 式）
+        msgQueue.push(text);
+        renderQueue();
+        input.value = '';
+        input.style.height = 'auto';
+        updateSendBtn();
+        input.focus();
+      } else {
+        // 输入框为空：⏹ 终止当前操作
+        fetch('/api/cancel?token=' + encodeURIComponent(token), { method: 'POST' })
+          .catch(function () {});
+        setBusy(false);
+        hideTyping();
+      }
+      return;
+    }
+    if (!text) return;
+    doSend(text);
     input.value = '';
     input.style.height = 'auto';
     input.focus();
@@ -869,6 +992,7 @@
   input.addEventListener('input', function () {
     input.style.height = 'auto';
     input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+    updateSendBtn();
   });
 
   tokenBtn.addEventListener('click', function () {
