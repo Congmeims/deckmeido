@@ -141,6 +141,27 @@
   .stream-body { white-space: pre-wrap; word-break: break-word; }
   #send.stop { background: var(--danger); }
 
+  /* 分享模式 */
+  #shareBar {
+    display: none;
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
+    background: var(--surface); border-top: 1px solid rgba(255,255,255,.1);
+    padding: 12px 16px; padding-bottom: calc(12px + env(safe-area-inset-bottom));
+    align-items: center; gap: 12px; font-size: 14px;
+  }
+  #shareBar.show { display: flex; }
+  #shareBar button { border: none; border-radius: 10px; padding: 9px 18px; font-size: 14px; background: var(--brand); color: #fff; }
+  #shareBar #shareCancel { background: var(--surface-2); color: var(--text); }
+  body.selecting .msg { cursor: pointer; }
+  body.selecting .msg.selected { outline: 2px solid var(--brand); outline-offset: 2px; }
+  #shareOverlay {
+    display: none; position: fixed; inset: 0; z-index: 40;
+    background: rgba(0,0,0,.85); align-items: center; justify-content: center;
+  }
+  #shareOverlay.show { display: flex; }
+  .share-box { max-width: 92vw; max-height: 92dvh; display: flex; flex-direction: column; align-items: center; }
+  .share-box img { max-width: 100%; max-height: 78dvh; border-radius: 12px; }
+
   /* 正在输入 */
   .typing { display: inline-flex; gap: 4px; padding: 4px 2px; }
   .typing i { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: blink 1.2s infinite; }
@@ -300,8 +321,27 @@
   <button class="menu-btn" id="btnNew">🆕 新会话</button>
   <button class="menu-btn" id="btnCompact">🗜 压缩上下文</button>
   <button class="menu-btn" id="btnShot">📷 截屏</button>
+  <button class="menu-btn" id="btnRetry">↻ 重试</button>
+  <button class="menu-btn" id="btnShare">↗ 分享</button>
   <span class="spacer"></span>
+  <span class="badge" id="ctxBadge" hidden></span>
 </nav>
+
+<div id="shareBar">
+  <span>已选 <b id="shareCount">0</b> 条</span>
+  <button id="shareGo">生成图片</button>
+  <button id="shareCancel">取消</button>
+</div>
+
+<div id="shareOverlay">
+  <div class="share-box">
+    <img id="shareImg" alt="对话分享图">
+    <div style="display:flex; gap:10px; margin-top:12px;">
+      <a id="shareDownload" download="deckmate-chat.png"><button class="menu-btn" style="padding:10px 20px;">⬇ 下载图片</button></a>
+      <button class="menu-btn" id="shareClose" style="padding:10px 20px;">关闭</button>
+    </div>
+  </div>
+</div>
 
 <div id="messages"></div>
 
@@ -347,6 +387,10 @@
         <option value="full">完全访问（不再询问）</option>
       </select>
     </div>
+    <div class="field">
+      <label>工作区目录（编程/文件任务默认位置）</label>
+      <input id="cfgWorkspace" type="text" placeholder="/home/deck/deckmate_workspace" autocomplete="off">
+    </div>
     <button id="saveCfg">保存</button>
     <div id="cfgHint"></div>
   </div>
@@ -361,6 +405,7 @@
   var statusText = document.getElementById('statusText');
   var batteryBadge = document.getElementById('batteryBadge');
   var modeBadge = document.getElementById('modeBadge');
+  var ctxBadge = document.getElementById('ctxBadge');
   var authOverlay = document.getElementById('authOverlay');
   var tokenInput = document.getElementById('tokenInput');
   var tokenBtn = document.getElementById('tokenBtn');
@@ -526,6 +571,8 @@
 
   var liveBox = null;      // 本轮对话的事件容器（实时渲染工具终端块）
   var liveToolCount = 0;   // 已实时渲染的工具数，避免 assistant_message 重复渲染
+  var liveThoughtShown = 0; // 已实时渲染的思维链数
+  var liveThought = null;  // 实时思维链卡片（.thought-body 元素）
   var streamEl = null;     // 流式输出气泡
   var streamBody = null;
 
@@ -557,6 +604,8 @@
           liveBox.className = 'events';
           messages.appendChild(liveBox);
           liveToolCount = 0;
+          liveThoughtShown = 0;
+          liveThought = null;
           showTyping();
           break;
         case 'stream_start':
@@ -575,6 +624,40 @@
             scrollBottomSafe();
           }
           break;
+        case 'thought_start':
+          if (!liveBox) {
+            liveBox = document.createElement('div');
+            liveBox.className = 'events';
+            messages.appendChild(liveBox);
+          }
+          var td = document.createElement('details');
+          td.className = 'ev thought';
+          td.open = true;
+          var tsum = document.createElement('summary');
+          tsum.textContent = '🧠 思维链（思考中…）';
+          var tbody = document.createElement('div');
+          tbody.className = 'thought-body';
+          td.appendChild(tsum);
+          td.appendChild(tbody);
+          liveBox.appendChild(td);
+          liveThought = tbody;
+          scrollBottomSafe();
+          break;
+        case 'thought_delta':
+          if (liveThought) {
+            liveThought.textContent += msg.text;
+            scrollBottomSafe();
+          }
+          break;
+        case 'thought_end':
+          if (liveThought) {
+            var sum2 = liveThought.previousSibling;
+            if (sum2) sum2.textContent = '🧠 思维链（点击展开）';
+            if (liveThought.parentNode) liveThought.parentNode.open = false;
+          }
+          liveThought = null;
+          liveThoughtShown++;
+          break;
         case 'tool_done':
           if (liveBox && msg.event) {
             renderEvent(msg.event, liveBox);
@@ -589,10 +672,11 @@
           streamEl = null; streamBody = null;
           if (msg.events && msg.events.length) {
             if (liveBox) {
-              // 补渲染未实时显示的事件（思维链等），跳过已显示的工具块
-              var skip = liveToolCount;
+              // 补渲染未实时显示的事件，跳过已显示的工具块与思维链
+              var skip = liveToolCount, skipT = liveThoughtShown;
               msg.events.forEach(function (e) {
                 if (e.type === 'tool' && skip > 0) { skip--; return; }
+                if (e.type === 'thought' && skipT > 0) { skipT--; return; }
                 renderEvent(e, liveBox);
               });
             } else {
@@ -602,8 +686,9 @@
           if (liveBox && !liveBox.childNodes.length && liveBox.parentNode) {
             liveBox.parentNode.removeChild(liveBox);
           }
-          liveBox = null; liveToolCount = 0;
+          liveBox = null; liveToolCount = 0; liveThoughtShown = 0;
           addMsg('assistant', msg.text, msg.ts);
+          refreshStatus();  // 更新上下文用量徽标
           break;
         case 'tool_activity':
           showTyping('🔧 ' + msg.text);
@@ -641,6 +726,11 @@
       modeBadge.hidden = false;
       modeBadge.textContent = s.mode === 'gaming' ? '游戏模式' : '桌面模式';
     }
+    if (s.context) {
+      ctxBadge.hidden = false;
+      ctxBadge.textContent = '📦 上下文 ' + s.context.messages + '/' + s.context.limit;
+      ctxBadge.title = '上下文约 ' + s.context.chars + ' 字符 · 工作区 ' + (s.workspace || '');
+    }
     if (s.llm_configured === false) {
       addSystem('提示：LLM API Key 未配置，详见 config.toml');
     }
@@ -648,17 +738,25 @@
 
   var busy = false;
 
+  function refreshStatus() {
+    fetch('/api/status?token=' + encodeURIComponent(token))
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (s) { if (s) renderStatus(s); })
+      .catch(function () {});
+  }
+  setInterval(refreshStatus, 30000);
+
   // 菜单栏按钮
   document.getElementById('btnNew').addEventListener('click', function () {
     fetch('/api/session/new?token=' + encodeURIComponent(token), { method: 'POST' })
-      .then(function () { messages.innerHTML = ''; addSystem('🆕 已开始新会话'); })
+      .then(function () { messages.innerHTML = ''; addSystem('🆕 已开始新会话'); refreshStatus(); })
       .catch(function () { addSystem('操作失败'); });
   });
   document.getElementById('btnCompact').addEventListener('click', function () {
     addSystem('🗜 正在压缩上下文…');
     fetch('/api/compact?token=' + encodeURIComponent(token), { method: 'POST' })
       .then(function (r) { return r.json(); })
-      .then(function (res) { addSystem('压缩完成：' + (res.summary || '').slice(0, 120)); })
+      .then(function (res) { addSystem('压缩完成：' + (res.summary || '').slice(0, 120)); refreshStatus(); })
       .catch(function () { addSystem('压缩失败'); });
   });
   document.getElementById('btnShot').addEventListener('click', function () {
@@ -666,6 +764,22 @@
       ws.send(JSON.stringify({ type: 'chat', text: '截屏，把当前桌面画面展示给我' }));
       setBusy(true);
     }
+  });
+  // 重试：撤掉上一条 AI 回复并让模型重新回答
+  document.getElementById('btnRetry').addEventListener('click', function () {
+    if (busy) return;
+    // 本地移除最后一条 assistant 气泡和它前面的事件容器
+    var last = messages.lastElementChild;
+    if (last && last.classList.contains('msg') && last.classList.contains('assistant')) {
+      messages.removeChild(last);
+      var prev = messages.lastElementChild;
+      if (prev && prev.classList.contains('events')) messages.removeChild(prev);
+    }
+    setBusy(true);
+    showTyping();
+    fetch('/api/retry?token=' + encodeURIComponent(token), { method: 'POST' })
+      .then(function (r) { if (!r.ok) { hideTyping(); setBusy(false); addSystem('没有可重试的消息'); } })
+      .catch(function () { hideTyping(); setBusy(false); });
   });
 
   function setBusy(b) {
@@ -717,6 +831,7 @@
   var cfgModel = document.getElementById('cfgModel');
   var cfgTts = document.getElementById('cfgTts');
   var cfgPerm = document.getElementById('cfgPerm');
+  var cfgWorkspace = document.getElementById('cfgWorkspace');
   var saveCfg = document.getElementById('saveCfg');
   var cfgHint = document.getElementById('cfgHint');
 
@@ -729,8 +844,9 @@
         cfgBaseUrl.value = c.base_url || '';
         cfgApiKey.value = c.api_key || '';
         cfgModel.value = c.model || '';
-        cfgTts.checked = !!c.tts_enable;
+        cfgTts.checked = c.tts_enable;
         cfgPerm.value = c.permission_mode || 'auto';
+        cfgWorkspace.value = c.workspace || '';
       })
       .catch(function () { cfgHint.textContent = '读取配置失败'; });
   }
@@ -750,7 +866,8 @@
         api_key: cfgApiKey.value,
         model: cfgModel.value,
         tts_enable: cfgTts.checked,
-        permission_mode: cfgPerm.value
+        permission_mode: cfgPerm.value,
+        workspace: cfgWorkspace.value
       })
     })
       .then(function (r) { return r.json(); })
@@ -759,6 +876,102 @@
         setTimeout(function () { settingsPanel.classList.remove('show'); }, 1200);
       })
       .catch(function () { cfgHint.textContent = '保存失败'; });
+  });
+
+  // ---------- 分享：多选消息 → 生成图片 ----------
+  var selecting = false;
+  var shareBar = document.getElementById('shareBar');
+  var shareCount = document.getElementById('shareCount');
+  var shareOverlay = document.getElementById('shareOverlay');
+  var shareImg = document.getElementById('shareImg');
+  var shareDownload = document.getElementById('shareDownload');
+
+  function updateShareCount() {
+    shareCount.textContent = messages.querySelectorAll('.msg.selected').length;
+  }
+  document.getElementById('btnShare').addEventListener('click', function () {
+    selecting = !selecting;
+    document.body.classList.toggle('selecting', selecting);
+    shareBar.classList.toggle('show', selecting);
+    if (!selecting) {
+      messages.querySelectorAll('.msg.selected').forEach(function (el) { el.classList.remove('selected'); });
+    }
+    updateShareCount();
+  });
+  document.getElementById('shareCancel').addEventListener('click', function () {
+    document.getElementById('btnShare').click();
+  });
+  messages.addEventListener('click', function (e) {
+    if (!selecting) return;
+    var el = e.target.closest('.msg');
+    if (!el || el.classList.contains('system')) return;
+    el.classList.toggle('selected');
+    updateShareCount();
+  });
+  document.getElementById('shareClose').addEventListener('click', function () {
+    shareOverlay.classList.remove('show');
+  });
+
+  // 把选中的消息画到 canvas（深色卡片风格）
+  document.getElementById('shareGo').addEventListener('click', function () {
+    var picked = Array.prototype.slice.call(messages.querySelectorAll('.msg.selected'));
+    if (!picked.length) return;
+    var W = 760, PAD = 28, GAP = 14, BW = W - PAD * 2;
+    var canvas = document.createElement('canvas');
+    var ctx = canvas.getContext('2d');
+    ctx.font = '16px system-ui, sans-serif';
+
+    // 预排版：每条消息算出行和高度
+    var items = picked.map(function (el) {
+      var isUser = el.classList.contains('user');
+      var text = el.textContent.replace(/\d{2}:\d{2}$/, '').trim();  // 去掉末尾时间
+      var words = text.split(''), lines = [], line = '';
+      var maxW = BW * (isUser ? 0.75 : 0.85) - 28;
+      for (var i = 0; i < words.length; i++) {
+        var test = line + words[i];
+        if (ctx.measureText(test).width > maxW && line) { lines.push(line); line = words[i]; }
+        else line = test;
+      }
+      if (line) lines.push(line);
+      return { user: isUser, lines: lines, h: lines.length * 24 + 22 };
+    });
+    var H = PAD + 56 + items.reduce(function (s, it) { return s + it.h + GAP; }, 0) + PAD;
+    canvas.width = W; canvas.height = H;
+
+    // 背景 + 标题
+    ctx.fillStyle = '#0f1117';
+    ctx.fillRect(0, 0, W, H);
+    ctx.font = 'bold 22px system-ui, sans-serif';
+    ctx.fillStyle = '#1a9fff';
+    ctx.fillText('DeckMate 对话', PAD, PAD + 10);
+    ctx.font = '13px system-ui, sans-serif';
+    ctx.fillStyle = '#8b91a3';
+    ctx.fillText(new Date().toLocaleString(), PAD, PAD + 34);
+
+    var y = PAD + 56;
+    ctx.font = '16px system-ui, sans-serif';
+    items.forEach(function (it) {
+      var maxLineW = 0;
+      it.lines.forEach(function (l) { maxLineW = Math.max(maxLineW, ctx.measureText(l).width); });
+      var bw = Math.max(maxLineW + 28, 60);
+      var x = it.user ? W - PAD - bw : PAD;
+      // 气泡
+      ctx.fillStyle = it.user ? '#1a9fff' : '#232737';
+      var r = 14;
+      ctx.beginPath();
+      ctx.roundRect(x, y, bw, it.h, r);
+      ctx.fill();
+      // 文本
+      ctx.fillStyle = it.user ? '#ffffff' : '#e8eaf0';
+      it.lines.forEach(function (l, i) { ctx.fillText(l, x + 14, y + 30 + i * 24); });
+      y += it.h + GAP;
+    });
+
+    var url = canvas.toDataURL('image/png');
+    shareImg.src = url;
+    shareDownload.href = url;
+    shareOverlay.classList.add('show');
+    document.getElementById('btnShare').click();  // 退出选择模式
   });
 
   connect();

@@ -47,3 +47,7 @@ max_chars = 300
 #   auto   = 只读命令自动执行，危险命令（删改/安装/系统级）需审批
 #   full   = 完全访问，不再审批
 permission_mode = "auto"
+
+[workspace]
+# 编程/文件任务的默认工作区，可在设置面板修改
+dir = "/home/deck/deckmate_workspace"

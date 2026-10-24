@@ -41,8 +41,9 @@ class LLMClient:
         data = resp.json()
         return data["choices"][0]["message"]
 
-    async def chat_with_tools_stream(self, messages: list[dict], tools: list[dict], on_delta=None) -> dict:
-        """流式调用：正文增量经 on_delta 回调，最终返回聚合后的完整 message"""
+    async def chat_with_tools_stream(self, messages: list[dict], tools: list[dict],
+                                     on_delta=None, on_thought=None) -> dict:
+        """流式调用：正文增量经 on_delta、思维链增量经 on_thought 回调，最终返回聚合后的完整 message"""
         payload = {"model": self.model, "messages": messages,
                    "tools": tools, "tool_choice": "auto", "stream": True}
         content_parts: list[str] = []
@@ -73,6 +74,8 @@ class LLMClient:
                 rc = delta.get("reasoning_content") or delta.get("reasoning")
                 if rc:
                     reasoning_parts.append(rc)
+                    if on_thought:
+                        await on_thought(rc)
                 for tc in delta.get("tool_calls") or []:
                     i = tc.get("index", 0)
                     acc = tool_acc.setdefault(i, {"id": "", "type": "function",

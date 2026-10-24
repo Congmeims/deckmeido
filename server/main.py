@@ -101,11 +101,11 @@ def build_system_prompt() -> str:
         "文件管理、进程控制、xdotool 桌面操作（DISPLAY=:0）、截屏、Steam 控制、软件安装等，"
         "遇到任务先想 Shell 方案。另外还有便捷工具：查天气、搜索网页、查看已安装游戏、"
         "商店搜游戏、扫描模拟器 ROM、检查系统更新、安装游戏。\n"
-        "编程能力：你有自己的工作区 ~/deckmate_workspace。写代码/改文件用专用工具："
+        "编程能力：你有自己的工作区（当前：" + str(tools.WORKSPACE) + "）。写代码/改文件用专用工具："
         "list_dir 看结构、read_file 读文件（带行号）、write_file 创建、edit_file 精确替换；"
         "运行测试/脚本再用 run_command。用户让做项目时，先规划再逐步实施，像一个编程搭档。\n"
         "screenshot 工具可截取当前桌面画面展示给用户：排查问题、确认状态或用户要求看屏幕时主动使用"
-        "（画面会直接显示在聊天里，你自己看不到图，只需确认已截取）。\n"
+        "（画面会同时显示在聊天里并附给你，你可以直接看图回答用户问题）。\n"
         "环境：SteamOS holo、桌面模式 X11、家目录 /home/deck、SD 卡在 /run/media 下。\n"
         "规则：\n"
         f"- {mode_desc}\n"
@@ -153,11 +153,23 @@ def apply_config(cfg: dict):
     tts.voice = t.get("voice", "cmn")
     tts.speed = int(t.get("speed", 170))
     PERMISSION_MODE = cfg.get("security", {}).get("permission_mode", "auto")
+    ws_dir = cfg.get("workspace", {}).get("dir", "")
+    if ws_dir:
+        try:
+            tools.set_workspace(ws_dir)
+        except Exception:
+            pass
     SYSTEM_PROMPT = build_system_prompt()
 
 
 # 权限模式：manual=所有命令手动审批 / auto=危险命令才审批 / full=完全访问
 PERMISSION_MODE = CFG.get("security", {}).get("permission_mode", "auto")
+
+# 工作区（默认 ~/deckmate_workspace，可在设置里改）
+try:
+    tools.set_workspace(CFG.get("workspace", {}).get("dir", str(Path.home() / "deckmate_workspace")))
+except Exception:
+    pass
 
 # 内存中的对话历史（单会话，MVP）
 history: list[dict] = []
@@ -237,6 +249,12 @@ def get_status() -> dict:
         "mode": "gaming" if gaming else "desktop",
         "llm_configured": llm.configured,
         "model": llm.model,
+        "context": {
+            "messages": len(history),
+            "limit": HISTORY_LIMIT,
+            "chars": sum(len(str(m.get("content", ""))) for m in history),
+        },
+        "workspace": str(tools.WORKSPACE),
     }
 
 
@@ -272,10 +290,10 @@ async def api_chat(req: ChatRequest):
 current_task: asyncio.Task | None = None
 
 
-async def start_chat(text: str):
-    """把一轮对话放到可取消的任务里执行"""
+async def start_chat(text: str, announce: bool = True):
+    """把一轮对话放到可取消的任务里执行。announce=False 时不重复广播用户消息（重试用）"""
     global current_task
-    current_task = asyncio.create_task(handle_chat(text))
+    current_task = asyncio.create_task(handle_chat(text, announce))
     try:
         return await current_task
     except asyncio.CancelledError:
@@ -298,6 +316,7 @@ class ConfigUpdate(BaseModel):
     model: str | None = None
     tts_enable: bool | None = None
     permission_mode: str | None = None
+    workspace: str | None = None
 
 
 @app.get("/api/config", dependencies=[Depends(check_token)])
@@ -308,6 +327,7 @@ async def api_get_config():
         "model": llm.model,
         "tts_enable": tts.enable,
         "permission_mode": PERMISSION_MODE,
+        "workspace": str(tools.WORKSPACE),
     }
 
 
@@ -327,15 +347,32 @@ async def api_set_config(req: ConfigUpdate):
         updates["tts"] = {"enable": req.tts_enable}
     if req.permission_mode in ("manual", "auto", "full"):
         updates["security"] = {"permission_mode": req.permission_mode}
+    if req.workspace is not None and req.workspace.strip():
+        updates["workspace"] = {"dir": req.workspace.strip()}
     if updates:
         update_config(updates)
-    return {"ok": True, "llm_configured": llm.configured}
+    return {"ok": True, "llm_configured": llm.configured, "workspace": str(tools.WORKSPACE)}
 
 
-async def handle_chat(text: str) -> dict:
+@app.post("/api/retry", dependencies=[Depends(check_token)])
+async def api_retry():
+    """重新生成上一轮回复：弹出上一条 assistant，用最后一条 user 消息重新跑"""
     global pending_action
-    await manager.broadcast({"type": "user_message", "text": text, "ts": time.time()})
-    feed_push("user_message", text=text)
+    if pending_action:
+        raise HTTPException(status_code=400, detail="有待确认的操作，先回复确认或取消")
+    if history and history[-1]["role"] == "assistant":
+        history.pop()
+    if not history or history[-1]["role"] != "user":
+        raise HTTPException(status_code=400, detail="没有可重试的用户消息")
+    text = history.pop()["content"]
+    return await start_chat(text, announce=False)
+
+
+async def handle_chat(text: str, announce: bool = True) -> dict:
+    global pending_action
+    if announce:
+        await manager.broadcast({"type": "user_message", "text": text, "ts": time.time()})
+        feed_push("user_message", text=text)
     history.append({"role": "user", "content": text})
     events: list[dict] = []
 
@@ -471,9 +508,21 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
             await manager.broadcast({"type": "stream_start", "ts": time.time()})
         await manager.broadcast({"type": "delta", "text": text})
 
+    thought_open = False
+
+    async def on_thought(text: str):
+        nonlocal thought_open
+        if not thought_open:
+            thought_open = True
+            await manager.broadcast({"type": "thought_start", "ts": time.time()})
+        await manager.broadcast({"type": "thought_delta", "text": text})
+
     try:
         for _ in range(MAX_TOOL_ROUNDS):
-            msg = await llm.chat_with_tools_stream(msgs, tools.TOOLS, on_delta=on_delta)
+            msg = await llm.chat_with_tools_stream(msgs, tools.TOOLS, on_delta=on_delta, on_thought=on_thought)
+            if thought_open:
+                await manager.broadcast({"type": "thought_end", "ts": time.time()})
+                thought_open = False
 
             # 思维链（reasoning_content，DeepSeek/Qwen 等支持）
             reasoning = (msg.get("reasoning_content") or "").strip()
@@ -523,6 +572,17 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
                 events.append(event)
                 await manager.broadcast({"type": "tool_done", "event": event, "ts": time.time()})
                 msgs.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+                # 截图后把画面注入对话，多模态模型可直接看图回答
+                if name == "screenshot" and tools.LAST_VISION:
+                    try:
+                        import base64
+                        b64 = base64.b64encode(Path(tools.LAST_VISION).read_bytes()).decode()
+                        msgs.append({"role": "user", "content": [
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                            {"type": "text", "text": "（这是刚才截取的当前桌面画面，根据画面回答用户的问题）"},
+                        ]})
+                    except Exception:
+                        pass
         # 工具轮数用尽：最后再不给工具地问一次，让它基于已有结果收尾回答
         msg = await llm.chat_with_tools_stream(msgs, [], on_delta)
         if msg.get("reasoning_content"):

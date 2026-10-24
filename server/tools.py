@@ -517,10 +517,34 @@ async def _screenshot() -> str:
             sct.shot(output=str(path))
     if not path.exists():
         return "截图失败：spectacle 与 mss 都不可用"
-    return f"截图完成：/shots/{name}（画面已展示给用户；你看不到图，只需告知已截取）"
+    # 压缩一份给多模态模型看（1280 宽 JPEG）
+    global LAST_VISION
+    LAST_VISION = None
+    try:
+        from PIL import Image
+        img = Image.open(path)
+        img.thumbnail((1280, 1280))
+        vpath = shots_dir / f"vision_{int(time.time())}.jpg"
+        img.convert("RGB").save(vpath, "JPEG", quality=70)
+        LAST_VISION = vpath
+    except Exception:
+        pass
+    return f"截图完成：/shots/{name}。当前桌面画面已附上，你可以直接根据画面内容回答用户的问题。"
+
+
+# 最近一次截图的模型可读版本路径（供 run_agent 注入多模态消息）
+LAST_VISION: Path | None = None
 
 
 WORKSPACE = Path.home() / "deckmate_workspace"
+
+
+def set_workspace(path: str):
+    """切换工作区目录（设置面板可改），目录不存在则创建"""
+    global WORKSPACE
+    p = Path(path).expanduser()
+    p.mkdir(parents=True, exist_ok=True)
+    WORKSPACE = p.resolve()
 
 
 def _resolve(path: str) -> Path:
