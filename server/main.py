@@ -177,8 +177,56 @@ try:
 except Exception:
     pass
 
-# 内存中的对话历史（单会话，MVP）
+# 内存中的对话历史（当前会话；多会话 JSON 落盘在 server/sessions/）
 history: list[dict] = []
+
+# ---------- 会话持久化 ----------
+
+SESSIONS_DIR = BASE_DIR / "sessions"
+SESSIONS_DIR.mkdir(exist_ok=True)
+current_sid = "default"
+
+
+def _sess_path(sid: str) -> Path:
+    return SESSIONS_DIR / f"{sid}.json"
+
+
+def save_current_session():
+    """把当前会话历史写盘，标题取第一条用户消息"""
+    title = "新会话"
+    for m in history:
+        if m["role"] == "user":
+            title = (str(m.get("content") or "")).strip()[:24] or "新会话"
+            break
+    p = _sess_path(current_sid)
+    created = None
+    if p.exists():
+        try:
+            created = json.loads(p.read_text(encoding="utf-8")).get("created")
+        except Exception:
+            pass
+    data = {"id": current_sid, "title": title,
+            "created": created or time.time(), "updated": time.time(),
+            "history": history}
+    p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def init_sessions():
+    """启动时恢复最近的会话；没有历史则创建默认会话"""
+    global current_sid, history
+    files = sorted(SESSIONS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        save_current_session()
+        return
+    try:
+        data = json.loads(files[0].read_text(encoding="utf-8"))
+        current_sid = data.get("id", "default")
+        history = data.get("history", [])
+    except Exception:
+        save_current_session()
+
+
+init_sessions()
 
 # 消息 feed（供原生客户端轮询同步，增量拉取）
 feed: list[dict] = []
@@ -474,9 +522,11 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
         await manager.broadcast({"type": "assistant_message", "text": "⏹ 已终止当前操作",
                                  "ts": time.time(), "events": events, "cancelled": True})
         feed_push("assistant_message", text="⏹ 已终止当前操作", events=events)
+        save_current_session()
         raise
 
     history.append({"role": "assistant", "content": reply})
+    save_current_session()
     await manager.broadcast({"type": "assistant_message", "text": reply, "ts": time.time(), "events": events})
     feed_push("assistant_message", text=reply, events=events)
     # 语音播报：只播报最终回复，不播报思维链/工具过程（后台进行，不阻塞）
@@ -506,6 +556,7 @@ async def compact_history(auto: bool = False) -> str:
         history[:] = history[-keep:]
         return f"压缩失败，已截断旧对话：{e}"
     history[:] = [{"role": "system", "content": f"【此前对话摘要，供上下文延续】\n{summary}"}] + history[-keep:]
+    save_current_session()
     note = f"{'🗜 已自动压缩上下文' if auto else '🗜 已压缩上下文'}（{len(old)} 条旧消息 → 摘要）"
     await manager.broadcast({"type": "system", "text": note, "ts": time.time()})
     feed_push("system", text=note)
@@ -518,15 +569,108 @@ async def api_compact():
     return {"ok": True, "summary": summary[:300]}
 
 
-@app.post("/api/session/new", dependencies=[Depends(check_token)])
-async def api_new_session():
-    global pending_action
-    history.clear()
-    feed.clear()
-    pending_action = None
+@app.get("/api/sysinfo", dependencies=[Depends(check_token)])
+async def api_sysinfo():
+    """侧栏状态卡：CPU / 内存 / 硬盘占用 / 运行时长 / 局域网 IP"""
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        du = psutil.disk_usage("/home")  # SteamOS 根分区只读且小，用户数据在 /home
+        return {
+            "cpu": psutil.cpu_percent(),
+            "mem_pct": vm.percent, "mem_used": vm.used, "mem_total": vm.total,
+            "disk_pct": du.percent, "disk_used": du.used, "disk_total": du.total,
+            "uptime": int(time.time() - psutil.boot_time()),
+            "ip": _lan_ip(),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+class OpenFileReq(BaseModel):
+    path: str
+
+
+@app.post("/api/open_file", dependencies=[Depends(check_token)])
+async def api_open_file(req: OpenFileReq):
+    """原生客户端里点开图片/文件 → 用系统默认工具打开（仅限 static 目录内）"""
+    rel = req.path.split("?")[0].lstrip("/")
+    p = (STATIC_DIR / rel).resolve()
+    if not str(p).startswith(str(STATIC_DIR.resolve())) or not p.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    subprocess.Popen(["xdg-open", str(p)],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return {"ok": True}
+
+
+# ---------- 会话管理 ----------
+
+@app.get("/api/sessions", dependencies=[Depends(check_token)])
+async def api_sessions():
+    items = []
+    for p in sorted(SESSIONS_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            items.append({"id": d.get("id", p.stem), "title": d.get("title", "会话"),
+                          "updated": d.get("updated", 0), "messages": len(d.get("history", []))})
+        except Exception:
+            continue
+    return {"current": current_sid, "items": items}
+
+
+@app.post("/api/sessions/create", dependencies=[Depends(check_token)])
+async def api_session_create():
+    global current_sid, history
+    save_current_session()
+    current_sid = secrets.token_hex(4)
+    history = []
+    save_current_session()
+    await manager.broadcast({"type": "history", "messages": history})
+    await manager.broadcast({"type": "session_changed", "current": current_sid})
     await manager.broadcast({"type": "system", "text": "🆕 已开始新会话", "ts": time.time()})
     feed_push("system", text="🆕 已开始新会话")
+    return {"ok": True, "id": current_sid}
+
+
+class SwitchReq(BaseModel):
+    id: str
+
+
+@app.post("/api/sessions/switch", dependencies=[Depends(check_token)])
+async def api_session_switch(req: SwitchReq):
+    global current_sid, history
+    p = _sess_path(req.id)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="session not found")
+    save_current_session()
+    data = json.loads(p.read_text(encoding="utf-8"))
+    current_sid = data.get("id", req.id)
+    history = data.get("history", [])
+    await manager.broadcast({"type": "history", "messages": history})
+    await manager.broadcast({"type": "session_changed", "current": current_sid})
     return {"ok": True}
+
+
+@app.delete("/api/sessions/{sid}", dependencies=[Depends(check_token)])
+async def api_session_delete(sid: str):
+    global current_sid, history
+    p = _sess_path(sid)
+    if p.exists():
+        p.unlink()
+    if sid == current_sid:
+        # 删掉的是当前会话：开一个全新会话顶上
+        current_sid = secrets.token_hex(4)
+        history = []
+        save_current_session()
+        await manager.broadcast({"type": "history", "messages": history})
+        await manager.broadcast({"type": "session_changed", "current": current_sid})
+    return {"ok": True}
+
+
+# 旧接口兼容：新会话
+@app.post("/api/session/new", dependencies=[Depends(check_token)])
+async def api_new_session():
+    return await api_session_create()
 
 
 def _lan_ip() -> str:
