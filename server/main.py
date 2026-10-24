@@ -82,6 +82,7 @@ llm = LLMClient(
     api_key=CFG["llm"]["api_key"],
     model=CFG["llm"]["model"],
     timeout=CFG["llm"].get("timeout", 60),
+    max_tokens=int(CFG["llm"].get("max_tokens", 4096)),
 )
 
 PERSONA = CFG.get("persona", {})
@@ -101,7 +102,7 @@ def build_system_prompt() -> str:
     p = (
         f"你是 {name}，{traits}。你运行在一台 Steam Deck 上，是这台设备的智能代理。\n"
         "你的核心能力是 run_command：可以在设备上执行任意 bash 命令完成任务——"
-        "文件管理、进程控制、xdotool 桌面操作（DISPLAY=:0）、截屏、Steam 控制、软件安装等，"
+        "文件管理、进程控制、桌面操作、截屏、Steam 控制、软件安装等，"
         "遇到任务先想 Shell 方案。另外还有便捷工具：查天气、搜索网页、查看已安装游戏、"
         "商店搜游戏、扫描模拟器 ROM、检查系统更新、安装游戏。\n"
         "编程能力：你有自己的工作区（当前：" + str(tools.WORKSPACE) + "）。写代码/改文件用专用工具："
@@ -109,7 +110,12 @@ def build_system_prompt() -> str:
         "运行测试/脚本再用 run_command。用户让做项目时，先规划再逐步实施，像一个编程搭档。\n"
         "screenshot 工具可截取当前桌面画面展示给用户：排查问题、确认状态或用户要求看屏幕时主动使用"
         "（画面会同时显示在聊天里并附给你，你可以直接看图回答用户问题）。\n"
-        "环境：SteamOS holo、桌面模式 X11、家目录 /home/deck、SD 卡在 /run/media 下。\n"
+        "环境：SteamOS holo、Wayland 桌面会话（Xwayland 在 DISPLAY=:0）、家目录 /home/deck、SD 卡在 /run/media 下。\n"
+        "桌面操作分两种：Wayland 原生窗口（如 Flatpak 应用）只能用合成输入。\n"
+        "点击/输入一律用 desktop 工具：先 desktop action=focus target=窗口标题关键词 把目标切到前台，\n"
+        "截图确认按钮位置后用 action=click 点它，需要打字用 action=type。\n"
+        "坐标以截图的左上角为原点；窗口没切到前台就点，会点到下面别的窗口上。\n"
+        "xdotool 只对 X11(Xwayland) 程序有效，对 Wayland 原生窗口无效。\n"
         "规则：\n"
         f"- {mode_desc}\n"
         "- 安全审批由系统完成，不是你的职责。用户明确要求执行命令时，你必须直接发起工具调用，"
@@ -480,9 +486,34 @@ async def api_set_config(req: ConfigUpdate):
     return {"ok": True, "llm_configured": llm.configured, "workspace": str(tools.WORKSPACE)}
 
 
+@app.get("/api/models", dependencies=[Depends(check_token)])
+async def api_models(base_url: str = "", api_key: str = ""):
+    """向服务商拉取可用模型列表，供前端下拉框自动填充
+
+    带上 base_url/api_key 时用面板里刚填的值临时探测（不落盘），
+    这样用户粘贴新地址和 Key 后不点保存也能先看到有哪些模型。
+    """
+    try:
+        if base_url.strip():
+            probe = LLMClient(
+                base_url=base_url.strip(),
+                api_key=(api_key or llm.api_key).strip(),
+                model=llm.model,
+                timeout=30.0,
+            )
+            try:
+                names = await probe.list_models()
+            finally:
+                await probe.close()
+        else:
+            names = await llm.list_models()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"拉取模型列表失败：{exc}")
+    return {"models": names}
+
+
 @app.post("/api/retry", dependencies=[Depends(check_token)])
 async def api_retry():
-    """重新生成上一轮回复：弹出上一条 assistant，用最后一条 user 消息重新跑"""
     global pending_action
     if pending_action:
         raise HTTPException(status_code=400, detail="有待确认的操作，先回复确认或取消")
@@ -742,7 +773,8 @@ _https_started = False
 # agent 真正操作设备时，桌面上盖一层半透明遮罩；用户点一下遮罩即终止当前操作
 
 _overlay_proc = None
-_overlay_state = {"show": False, "text": ""}
+_overlay_state = {"show": False, "text": "", "passthrough": False}
+_overlay_ack = {"passthrough": False}  # 遮罩进程确认已让开鼠标
 
 
 def _overlay_env() -> dict:
@@ -784,12 +816,37 @@ def set_overlay(show: bool, text: str = "") -> None:
     _overlay_state["show"] = show
     if text:
         _overlay_state["text"] = text
+    if not show:
+        _overlay_state["passthrough"] = False
     if show:
         ensure_overlay()
 
 
+async def set_overlay_passthrough(on: bool) -> None:
+    """让遮罩暂时不接收鼠标点击，使 agent 的点击能落到下面的窗口。
+
+    打开时要等遮罩进程真正让开（它每 25ms 轮询，回报 ack）；
+    否则点击会打在还没隐藏的遮罩上，被当成「用户终止」。
+    """
+    _overlay_state["passthrough"] = on
+    if not on:
+        return
+    if _overlay_proc is None or _overlay_proc.poll() is not None:
+        return  # 遮罩没跑，不用等
+    for _ in range(40):  # 最多等 400ms
+        if _overlay_ack["passthrough"]:
+            return
+        await asyncio.sleep(0.01)
+
+
+tools.ON_OVERLAY_PASSTHROUGH = set_overlay_passthrough
+
+
 @app.get("/api/overlay_state", dependencies=[Depends(check_token)])
-async def api_overlay_state():
+async def api_overlay_state(ack: int = 0):
+    # 遮罩进程带 ack=1 轮询时，表示它已经按本次返回的 passthrough 生效过了
+    if ack:
+        _overlay_ack["passthrough"] = _overlay_state["passthrough"]
     return _overlay_state
 
 
@@ -884,6 +941,10 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
 
             tool_calls = msg.get("tool_calls") or []
             if not tool_calls:
+                # 输出被 max_tokens 截断：正文多半是半截工具调用标记，不能当答复返回
+                if msg.get("finish_reason") == "length":
+                    return ("这次回答被长度上限截断了，没能完成。"
+                            "可以让我拆成更小的步骤再来一次。")
                 return msg.get("content") or "（没有回复内容）"
 
             # 有工具调用：本轮流式输出的内容是中间话，作废（最终答复会重新流式）

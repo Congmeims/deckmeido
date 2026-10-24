@@ -21,7 +21,8 @@ from PySide6.QtWidgets import QApplication, QFrame, QLabel, QVBoxLayout, QWidget
 API = os.environ.get("DECKMATE_API", "http://127.0.0.1:18765")
 TOKEN = os.environ.get("DECKMATE_TOKEN", "")
 
-POLL_MS = 400          # 向后端询问「是否在操作」
+POLL_MS = 100          # 向后端询问「是否在操作」的常规间隔
+URGENT_MS = 25         # 穿透期间的快速轮询间隔（后端马上要点，等不起）
 MIN_SHOW_MS = 700      # 最短显示时长，避免秒级工具闪一下就消失
 
 # 遮罩进程不读 KDE 字体配置。优先等宽字体：它的空格宽度明确，
@@ -92,6 +93,7 @@ class Mask(QWidget):
 
         self._shown_at = 0.0
         self._cancelled = False
+        self._passthrough = False
 
         self.anim = QTimer(self)
         self.anim.timeout.connect(self._tick)
@@ -100,11 +102,18 @@ class Mask(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._poll)
         self.timer.start(POLL_MS)
+        # 后端要点击时会立刻打开 passthrough 然后马上点，
+        # 常规 400ms 轮询来不及反应，所以这里记下「需要快速轮询」的状态
+        self._urgent = False
+        self.urgent_timer = QTimer(self)
+        self.urgent_timer.timeout.connect(self._poll_urgent)
+        self.urgent_timer.start(URGENT_MS)
 
     # ---------- 后端状态 ----------
     def _fetch(self) -> dict:
+        # ack=1 告诉后端「本次返回的状态我已经照做了」，后端据此判断可以安全点击
         req = urllib.request.Request(
-            f"{API}/api/overlay_state?token={TOKEN}")
+            f"{API}/api/overlay_state?ack=1&token={TOKEN}")
         try:
             with urllib.request.urlopen(req, timeout=3) as r:
                 return json.loads(r.read())
@@ -116,18 +125,37 @@ class Mask(QWidget):
         self.action.setText(text or "准备中")
         self._relayout()
 
+    def _poll_urgent(self):
+        """穿透期间每 25ms 问一次后端，保证 agent 点击前遮罩已经让开"""
+        if self._urgent:
+            self._poll()
+
     def _poll(self):
         state = self._fetch()
         show = bool(state.get("show"))
         self._set_text(state.get("text") or "")
         now = time.monotonic()
+        # agent 发送鼠标点击期间后端会打开穿透，否则那一下会点在遮罩上变成「用户终止」
+        self._set_passthrough(bool(state.get("passthrough")))
+        # 正在显示或者刚要求穿透时，切到快速轮询
+        self._urgent = bool(show or self._passthrough)
         if show:
-            if not self.isVisible():
+            if not self.isVisible() and not self._passthrough:
                 self._show_mask()
                 self._shown_at = now
                 self._cancelled = False
         elif self.isVisible() and (now - self._shown_at) * 1000 >= MIN_SHOW_MS:
             self.hide()
+
+    def _set_passthrough(self, on: bool):
+        if on == self._passthrough:
+            return
+        self._passthrough = on
+        # 穿透期间直接把窗口藏起来：X11 下改 WA_TransparentForMouseEvents
+        # 需要重建窗口，隐藏再显示更简单可靠
+        if on:
+            self.hide()
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, on)
 
     def _cancel(self):
         if self._cancelled:

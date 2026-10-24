@@ -25,6 +25,7 @@ TOOL_CN: dict[str, str] = {
     "install_game": "安装游戏",
     "list_emulator_roms": "扫描模拟器游戏",
     "run_command": "执行命令",
+    "desktop": "操作桌面",
     "screenshot": "截取屏幕",
     "list_dir": "查看目录",
     "read_file": "读取文件",
@@ -146,6 +147,27 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "desktop",
+            "description": ("操作桌面窗口（Wayland 原生程序也能点）。action=focus 切窗口到前台；"
+                            "click 在屏幕坐标处左键单击；move 移动光标；type 在当前窗口打字；where 查光标和焦点窗口。"
+                            "坐标从 screenshot 画面上读，左上角为 0,0"),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["focus", "click", "move", "type", "where"],
+                               "description": "要做的动作"},
+                    "target": {"type": "string", "description": "focus 时填窗口标题关键词（如 Kazumi）"},
+                    "x": {"type": "integer", "description": "click/move 的屏幕横坐标"},
+                    "y": {"type": "integer", "description": "click/move 的屏幕纵坐标"},
+                    "text": {"type": "string", "description": "type 时要输入的文本（只支持英文/数字/符号）"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "screenshot",
             "description": "截取当前桌面屏幕画面，直接展示给用户。排查问题、用户要求看屏幕时使用",
             "parameters": {"type": "object", "properties": {}},
@@ -255,6 +277,20 @@ def extract_writes(cmd: str) -> list[str]:
     return files[:10]
 
 
+# 命令里出现这些说明 agent 要真的点屏幕：ydotool/xdotool 的 click、mousedown、mouseup
+_MOUSE_CLICK_RE = re.compile(
+    r"\b(?:ydotool|xdotool)\b[^\n;&|]*\b(?:click|mousedown|mouseup)\b")
+
+# 由 main 注入：切换遮罩的鼠标穿透状态
+ON_OVERLAY_PASSTHROUGH = None
+
+
+async def _set_overlay_passthrough(on: bool):
+    """通知后端：遮罩是否暂时不接鼠标事件（避免 agent 的点击被遮罩当成用户终止）"""
+    if ON_OVERLAY_PASSTHROUGH:
+        await ON_OVERLAY_PASSTHROUGH(on)
+
+
 def _fix_display_env(env: dict):
     """补全桌面会话环境变量：X11/Wayland(Xwayland) 授权文件路径每次开机随机"""
     env.setdefault("DISPLAY", ":0")
@@ -264,12 +300,19 @@ def _fix_display_env(env: dict):
             env["XAUTHORITY"] = hits[0]
         elif (Path.home() / ".Xauthority").exists():
             env["XAUTHORITY"] = str(Path.home() / ".Xauthority")
+    # ydotool 走 ydotoold 的 socket；服务环境里不一定有，给个默认值
+    env.setdefault("YDOTOOL_SOCKET", f"/run/user/{os.getuid()}/.ydotool_socket")
+    # kdotool 靠这个变量判断是 Plasma 6；缺了会误报「只支持 KDE Plasma 6」
+    env.setdefault("KDE_SESSION_VERSION", "6")
 
 
 async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin: str = "") -> str:
     timeout = max(1, min(int(timeout or 60), 300))
     env = dict(os.environ)
     _fix_display_env(env)
+    # 命令里有鼠标点击时，遮罩必须暂时不接事件，否则这点会点在遮罩上变成「用户终止」；
+    # 打开后要等遮罩真正让开，否则点击仍会打在还没隐藏的遮罩上
+    await _set_overlay_passthrough(bool(_MOUSE_CLICK_RE.search(command)))
     feed = None
     if stdin:
         # 用 script 包一层伪终端：/dev/tty 读取和交互菜单都能收到 stdin 输入
@@ -297,6 +340,9 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
         proc.kill()
         await proc.wait()
         raise
+    finally:
+        # 点击已经发完，遮罩恢复接收点击，用户仍可随时点一下终止
+        await _set_overlay_passthrough(False)
     text = out.decode("utf-8", "replace").strip()
     if stdin:
         # 伪终端会回显输入，把疑似密码的行打码（短输入如菜单选项保留）
@@ -327,6 +373,18 @@ def summarize_tool(name: str, args: dict) -> str:
         return f"「{args.get('name', '')}」"
     if name == "install_game":
         return f"「{args.get('appid', '')}」"
+    if name == "desktop":
+        act = args.get("action", "")
+        if act == "focus":
+            return f"切到「{args.get('target', '')}」"
+        if act == "click":
+            return f"点击 ({args.get('x', 0)}, {args.get('y', 0)})"
+        if act == "move":
+            return f"移动光标到 ({args.get('x', 0)}, {args.get('y', 0)})"
+        if act == "type":
+            t = str(args.get("text", ""))
+            return f"输入「{t[:40]}」"
+        return "查看光标与焦点"
     if name in ("read_file", "write_file", "edit_file", "list_dir"):
         path = str(args.get("path", ""))
         return path.split("/")[-1] or path
@@ -582,6 +640,97 @@ async def _screenshot() -> str:
     return f"截图完成：/shots/{name}。当前桌面画面已附上，你可以直接根据画面内容回答用户的问题。"
 
 
+async def _kdotool(*args: str) -> tuple[int, str]:
+    """跑一条 kdotool 命令，返回 (退出码, 输出)"""
+    env = dict(os.environ)
+    _fix_display_env(env)
+    env["KDE_SESSION_VERSION"] = "6"  # kdotool 靠它判断 Plasma 6
+    proc = await asyncio.create_subprocess_exec(
+        "kdotool", *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
+    )
+    out, err = await proc.communicate()
+    return proc.returncode, (out + err).decode(errors="replace").strip()
+
+
+async def _ydotool(*args: str) -> str:
+    """跑一条 ydotool 命令，返回输出（失败时抛错）"""
+    env = dict(os.environ)
+    _fix_display_env(env)
+    proc = await asyncio.create_subprocess_exec(
+        "ydotool", *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
+    )
+    out, err = await proc.communicate()
+    text = (out + err).decode(errors="replace").strip()
+    if proc.returncode != 0:
+        raise RuntimeError(text or f"ydotool {args[0]} 失败")
+    return text
+
+
+async def _cursor() -> tuple[int, int]:
+    code, text = await _kdotool("getmouselocation")
+    if code != 0:
+        raise RuntimeError(f"读光标位置失败：{text}")
+    mx = re.search(r"x:(-?\d+)", text)
+    my = re.search(r"y:(-?\d+)", text)
+    return (int(mx.group(1)) if mx else 0, int(my.group(1)) if my else 0)
+
+
+async def _move_to(x: int, y: int) -> None:
+    """移到屏幕绝对坐标。ydotoold 的虚拟设备没有绝对坐标轴，
+    mousemove --absolute 会静默失效，所以必须读当前位置算相对位移"""
+    cx, cy = await _cursor()
+    dx, dy = x - cx, y - cy
+    if dx or dy:
+        await _ydotool("mousemove", "--", str(dx), str(dy))
+
+
+async def _desktop(action: str, target: str = "", x: int = 0, y: int = 0, text: str = "") -> str:
+    """桌面窗口操作：切焦点 / 点击 / 移动 / 打字。命中点击时自动打开遮罩穿透"""
+    if action == "focus":
+        if not target:
+            return "focus 需要提供 target（窗口标题关键词）"
+        code, out = await _kdotool("search", "--name", target)
+        if code != 0 or not out:
+            return f"没找到标题匹配「{target}」的窗口"
+        wid = out.splitlines()[0].strip()
+        await _kdotool("windowactivate", wid)
+        await _kdotool("windowraise", wid)
+        _, name = await _kdotool("getwindowname", wid)
+        return f"已切到前台：{name}"
+
+    if action in ("move", "click"):
+        # 点击会落在遮罩上变成「用户终止」，先让遮罩让开并等它确认
+        await _set_overlay_passthrough(True)
+        try:
+            await _move_to(x, y)
+            if action == "click":
+                await asyncio.sleep(0.25)
+                await _ydotool("click", "0xC0")
+                cx, cy = await _cursor()
+                _, focus = await _kdotool("getactivewindow", "getwindowname")
+                return f"已点击 ({cx}, {cy})，当前焦点窗口：{focus}"
+            cx, cy = await _cursor()
+            return f"光标已移到 ({cx}, {cy})"
+        finally:
+            await _set_overlay_passthrough(False)
+
+    if action == "type":
+        if not text:
+            return "type 需要提供 text"
+        # ydotool type 不支持中文；输入前若焦点不在目标窗口，调用方应先 focus
+        await _ydotool("type", "--", text)
+        return f"已输入 {len(text)} 个字符"
+
+    if action == "where":
+        cx, cy = await _cursor()
+        _, focus = await _kdotool("getactivewindow", "getwindowname")
+        return f"光标：({cx}, {cy})\n焦点窗口：{focus}"
+
+    return f"不支持的动作：{action}"
+
+
 # 最近一次截图的模型可读版本路径（供 run_agent 注入多模态消息）
 LAST_VISION: Path | None = None
 
@@ -666,6 +815,7 @@ EXECUTORS = {
     "install_game": _install_game,
     "list_emulator_roms": _list_emulator_roms,
     "run_command": _run_command,
+    "desktop": _desktop,
     "screenshot": _screenshot,
     "list_dir": _list_dir,
     "read_file": _read_file,

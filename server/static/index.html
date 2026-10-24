@@ -607,7 +607,12 @@
     </div>
     <div class="field">
       <label>模型</label>
-      <input id="cfgModel" type="text" placeholder="gpt-4o-mini" autocomplete="off">
+      <input id="cfgModel" type="text" list="cfgModelList" placeholder="填好地址和 Key 后点「拉取」自动列出" autocomplete="off">
+      <datalist id="cfgModelList"></datalist>
+      <div style="display:flex; gap:8px; margin-top:8px; align-items:center;">
+        <button id="fetchModels" type="button" style="margin:0; padding:8px 14px; font-size:13px; background:var(--surface-2); color:var(--text); border:1px solid var(--line);">拉取模型列表</button>
+        <span id="fetchModelsHint" style="font-size:12px; color:var(--muted);"></span>
+      </div>
     </div>
     <div class="field field-row">
       <label style="margin:0">语音播报回复</label>
@@ -1293,6 +1298,38 @@
     if (e.target === phonePanel) phonePanel.classList.remove('show');
   });
 
+  // 拉取模型列表：带上面板里刚填的地址和 Key 直接探测（不落盘），点保存才写入配置
+  document.getElementById('fetchModels').addEventListener('click', function () {
+    var hint = document.getElementById('fetchModelsHint');
+    var btn = this;
+    btn.disabled = true;
+    hint.textContent = '拉取中…';
+    var qs = 'token=' + encodeURIComponent(token)
+      + '&base_url=' + encodeURIComponent(cfgBaseUrl.value.trim())
+      + '&api_key=' + encodeURIComponent(cfgApiKey.value.trim());
+    fetch('/api/models?' + qs)
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d.detail) { hint.textContent = d.detail; return; }
+        var list = d.models || [];
+        var dl = document.getElementById('cfgModelList');
+        dl.innerHTML = '';
+        list.forEach(function (m) {
+          var o = document.createElement('option');
+          o.value = m;
+          dl.appendChild(o);
+        });
+        if (!cfgModel.value && list.length) cfgModel.value = list[0];
+        if (list.indexOf(cfgModel.value) < 0 && cfgModel.value) {
+          hint.textContent = '当前填的「' + cfgModel.value + '」不在返回列表里';
+          return;
+        }
+        hint.textContent = list.length ? ('共 ' + list.length + ' 个模型，点输入框选') : '没有返回模型';
+      })
+      .catch(function () { hint.textContent = '拉取失败，检查地址和 Key'; })
+      .finally(function () { btn.disabled = false; });
+  });
+
   saveCfg.addEventListener('click', function () {
     cfgHint.textContent = '保存中…';
     fetch('/api/config?token=' + encodeURIComponent(token), {
@@ -1432,19 +1469,41 @@
       .then(function (r) { return r.json(); })
       .then(function (c) {
         if (c.permission_mode) permSelect.value = c.permission_mode;
-        // 模型下拉：当前模型 + 常用预设
-        var presets = ['deepseek-v4.1-flash', 'deepseek-reasoner', 'gpt-4o-mini', 'gpt-4o', 'qwen-max', 'qwen-qwq-plus'];
-        var opts = [c.model].concat(presets.filter(function (m) { return m !== c.model; }));
-        modelSelect.innerHTML = '';
-        opts.forEach(function (m) {
-          if (!m) return;
-          var o = document.createElement('option');
-          o.value = m; o.textContent = m;
-          modelSelect.appendChild(o);
-        });
+        // 模型下拉：先用当前模型占位，再异步补上服务商真实模型列表
+        fillModelSelect([c.model]);
         if (c.model) modelSelect.value = c.model;
+        fetchModels().then(function (list) { fillModelSelect(list, c.model); });
       })
       .catch(function () {});
+  }
+
+  function fillModelSelect(list, current) {
+    var cur = current || modelSelect.value;
+    var seen = {};
+    var opts = [];
+    [cur].concat(list || []).forEach(function (m) {
+      if (!m || seen[m]) return;
+      seen[m] = 1; opts.push(m);
+    });
+    modelSelect.innerHTML = '';
+    opts.forEach(function (m) {
+      var o = document.createElement('option');
+      o.value = m; o.textContent = m;
+      modelSelect.appendChild(o);
+    });
+    if (cur) modelSelect.value = cur;
+  }
+
+  // 从服务商拉当前配置的模型列表：GET /models，OpenAI 兼容接口都支持
+  var modelsPromise = null;
+  function fetchModels() {
+    if (!modelsPromise) {
+      modelsPromise = fetch('/api/models?token=' + encodeURIComponent(token))
+        .then(function (r) { return r.json(); })
+        .then(function (d) { return d.models || []; })
+        .catch(function () { modelsPromise = null; return []; });
+    }
+    return modelsPromise;
   }
   permSelect.addEventListener('change', function () {
     postConfig({ permission_mode: permSelect.value });
