@@ -31,11 +31,11 @@ STATIC_DIR = BASE_DIR / "static"
 # ---------- 配置 ----------
 
 def gen_token(length: int = 5) -> str:
-    """生成访问令牌：数字 + 大小写字母混合，如 x7K2m。
+    """生成访问令牌：小写字母 + 数字，如 x7k2m。
 
-    去掉了容易看错的 0/O/1/l/I，方便在掌机上手动敲。
+    去掉了容易看错的 0/o/1/l/i；校验时不分大小写，全大写输入也能连上。
     """
-    alphabet = "23456789abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ"
+    alphabet = "23456789abcdefghjkmnpqrstuvwxyz"
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
@@ -84,7 +84,7 @@ def update_config(updates: dict):
 
 
 CFG = load_config()
-TOKEN = CFG["server"]["token"]
+TOKEN = CFG["server"]["token"].strip().lower()
 
 llm = LLMClient(
     base_url=CFG["llm"]["base_url"],
@@ -218,7 +218,7 @@ def apply_config(cfg: dict):
     """热更新运行配置（LLM / TTS / 权限模式 / 访问令牌），无需重启"""
     global CFG, TOKEN, PERMISSION_MODE, SYSTEM_PROMPT
     CFG = cfg
-    TOKEN = cfg["server"].get("token", TOKEN)
+    TOKEN = (cfg["server"].get("token") or TOKEN).strip().lower()
     c = cfg["llm"]
     llm.base_url = c["base_url"].rstrip("/")
     llm.api_key = c["api_key"]
@@ -346,9 +346,15 @@ _pending_token: str | None = None
 
 # ---------- 认证 ----------
 
+def _norm_token(value: str | None) -> str:
+    """令牌统一按小写比较，输入不分大小写"""
+    return (value or "").strip().lower()
+
+
 def check_token(token: str | None = Query(default=None), x_token: str | None = Header(default=None)):
-    if token != TOKEN and x_token != TOKEN:
-        raise HTTPException(status_code=401, detail="invalid token")
+    if _norm_token(TOKEN) and _norm_token(TOKEN) in (_norm_token(token), _norm_token(x_token)):
+        return
+    raise HTTPException(status_code=401, detail="invalid token")
 
 
 def check_token_any(token: str | None = Query(default=None), x_token: str | None = Header(default=None)):
@@ -357,8 +363,8 @@ def check_token_any(token: str | None = Query(default=None), x_token: str | None
     设置页保存新令牌时，前端还带着旧令牌，而校验已经换成新的了，
     不放开这一条会导致「改完自己把自己锁在外面」。
     """
-    ok = {TOKEN, _pending_token} - {None, ""}
-    if token not in ok and x_token not in ok:
+    ok = {_norm_token(TOKEN), _norm_token(_pending_token)} - {""}
+    if _norm_token(token) not in ok and _norm_token(x_token) not in ok:
         raise HTTPException(status_code=401, detail="invalid token")
 
 
@@ -592,9 +598,10 @@ async def api_set_config(req: ConfigUpdate):
     if req.workspace is not None and req.workspace.strip():
         updates["workspace"] = {"dir": req.workspace.strip()}
     if req.token is not None:
-        new_token = req.token.strip()
+        # 统一存成小写，避免 config 里大小写混着看花眼（校验本来就不分大小写）
+        new_token = req.token.strip().lower()
         # 令牌只允许 4-32 位数字/字母，太短容易被猜，太长在掌机上不好敲
-        if not re.fullmatch(r"[A-Za-z0-9]{4,32}", new_token):
+        if not re.fullmatch(r"[a-z0-9]{4,32}", new_token):
             raise HTTPException(status_code=400, detail="令牌需为 4-32 位数字或字母")
         updates["server"] = {"token": new_token}
     if updates:
@@ -1165,7 +1172,7 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
-    if token != TOKEN:
+    if not _norm_token(TOKEN) or _norm_token(token) != _norm_token(TOKEN):
         await ws.close(code=4401)
         return
     await manager.connect(ws)

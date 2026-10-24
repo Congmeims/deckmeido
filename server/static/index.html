@@ -714,9 +714,9 @@
       <input id="cfgWorkspace" type="text" placeholder="/home/deck/deckmate_workspace" autocomplete="off">
     </div>
     <div class="field">
-      <label>访问令牌（连接这台 Deck 用，4-32 位数字或字母）</label>
+      <label>访问令牌（连接这台 Deck 用，4-32 位数字或字母，不分大小写）</label>
       <div class="token-row">
-        <input id="cfgToken" type="text" placeholder="例如 x7K2m" autocomplete="off" maxlength="32">
+        <input id="cfgToken" type="text" placeholder="例如 x7k2m" autocomplete="off" maxlength="32" spellcheck="false">
         <button id="genToken" class="mini-btn" type="button">随机生成</button>
       </div>
       <div id="tokenHint" class="field-hint"></div>
@@ -1375,7 +1375,7 @@
   });
 
   tokenBtn.addEventListener('click', function () {
-    var t = tokenInput.value.trim();
+    var t = tokenInput.value.trim().toLowerCase();
     if (!t) return;
     token = t;
     localStorage.setItem('deckmate_token', t);
@@ -1436,11 +1436,12 @@
   }
 
   saveCfg.addEventListener('click', function () {
-    var newToken = cfgToken.value.trim();
-    if (!/^[A-Za-z0-9]{4,32}$/.test(newToken)) {
+    var newToken = cfgToken.value.trim().toLowerCase();
+    if (!/^[a-z0-9]{4,32}$/.test(newToken)) {
       tokenHint.textContent = '令牌需为 4-32 位数字或字母';
       return;
     }
+    cfgToken.value = newToken;
     var tokenChanged = newToken !== token;
     cfgHint.textContent = '保存中…';
     fetch('/api/config?token=' + encodeURIComponent(token), {
