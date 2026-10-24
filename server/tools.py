@@ -85,6 +85,19 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_emulator_roms",
+            "description": "扫描本机模拟器 ROM 游戏目录（EmuDeck 标准结构 ~/Emulation/roms 等），按机型统计数量。可指定机型过滤，如 switch",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "system": {"type": "string", "description": "可选，机型目录名，如 switch、ps2、gba"},
+                },
+            },
+        },
+    },
 ]
 
 # 危险操作：执行前需要用户明确确认
@@ -211,6 +224,88 @@ async def _install_game(appid: int) -> str:
     return f"已向 Steam 发送安装指令（appid {appid}），下载会在 Steam 客户端中开始"
 
 
+# 不算 ROM 的杂项文件（存档/封面/数据库等）
+ROM_EXCLUDE_EXT = {
+    ".txt", ".xml", ".md", ".json", ".dat", ".db", ".png", ".jpg", ".jpeg",
+    ".webp", ".cue", ".m3u", ".srm", ".sav", ".state", ".dst", ".dsv",
+    ".cfg", ".ini", ".log", ".bak", ".tmp", ".bin.index",
+}
+# 在 Games 等非标准目录里，只认这些模拟器游戏扩展名
+ROM_INCLUDE_EXT = {
+    ".nsp", ".xci", ".nro", ".iso", ".gcm", ".rvz", ".wbfs", ".chd",
+    ".gba", ".gbc", ".gb", ".nds", ".3ds", ".cia", ".nes", ".sfc", ".smc",
+    ".md", ".sms", ".n64", ".z64", ".v64", ".pbp", ".cso", ".wad",
+}
+# 不计入游戏数的部分（DLC/升级补丁）
+ROM_SKIP_DIRS = {"dlc", "dlcs", "update", "updates", "upd", "runtime"}
+ROM_SKIP_PREFIX = ("[dlc]", "[upd]", "[update]")
+
+
+def _count_roms(directory: Path, by_ext_only: bool) -> int:
+    n = 0
+    for f in directory.rglob("*"):
+        if not f.is_file() or f.name.startswith("."):
+            continue
+        # 跳过 DLC/补丁目录与文件
+        if any(part.lower() in ROM_SKIP_DIRS for part in f.parts):
+            continue
+        if f.name.lower().startswith(ROM_SKIP_PREFIX):
+            continue
+        ext = f.suffix.lower()
+        if by_ext_only:
+            if ext in ROM_INCLUDE_EXT:
+                n += 1
+        elif ext not in ROM_EXCLUDE_EXT:
+            n += 1
+    return n
+
+
+async def _list_emulator_roms(system: str = "") -> str:
+    def _scan() -> dict:
+        counts: dict[str, int] = {}
+
+        # EmuDeck 标准结构：<root>/<机型>/ 下所有非杂项文件都算 ROM
+        roots = [Path.home() / "Emulation/roms", Path.home() / "ROMs", Path.home() / "roms"]
+        media = Path("/run/media")
+        if media.is_dir():
+            for card in media.iterdir():
+                if card.is_dir():
+                    roots.append(card / "Emulation/roms")
+        for root in roots:
+            if not root.is_dir():
+                continue
+            for sub in sorted(root.iterdir()):
+                if not sub.is_dir():
+                    continue
+                n = _count_roms(sub, by_ext_only=False)
+                if n:
+                    counts[sub.name] = counts.get(sub.name, 0) + n
+
+        # SD 卡 Games 目录：<card>/Games/<合集名>/ 下按扩展名识别
+        if media.is_dir():
+            for card in media.iterdir():
+                games = card / "Games"
+                if not games.is_dir():
+                    continue
+                for sub in sorted(games.iterdir()):
+                    if not sub.is_dir() or sub.name.lower() in ROM_SKIP_DIRS:
+                        continue
+                    n = _count_roms(sub, by_ext_only=True)
+                    if n:
+                        counts[sub.name] = counts.get(sub.name, 0) + n
+        return counts
+
+    counts = await asyncio.to_thread(_scan)
+    if system:
+        counts = {k: v for k, v in counts.items() if system.lower() in k.lower()}
+        if not counts:
+            return f"没有找到 {system} 相关的游戏目录"
+    if not counts:
+        return "没有找到模拟器 ROM（已扫描 ~/Emulation/roms、SD 卡 Games 等目录）"
+    lines = [f"- {k}: {v} 个" for k, v in sorted(counts.items())]
+    return f"共 {sum(counts.values())} 个游戏文件：\n" + "\n".join(lines)
+
+
 EXECUTORS = {
     "get_weather": _get_weather,
     "web_search": _web_search,
@@ -218,6 +313,7 @@ EXECUTORS = {
     "find_game": _find_game,
     "check_system_updates": _check_system_updates,
     "install_game": _install_game,
+    "list_emulator_roms": _list_emulator_roms,
 }
 
 
