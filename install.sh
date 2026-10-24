@@ -72,6 +72,11 @@ system_notes() {
     for m in "${miss[@]}"; do dim "$m"; done
     dim "SteamOS 装 AUR 包：先设置 → 开发者模式，再用 pacman/paru 安装"
   fi
+  # ydotool 装了但 ydotoold 没跑，点击/输入会直接报 socket 错误，这里提前点出来
+  if need_cmd ydotool && ! pgrep -x ydotoold >/dev/null 2>&1; then
+    warn "ydotool 已装但 ydotoold 守护进程没在运行，模拟点击/输入会失败"
+    dim "临时启动：ydotoold >/dev/null 2>&1 &"
+  fi
 }
 
 # ---------- 代码同步 ----------

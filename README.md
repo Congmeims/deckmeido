@@ -114,6 +114,10 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 - Python 3.11+（用到 `tomllib`）
 - 可选：`spectacle`（KWin 截图，一般自带）、`kdotool` / `ydotool`（按窗口名聚焦与合成输入）、`espeak-ng`（语音播报）
 
+> 控制类插件（`kdotool` / `ydotool`）**不会**由 `install.sh` 自动安装：它们是系统包，装它们需要 sudo，脚本只做检测并在结尾列出缺了哪些。缺了不影响对话、截图、执行命令等能力，只是「模拟鼠标点击 / 键盘输入」用不了。
+>
+> `ydotool` 还需要守护进程 `ydotoold` 在运行，否则点击会报 socket 错误：`ydotoold >/dev/null 2>&1 &`（想开机自启就自己写个 systemd 用户单元）。
+
 ### 一键安装
 
 ```bash
