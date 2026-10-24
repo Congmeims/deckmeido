@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=DeckMate
+Comment=DeckMate AI 控制台
+Exec=xdg-open http://localhost:18765/?token=Xig5JWJCO22d-kqCcn4V0g
+Icon=applications-games
+Type=Application
+Terminal=false

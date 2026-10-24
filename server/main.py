@@ -40,6 +40,36 @@ def load_config() -> dict:
     return cfg
 
 
+def update_config(updates: dict):
+    """把 {section: {key: value}} 写回 config.toml（保留注释），并重载运行配置"""
+    import re
+
+    text = CONFIG_PATH.read_text(encoding="utf-8")
+    for section, kv in updates.items():
+        for key, value in kv.items():
+            if isinstance(value, bool):
+                v = "true" if value else "false"
+            elif isinstance(value, (int, float)):
+                v = str(value)
+            else:
+                v = '"' + str(value).replace('"', '\\"') + '"'
+            # 在目标 section 内替换 key = ...，没有则在 section 末尾追加
+            sec_pat = re.compile(rf"(^\[{re.escape(section)}\]\n(?:[^\[\n].*\n?)*)", re.M)
+            m = sec_pat.search(text)
+            kv_line = f"{key} = {v}"
+            if m:
+                block = m.group(1)
+                if re.search(rf"^{re.escape(key)}\s*=", block, re.M):
+                    new_block = re.sub(rf"^{re.escape(key)}\s*=.*$", kv_line, block, flags=re.M)
+                else:
+                    new_block = block.rstrip("\n") + "\n" + kv_line + "\n"
+                text = text[: m.start()] + new_block + text[m.end():]
+            else:
+                text = text.rstrip("\n") + f"\n\n[{section}]\n{kv_line}\n"
+    CONFIG_PATH.write_text(text, encoding="utf-8")
+    apply_config(tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+
+
 CFG = load_config()
 TOKEN = CFG["server"]["token"]
 
@@ -83,6 +113,20 @@ tts = TTS(
     speed=int(_tts_cfg.get("speed", 170)),
     max_chars=int(_tts_cfg.get("max_chars", 300)),
 )
+
+
+def apply_config(cfg: dict):
+    """热更新运行配置（LLM / TTS），无需重启"""
+    global CFG
+    CFG = cfg
+    c = cfg["llm"]
+    llm.base_url = c["base_url"].rstrip("/")
+    llm.api_key = c["api_key"]
+    llm.model = c["model"]
+    t = cfg.get("tts", {})
+    tts.enable = bool(t.get("enable", False))
+    tts.voice = t.get("voice", "cmn")
+    tts.speed = int(t.get("speed", 170))
 
 # 内存中的对话历史（单会话，MVP）
 history: list[dict] = []
@@ -175,6 +219,42 @@ async def api_chat(req: ChatRequest):
         raise HTTPException(status_code=400, detail="empty message")
     reply = await handle_chat(text)
     return {"reply": reply}
+
+
+class ConfigUpdate(BaseModel):
+    base_url: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+    tts_enable: bool | None = None
+
+
+@app.get("/api/config", dependencies=[Depends(check_token)])
+async def api_get_config():
+    return {
+        "base_url": llm.base_url,
+        "api_key": llm.api_key,
+        "model": llm.model,
+        "tts_enable": tts.enable,
+    }
+
+
+@app.post("/api/config", dependencies=[Depends(check_token)])
+async def api_set_config(req: ConfigUpdate):
+    llm_updates = {}
+    if req.base_url is not None:
+        llm_updates["base_url"] = req.base_url.strip()
+    if req.api_key is not None:
+        llm_updates["api_key"] = req.api_key.strip()
+    if req.model is not None:
+        llm_updates["model"] = req.model.strip()
+    updates = {}
+    if llm_updates:
+        updates["llm"] = llm_updates
+    if req.tts_enable is not None:
+        updates["tts"] = {"enable": req.tts_enable}
+    if updates:
+        update_config(updates)
+    return {"ok": True, "llm_configured": llm.configured}
 
 
 async def handle_chat(text: str) -> str:

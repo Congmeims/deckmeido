@@ -170,6 +170,69 @@
     background: var(--brand); color: #fff;
     font-size: 16px; font-weight: 600;
   }
+
+  /* 设置按钮与面板 */
+  #settingsBtn {
+    flex: 0 0 auto;
+    width: 36px; height: 36px;
+    border: none; border-radius: 50%;
+    background: var(--surface-2); color: var(--muted);
+    font-size: 17px; cursor: pointer;
+  }
+  #settingsPanel {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,.5);
+    display: none;
+    align-items: flex-end;
+    z-index: 20;
+  }
+  #settingsPanel.show { display: flex; }
+  .sheet {
+    background: var(--surface);
+    width: 100%;
+    border-radius: 16px 16px 0 0;
+    padding: 18px 16px;
+    padding-bottom: calc(18px + env(safe-area-inset-bottom));
+    max-height: 85dvh;
+    overflow-y: auto;
+  }
+  .sheet h2 { font-size: 17px; margin-bottom: 14px; }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  .field input {
+    width: 100%;
+    padding: 12px 14px;
+    border: 1px solid rgba(255,255,255,.12);
+    border-radius: 10px;
+    background: var(--surface-2);
+    color: var(--text);
+    font-size: 15px;
+    outline: none;
+    box-sizing: border-box;
+  }
+  .field-row { display: flex; align-items: center; justify-content: space-between; }
+  .switch { position: relative; width: 46px; height: 26px; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute; inset: 0; border-radius: 999px;
+    background: var(--surface-2); transition: .15s;
+  }
+  .slider::before {
+    content: ''; position: absolute; width: 20px; height: 20px;
+    border-radius: 50%; background: var(--muted);
+    top: 3px; left: 3px; transition: .15s;
+  }
+  .switch input:checked + .slider { background: var(--brand); }
+  .switch input:checked + .slider::before { transform: translateX(20px); background: #fff; }
+  #saveCfg {
+    width: 100%;
+    padding: 13px;
+    border: none; border-radius: 10px;
+    background: var(--brand); color: #fff;
+    font-size: 16px; font-weight: 600;
+    margin-top: 4px;
+  }
+  #cfgHint { text-align: center; font-size: 13px; color: var(--muted); margin-top: 10px; min-height: 18px; }
 </style>
 </head>
 <body>
@@ -181,6 +244,7 @@
   <span class="spacer"></span>
   <span class="badge" id="batteryBadge" hidden></span>
   <span class="badge" id="modeBadge" hidden></span>
+  <button id="settingsBtn" title="设置">⚙</button>
 </header>
 
 <div id="messages"></div>
@@ -195,6 +259,33 @@
   <p>请输入访问令牌（token）。<br>令牌可在 Deck 的 ~/deckmate/server/config.toml 中查看。</p>
   <input id="tokenInput" type="password" placeholder="token" autocomplete="off">
   <button id="tokenBtn">连接</button>
+</div>
+
+<div id="settingsPanel">
+  <div class="sheet">
+    <h2>设置</h2>
+    <div class="field">
+      <label>API 接口地址（base_url）</label>
+      <input id="cfgBaseUrl" type="text" placeholder="https://api.openai.com/v1" autocomplete="off">
+    </div>
+    <div class="field">
+      <label>API Key</label>
+      <input id="cfgApiKey" type="password" placeholder="sk-…" autocomplete="off">
+    </div>
+    <div class="field">
+      <label>模型</label>
+      <input id="cfgModel" type="text" placeholder="gpt-4o-mini" autocomplete="off">
+    </div>
+    <div class="field field-row">
+      <label style="margin:0">语音播报回复</label>
+      <span class="switch">
+        <input id="cfgTts" type="checkbox">
+        <span class="slider"></span>
+      </span>
+    </div>
+    <button id="saveCfg">保存</button>
+    <div id="cfgHint"></div>
+  </div>
 </div>
 
 <script>
@@ -368,6 +459,55 @@
     token = t;
     localStorage.setItem('deckmate_token', t);
     connect();
+  });
+
+  // ---------- 设置面板 ----------
+  var settingsBtn = document.getElementById('settingsBtn');
+  var settingsPanel = document.getElementById('settingsPanel');
+  var cfgBaseUrl = document.getElementById('cfgBaseUrl');
+  var cfgApiKey = document.getElementById('cfgApiKey');
+  var cfgModel = document.getElementById('cfgModel');
+  var cfgTts = document.getElementById('cfgTts');
+  var saveCfg = document.getElementById('saveCfg');
+  var cfgHint = document.getElementById('cfgHint');
+
+  function openSettings() {
+    settingsPanel.classList.add('show');
+    cfgHint.textContent = '';
+    fetch('/api/config?token=' + encodeURIComponent(token))
+      .then(function (r) { return r.json(); })
+      .then(function (c) {
+        cfgBaseUrl.value = c.base_url || '';
+        cfgApiKey.value = c.api_key || '';
+        cfgModel.value = c.model || '';
+        cfgTts.checked = !!c.tts_enable;
+      })
+      .catch(function () { cfgHint.textContent = '读取配置失败'; });
+  }
+
+  settingsBtn.addEventListener('click', openSettings);
+  settingsPanel.addEventListener('click', function (e) {
+    if (e.target === settingsPanel) settingsPanel.classList.remove('show');
+  });
+
+  saveCfg.addEventListener('click', function () {
+    cfgHint.textContent = '保存中…';
+    fetch('/api/config?token=' + encodeURIComponent(token), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        base_url: cfgBaseUrl.value,
+        api_key: cfgApiKey.value,
+        model: cfgModel.value,
+        tts_enable: cfgTts.checked
+      })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        cfgHint.textContent = res.llm_configured ? '已保存并生效 ✓' : '已保存（API Key 为空，对话暂不可用）';
+        setTimeout(function () { settingsPanel.classList.remove('show'); }, 1200);
+      })
+      .catch(function () { cfgHint.textContent = '保存失败'; });
   });
 
   connect();
