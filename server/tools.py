@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 from pathlib import Path
 
 import httpx
@@ -164,7 +165,11 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
     timeout = max(1, min(int(timeout or 60), 300))
     env = dict(os.environ)
     env.setdefault("DISPLAY", ":0")
-    feed = (stdin if stdin.endswith("\n") else stdin + "\n").encode() if stdin else None
+    feed = None
+    if stdin:
+        # 用 script 包一层伪终端：/dev/tty 读取和交互菜单都能收到 stdin 输入
+        command = f"script -qefc {shlex.quote(command)} /dev/null"
+        feed = (stdin if stdin.endswith("\n") else stdin + "\n").encode()
     proc = await asyncio.create_subprocess_shell(
         command,
         stdin=asyncio.subprocess.PIPE if feed else None,
@@ -180,9 +185,14 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
         proc.kill()
         await proc.wait()
         return (f"命令超时（{timeout}s），已强制终止。\n"
-                "提示：若命令需要交互输入（密码/确认），请用 stdin 参数传入；"
+                "提示：若命令需要多次交互输入，请在 stdin 里按行准备好全部答案；"
                 "若是长任务，请用 nohup ... > /tmp/日志 2>&1 & 放后台")
     text = out.decode("utf-8", "replace").strip()
+    if stdin:
+        # 伪终端会回显输入，把疑似密码的行打码（短输入如菜单选项保留）
+        for line in stdin.splitlines():
+            if len(line.strip()) >= 4:
+                text = text.replace(line.strip(), "***")
     if len(text) > 4000:
         text = text[:4000] + "\n…（输出过长已截断）"
     return f"exit={proc.returncode}\n{text}" if text else f"exit={proc.returncode}（无输出）"
