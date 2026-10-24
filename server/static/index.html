@@ -93,6 +93,25 @@
   }
   .msg .time { display: block; margin-top: 4px; font-size: 11px; opacity: .55; }
 
+  /* markdown 内容 */
+  .msg pre { background: #0b0d13; padding: 10px 12px; border-radius: 8px; overflow-x: auto; margin: 6px 0; font-size: 13px; }
+  .msg code { background: #0b0d13; padding: 2px 6px; border-radius: 5px; font-size: 13px; font-family: ui-monospace, monospace; }
+  .msg pre code { background: none; padding: 0; }
+  .msg h3, .msg h4 { margin: 8px 0 4px; color: var(--brand); }
+  .msg ul { padding-left: 20px; margin: 4px 0; }
+  .msg a { color: var(--brand); }
+
+  /* 事件区：思维链 / 工具调用 / 文件改动 */
+  .events { align-self: flex-start; max-width: 90%; display: flex; flex-direction: column; gap: 6px; }
+  .ev { font-size: 13px; border-radius: 10px; padding: 7px 12px; }
+  .ev.thought { background: rgba(138,147,163,.1); color: var(--muted); }
+  .ev.thought summary { cursor: pointer; user-select: none; }
+  .ev.thought .thought-body { margin-top: 6px; white-space: pre-wrap; line-height: 1.5; font-size: 12.5px; opacity: .85; }
+  .ev.tool { background: rgba(26,159,255,.12); color: #9fd4ff; font-family: ui-monospace, monospace; font-size: 12.5px; word-break: break-all; }
+  .ev.tool .ev-name { font-weight: 700; color: var(--brand); margin-right: 6px; }
+  .ev.tool.approved { background: rgba(232,179,57,.12); color: #e8b339; }
+  .ev.file { background: rgba(46,204,113,.1); color: #7ddba3; font-family: ui-monospace, monospace; font-size: 12px; margin-left: 18px; }
+
   /* 正在输入 */
   .typing { display: inline-flex; gap: 4px; padding: 4px 2px; }
   .typing i { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: blink 1.2s infinite; }
@@ -328,15 +347,85 @@
     messages.scrollTop = messages.scrollHeight;
   }
 
+  function escapeHtml(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // 轻量 markdown 渲染（代码块/行内码/加粗/标题/列表/链接）
+  function renderMd(t) {
+    var s = escapeHtml(t);
+    s = s.replace(/```(\w*)\n?([\s\S]*?)```/g, function (m, l, c) {
+      return '<pre><code>' + c.replace(/\n$/, '') + '</code></pre>';
+    });
+    s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+    s = s.replace(/^#{1,4}\s+(.+)$/gm, '<h4>$1</h4>');
+    s = s.replace(/(^|\n)((?:\s*[-*] .+(?:\n|$))+)/g, function (m, p, block) {
+      var items = block.trim().split('\n').map(function (l) {
+        return '<li>' + l.replace(/^\s*[-*] /, '') + '</li>';
+      }).join('');
+      return p + '<ul>' + items + '</ul>';
+    });
+    s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    s = s.replace(/\n{2,}/g, '<br><br>').replace(/\n/g, '<br>');
+    return s;
+  }
+
   function addMsg(role, text, ts) {
     var el = document.createElement('div');
     el.className = 'msg ' + role;
-    el.textContent = text;
+    if (role === 'assistant') {
+      var body = document.createElement('div');
+      body.innerHTML = renderMd(text);
+      el.appendChild(body);
+    } else {
+      el.textContent = text;
+    }
     var t = document.createElement('span');
     t.className = 'time';
     t.textContent = fmtTime(ts);
     el.appendChild(t);
     messages.appendChild(el);
+    scrollBottomSafe();
+  }
+
+  // 渲染思维链 / 工具调用 / 文件改动事件
+  function renderEvents(events) {
+    if (!events || !events.length) return;
+    var box = document.createElement('div');
+    box.className = 'events';
+    events.forEach(function (ev) {
+      if (ev.type === 'thought') {
+        var d = document.createElement('details');
+        d.className = 'ev thought';
+        var sum = document.createElement('summary');
+        sum.textContent = '🧠 思维链（点击展开）';
+        var body = document.createElement('div');
+        body.className = 'thought-body';
+        body.textContent = ev.text;
+        d.appendChild(sum);
+        d.appendChild(body);
+        box.appendChild(d);
+      } else if (ev.type === 'tool') {
+        var t = document.createElement('div');
+        t.className = 'ev tool' + (ev.approved ? ' approved' : '');
+        var name = document.createElement('span');
+        name.className = 'ev-name';
+        name.textContent = (ev.approved ? '✓ ' : '🔧 ') + ev.name;
+        var summary = document.createElement('span');
+        summary.textContent = ev.summary || '';
+        t.appendChild(name);
+        t.appendChild(summary);
+        box.appendChild(t);
+        (ev.files || []).forEach(function (f) {
+          var fc = document.createElement('div');
+          fc.className = 'ev file';
+          fc.textContent = '📄 写入 ' + f;
+          box.appendChild(fc);
+        });
+      }
+    });
+    messages.appendChild(box);
     scrollBottomSafe();
   }
 
@@ -348,11 +437,17 @@
     scrollBottomSafe();
   }
 
-  function showTyping() {
+  function showTyping(label) {
     hideTyping();
     typingEl = document.createElement('div');
     typingEl.className = 'msg assistant';
     typingEl.innerHTML = '<span class="typing"><i></i><i></i><i></i></span>';
+    if (label) {
+      var l = document.createElement('span');
+      l.style.cssText = 'color:var(--muted);font-size:12.5px;margin-left:8px;';
+      l.textContent = label;
+      typingEl.appendChild(l);
+    }
     messages.appendChild(typingEl);
     scrollBottomSafe();
   }
@@ -404,10 +499,11 @@
           break;
         case 'assistant_message':
           hideTyping();
+          renderEvents(msg.events);
           addMsg('assistant', msg.text, msg.ts);
           break;
         case 'tool_activity':
-          addSystem('🔧 ' + msg.text);
+          showTyping('🔧 ' + msg.text);
           break;
         case 'status':
           renderStatus(msg.data || {});

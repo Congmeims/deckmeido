@@ -49,6 +49,28 @@ def api_post(path: str, token: str, payload: dict, timeout: float = 300):
         return json.loads(r.read())
 
 
+def html_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def md_to_html(text: str) -> str:
+    """轻量 markdown → QTextBrowser 支持的 HTML 子集"""
+    import re
+
+    s = html_escape(text)
+    s = re.sub(
+        r"```\w*\n?(.*?)```",
+        lambda m: f"<pre style='background:#0b0d13; padding:8px; border-radius:6px;'>{m.group(1).strip()}</pre>",
+        s, flags=re.S,
+    )
+    s = re.sub(r"`([^`\n]+)`",
+               r"<code style='background:#0b0d13; padding:1px 5px; border-radius:4px;'>\1</code>", s)
+    s = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", s)
+    s = re.sub(r"(?m)^#{1,4}\s+(.+)$", r"<b style='color:#1a9fff;'>\1</b>", s)
+    s = re.sub(r"(?m)^\s*[-*] (.+)$", r"• \1", s)
+    return s.replace("\n", "<br>")
+
+
 def ensure_backend() -> bool:
     """后端未运行则拉起，返回是否可用"""
     try:
@@ -74,7 +96,7 @@ def ensure_backend() -> bool:
 
 class ChatWorker(QThread):
     """后台线程发消息，避免卡住 UI"""
-    done = Signal(str)
+    done = Signal(dict)
     failed = Signal(str)
 
     def __init__(self, token: str, text: str):
@@ -83,7 +105,7 @@ class ChatWorker(QThread):
 
     def run(self):
         try:
-            self.done.emit(api_post("/api/chat", self.token, {"message": self.text})["reply"])
+            self.done.emit(api_post("/api/chat", self.token, {"message": self.text}))
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -207,16 +229,40 @@ class MainWindow(QMainWindow):
     def append_msg(self, role: str, text: str):
         if role == "user":
             color, align, name = "#1a9fff", "right", "我"
+            body = md_to_html(text)
         else:
             color, align, name = "#232737", "left", "DeckMate"
+            body = md_to_html(text)
         html = (
             f'<div style="text-align:{align}; margin:6px 0;">'
             f'<span style="font-size:11px; color:#8b91a3;">{name}</span><br>'
             f'<span style="display:inline-block; max-width:80%; text-align:left;'
             f' background:{color}; color:#e8eaf0; padding:8px 12px;'
-            f' border-radius:12px; font-size:15px;">{text}</span></div>'
+            f' border-radius:12px; font-size:15px;">{body}</span></div>'
         )
         self.chat.append(html)
+
+    def append_events(self, events: list):
+        """渲染思维链 / 工具调用 / 文件改动"""
+        for ev in events or []:
+            if ev.get("type") == "thought":
+                text = html_escape(ev.get("text", ""))[:800]
+                self.chat.append(
+                    f'<div style="color:#6b7280; font-size:12px; font-style:italic;'
+                    f' margin:2px 0;">🧠 {text}</div>'
+                )
+            elif ev.get("type") == "tool":
+                icon = "✓" if ev.get("approved") else "🔧"
+                summary = html_escape(ev.get("summary", ""))
+                self.chat.append(
+                    f'<div style="font-size:12.5px; color:#9fd4ff; margin:2px 0;">'
+                    f'{icon} <b style="color:#1a9fff;">{ev.get("name")}</b> {summary}</div>'
+                )
+                for f in ev.get("files") or []:
+                    self.chat.append(
+                        f'<div style="font-size:12px; color:#7ddba3; margin:0 0 2px 18px;">'
+                        f'📄 写入 {html_escape(str(f))}</div>'
+                    )
 
     def send(self):
         text = self.input.text().strip()
@@ -231,9 +277,10 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self.on_error)
         self.worker.start()
 
-    def on_reply(self, reply: str):
+    def on_reply(self, res: dict):
         self.send_btn.setEnabled(True)
-        self.append_msg("assistant", reply.replace("\n", "<br>"))
+        self.append_events(res.get("events"))
+        self.append_msg("assistant", res.get("reply", ""))
 
     def on_error(self, err: str):
         self.send_btn.setEnabled(True)

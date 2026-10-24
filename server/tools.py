@@ -136,6 +136,29 @@ def is_dangerous(cmd: str) -> bool:
     return any(re.search(p, cmd) for p in DANGER_PATTERNS)
 
 
+# 从命令中识别会写入/改动的文件路径（用于 UI 展示）
+WRITE_PATTERNS = [
+    r"(?<![\d&])>+\s*([^\s|;&>]+)",                          # > file / >> file（排除 2>&1 这类）
+    r"\btee\s+(?:-a\s+)?([^\s|;&]+)",                        # tee file
+    r"\bsed\s+-i\S*\s+(?:'[^']*'|\"[^\"]*\"|\S+)\s+([^\s|;&]+)",  # sed -i ... file
+    r"\btouch\s+([^\s|;&]+)",
+    r"\bmkdir\s+(?:-p\s+)?([^\s|;&]+)",
+    r"\bcp\s+(?:-\S+\s+)*[^\s|;&]+\s+([^\s|;&]+)",           # cp src dst
+    r"\bmv\s+(?:-\S+\s+)*[^\s|;&]+\s+([^\s|;&]+)",           # mv src dst
+    r"\bln\s+(?:-\S+\s+)*[^\s|;&]+\s+([^\s|;&]+)",           # ln target link
+]
+
+
+def extract_writes(cmd: str) -> list[str]:
+    files = []
+    for pat in WRITE_PATTERNS:
+        for m in re.finditer(pat, cmd):
+            p = m.group(1)
+            if p not in files:
+                files.append(p)
+    return files[:10]
+
+
 async def _run_command(command: str, reason: str = "", timeout: int = 60) -> str:
     timeout = max(1, min(int(timeout or 60), 300))
     env = dict(os.environ)

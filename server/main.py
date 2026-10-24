@@ -227,8 +227,7 @@ async def api_chat(req: ChatRequest):
     text = req.message.strip()
     if not text:
         raise HTTPException(status_code=400, detail="empty message")
-    reply = await handle_chat(text)
-    return {"reply": reply}
+    return await handle_chat(text)
 
 
 class ConfigUpdate(BaseModel):
@@ -271,41 +270,58 @@ async def api_set_config(req: ConfigUpdate):
     return {"ok": True, "llm_configured": llm.configured}
 
 
-async def handle_chat(text: str) -> str:
+async def handle_chat(text: str) -> dict:
     global pending_action
     await manager.broadcast({"type": "user_message", "text": text, "ts": time.time()})
     history.append({"role": "user", "content": text})
     del history[:-HISTORY_LIMIT]
+    events: list[dict] = []
 
     if not llm.configured:
-        reply = "LLM 未配置 API Key。请编辑 Deck 上的 ~/deckmate/server/config.toml 填入 api_key 后重启服务。"
+        reply = "LLM 未配置 API Key。请在设置里填入 api_key。"
     elif pending_action and tools.is_confirm(text):
         # 用户确认了挂起的危险操作
         action, pending_action = pending_action, None
-        await manager.broadcast({"type": "tool_activity", "text": f"正在执行：{action['description']}", "ts": time.time()})
+        events.append({"type": "tool", "name": action["name"],
+                       "summary": action["description"], "files": [], "approved": True})
         result = await tools.execute(action["name"], action["args"])
         reply = f"已完成：{action['description']}\n{result}"
     elif pending_action:
         # 有新消息但未确认，取消挂起操作
         action, pending_action = pending_action, None
-        reply = f"已取消：{action['description']}。\n\n" + await run_agent()
+        reply = f"已取消：{action['description']}。\n\n" + await run_agent(events)
     else:
-        reply = await run_agent()
+        reply = await run_agent(events)
 
     history.append({"role": "assistant", "content": reply})
-    await manager.broadcast({"type": "assistant_message", "text": reply, "ts": time.time()})
-    # 语音播报（后台进行，不阻塞回复）
+    await manager.broadcast({"type": "assistant_message", "text": reply, "ts": time.time(), "events": events})
+    # 语音播报：只播报最终回复，不播报思维链/工具过程（后台进行，不阻塞）
     asyncio.create_task(tts.speak(reply))
-    return reply
+    return {"reply": reply, "events": events}
 
 
-async def run_agent() -> str:
-    """LLM + 工具调用循环"""
+def summarize_tool(name: str, args: dict) -> str:
+    if name == "run_command":
+        cmd = str(args.get("command", ""))
+        return cmd if len(cmd) <= 120 else cmd[:120] + "…"
+    s = json.dumps(args, ensure_ascii=False)
+    return s if len(s) <= 120 else s[:120] + "…"
+
+
+async def run_agent(events: list[dict]) -> str:
+    """LLM + 工具调用循环，思考链/工具调用写入 events 供 UI 展示"""
     global pending_action
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + list(history)
     try:
         for _ in range(MAX_TOOL_ROUNDS):
             msg = await llm.chat_with_tools(msgs, tools.TOOLS)
+
+            # 思维链（reasoning_content，DeepSeek/Qwen 等支持）
+            reasoning = (msg.get("reasoning_content") or "").strip()
+            if reasoning:
+                events.append({"type": "thought", "text": reasoning})
+                await manager.broadcast({"type": "thought", "text": reasoning, "ts": time.time()})
+
             tool_calls = msg.get("tool_calls") or []
             if not tool_calls:
                 return msg.get("content") or "（没有回复内容）"
@@ -332,7 +348,12 @@ async def run_agent() -> str:
                     pending_action = {"name": name, "args": args, "description": tools.describe(name, args)}
                     return f"我需要执行一个会影响设备的操作：\n\n**{pending_action['description']}**\n\n回复「确认」我就执行，说别的就当作取消。"
 
-                await manager.broadcast({"type": "tool_activity", "text": f"调用工具 {name}", "ts": time.time()})
+                # 文件改动识别（run_command）
+                files = tools.extract_writes(str(args.get("command", ""))) if name == "run_command" else []
+                event = {"type": "tool", "name": name, "summary": summarize_tool(name, args), "files": files}
+                events.append(event)
+                await manager.broadcast({"type": "tool_activity", "text": f"{name}：{event['summary']}", "ts": time.time()})
+
                 result = await tools.execute(name, args)
                 msgs.append({"role": "tool", "tool_call_id": call["id"], "content": result})
         return "（工具调用次数超限，换个问法试试吧）"
