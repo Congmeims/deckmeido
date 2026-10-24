@@ -228,12 +228,6 @@ def apply_config(cfg: dict):
 # 权限模式：manual=所有命令手动审批 / auto=危险命令才审批 / full=完全访问
 PERMISSION_MODE = CFG.get("security", {}).get("permission_mode", "auto")
 
-# HTTPS 副端口（手机浏览器麦克风需要安全上下文）：证书存在才启用，HTTP 18765 保留给本机客户端
-HTTPS_PORT = int(CFG["server"].get("https_port", 18766))
-CERT_FILE = BASE_DIR / "certs" / "cert.pem"
-KEY_FILE = BASE_DIR / "certs" / "key.pem"
-HTTPS_ENABLED = CERT_FILE.exists() and KEY_FILE.exists()
-
 # 工作区（默认 ~/deckmate_workspace，可在设置里改）
 try:
     tools.set_workspace(CFG.get("workspace", {}).get("dir", str(Path.home() / "deckmate_workspace")))
@@ -822,14 +816,13 @@ def _lan_ip() -> str:
 
 def phone_url() -> str:
     """手机扫码/直连用的完整地址（带 token 免输入）"""
-    scheme = "https" if HTTPS_ENABLED else "http"
-    port = HTTPS_PORT if HTTPS_ENABLED else int(CFG["server"].get("port", 18765))
-    return f"{scheme}://{_lan_ip()}:{port}/?token={TOKEN}"
+    port = int(CFG["server"].get("port", 18765))
+    return f"http://{_lan_ip()}:{port}/?token={TOKEN}"
 
 
 @app.get("/api/qrcode", dependencies=[Depends(check_token)])
 async def api_qrcode():
-    """手机连接信息 + 二维码 PNG（base64）"""
+    """局域网访问地址 + 二维码 PNG（base64）"""
     url = phone_url()
     png_b64 = ""
     try:
@@ -844,14 +837,7 @@ async def api_qrcode():
         png_b64 = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
     except Exception:
         pass
-    return {
-        "url": url,
-        "qr": png_b64,
-        "https": HTTPS_ENABLED,
-    }
-
-
-_https_started = False
+    return {"url": url, "qr": png_b64}
 
 
 # ---------- 操作遮罩 ----------
@@ -938,20 +924,6 @@ async def api_overlay_state(ack: int = 0):
 @app.on_event("startup")
 async def _boot_overlay():
     ensure_overlay()
-
-
-@app.on_event("startup")
-async def _start_https():
-    """证书就绪时进程内再起一个 HTTPS 端口（HTTP 18765 不受影响）。守卫防止递归触发"""
-    global _https_started
-    if _https_started or not HTTPS_ENABLED:
-        return
-    _https_started = True
-    import uvicorn
-    cfg2 = uvicorn.Config(app, host="0.0.0.0", port=HTTPS_PORT,
-                          ssl_certfile=str(CERT_FILE), ssl_keyfile=str(KEY_FILE),
-                          log_level="warning")
-    asyncio.create_task(uvicorn.Server(cfg2).serve())
 
 
 _REFUSAL_MARKS = ["我不会", "我不能", "无法执行", "无法直接执行", "恕我不能", "不执行", "拒绝执行",

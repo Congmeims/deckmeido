@@ -232,7 +232,6 @@
     background: var(--surface-2); color: var(--muted);
     font-size: 16px; cursor: pointer; flex: 0 0 auto;
   }
-  .cb-btn.rec { color: #e8463a; }
   .cb-select {
     height: 34px; border: 1px solid var(--line); border-radius: 10px;
     background: var(--surface-2); color: var(--muted);
@@ -356,14 +355,14 @@
     background: var(--surface-2); color: var(--muted);
     font-size: 13px; cursor: pointer;
   }
-  #settingsPanel, #phonePanel {
+  #settingsPanel {
     position: fixed; inset: 0;
     background: rgba(0,0,0,.5);
     display: none;
     align-items: flex-end;
     z-index: 20;
   }
-  #settingsPanel.show, #phonePanel.show { display: flex; }
+  #settingsPanel.show { display: flex; }
   .sheet {
     background: var(--surface);
     width: 100%;
@@ -523,7 +522,6 @@
   <button class="menu-btn" id="btnShot">截屏</button>
   <button class="menu-btn" id="btnRetry">重试</button>
   <button class="menu-btn" id="btnShare">分享</button>
-  <button class="menu-btn" id="btnPhone">手机连接</button>
   <span class="spacer"></span>
   <span class="badge" id="ctxBadge" hidden></span>
 </nav>
@@ -560,7 +558,6 @@
     </div>
     <div class="cb-right">
       <select class="cb-select" id="modelSelect" title="模型"></select>
-      <button class="cb-btn" id="btnMic" title="语音输入" style="font-size:13px">语音</button>
       <button id="send">发送</button>
     </div>
   </div>
@@ -627,19 +624,6 @@
     </div>
     <button id="saveCfg">保存</button>
     <div id="cfgHint"></div>
-  </div>
-</div>
-
-<div id="phonePanel">
-  <div class="sheet">
-    <h2>手机连接</h2>
-    <p style="color:var(--muted); font-size:13px; margin-bottom:12px;">手机连同一局域网，扫码即开（地址里已带鉴权 token，免输入）</p>
-    <div style="display:flex; justify-content:center; margin-bottom:12px;">
-      <img id="qrImg" alt="连接二维码" style="width:210px; height:210px; background:#fff; border-radius:12px; padding:8px;">
-    </div>
-    <div id="phoneUrl" style="font-family:ui-monospace,monospace; font-size:13px; color:var(--brand); word-break:break-all; text-align:center; margin-bottom:14px;"></div>
-    <a href="/ca.crt" download style="display:block; text-align:center; background:var(--surface-2); border-radius:10px; padding:12px; color:var(--text); text-decoration:none; font-size:14px; margin-bottom:10px;">下载根证书 ca.crt（开启麦克风需要）</a>
-    <p style="color:var(--muted); font-size:12px; line-height:1.6;">想用语音输入：手机浏览器要求 HTTPS。安装上面的根证书后（iPhone：设置→通用→VPN与设备管理→安装描述文件，再到 关于本机→证书信任设置 里信任；安卓：设置→安全→更多安全设置→安装证书），用 https 地址打开即可。</p>
   </div>
 </div>
 
@@ -1278,24 +1262,6 @@
     if (e.target === settingsPanel) settingsPanel.classList.remove('show');
   });
 
-  // ---------- 手机连接（扫码） ----------
-  var phonePanel = document.getElementById('phonePanel');
-  document.getElementById('btnPhone').addEventListener('click', function () {
-    phonePanel.classList.add('show');
-    fetch('/api/qrcode?token=' + encodeURIComponent(token))
-      .then(function (r) { return r.json(); })
-      .then(function (d) {
-        if (d.qr) document.getElementById('qrImg').src = d.qr;
-        document.getElementById('phoneUrl').textContent = d.url;
-      })
-      .catch(function () {
-        document.getElementById('phoneUrl').textContent = '获取失败';
-      });
-  });
-  phonePanel.addEventListener('click', function (e) {
-    if (e.target === phonePanel) phonePanel.classList.remove('show');
-  });
-
   // 拉取当前配置（已保存的地址和 Key）的模型列表，同步到底部下拉框
   function reloadModels() {
     modelsPromise = null;
@@ -1430,13 +1396,12 @@
     document.getElementById('btnShare').click();  // 退出选择模式
   });
 
-  // ---------- 输入框工具栏：＋附件 / 权限 / 模型 / 语音 ----------
+  // ---------- 输入框工具栏：＋附件 / 权限 / 模型 ----------
   var plusMenu = document.getElementById('plusMenu');
   var fileList = document.getElementById('fileList');
   var imgInput = document.getElementById('imgInput');
   var permSelect = document.getElementById('permSelect');
   var modelSelect = document.getElementById('modelSelect');
-  var btnMic = document.getElementById('btnMic');
 
   function postConfig(patch) {
     return fetch('/api/config?token=' + encodeURIComponent(token), {
@@ -1566,29 +1531,6 @@
     }
   });
 
-  // 语音输入（浏览器 SpeechRecognition，支持中文）
-  var recog = null;
-  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) {
-    btnMic.style.opacity = .35;
-    btnMic.title = '当前浏览器不支持语音识别';
-  }
-  btnMic.addEventListener('click', function () {
-    if (!SR) { addSystem('当前浏览器不支持语音识别'); return; }
-    if (recog) { recog.stop(); return; }
-    recog = new SR();
-    recog.lang = 'zh-CN';
-    recog.interimResults = false;
-    btnMic.classList.add('rec');
-    recog.onresult = function (e) {
-      var t = e.results[0][0].transcript;
-      input.value += (input.value ? ' ' : '') + t;
-      input.focus();
-    };
-    recog.onend = function () { btnMic.classList.remove('rec'); recog = null; };
-    recog.onerror = function () { btnMic.classList.remove('rec'); recog = null; };
-    try { recog.start(); } catch (e) { recog = null; }
-  });
 
   loadToolbar();
 
