@@ -114,7 +114,7 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 - Python 3.11+（用到 `tomllib`）
 - 可选：`spectacle`（KWin 截图，一般自带）、`kdotool` / `ydotool`（按窗口名聚焦与合成输入）、`espeak-ng`（语音播报）
 
-> 控制类插件（`kdotool` / `ydotool` / `espeak-ng`）是系统包，装它们需要 root。`install.sh` 默认**不**自动装，只在结尾列出缺了哪些并询问一次（输入 `y` 才走 `sudo`；无终端时自动跳过，不会卡住）。想跳过询问直接装：
+> 控制类插件（`ydotool` / `kdotool` / `espeak-ng`）是「替你在桌面上动手」的核心能力，装它们需要 root：`ydotool` 负责模拟鼠标点击与键盘输入，`kdotool` 按窗口标题聚焦窗口，`espeak-ng` 把回复念出来。`install.sh` 在结尾会把每个控件的用途列出来并**推荐安装**，询问一次（输入 `y` 才走 `sudo`；无终端时自动跳过，不会卡住）。想跳过询问直接装：
 >
 > ```bash
 > bash install.sh install --deps
@@ -140,8 +140,25 @@ wget https://github.com/Congmeims/deckmeido/releases/latest/download/deckmeido-0
 
 ```bash
 bash install.sh upgrade      # 升级：同步代码 + 依赖，保留配置与会话
-bash install.sh uninstall    # 卸载：停服务、删快捷方式，保留配置与工作区
-bash install.sh uninstall --purge   # 连配置与工作区一起删
+bash ~/deckmeido/uninstall.sh        # 卸载：停服务、删快捷方式，保留配置与工作区
+bash ~/deckmeido/uninstall.sh --purge   # 连配置与工作区一起删
+```
+
+安装脚本会在程序目录留一个 `uninstall.sh`，不用记 `install.sh` 的路径和参数。等价的原始写法是 `bash install.sh uninstall [--purge]`。
+
+### 版本与升级
+
+设置页底部显示当前版本号（安装时由 `install.sh` 写入安装目录的 `VERSION`），旁边有「检查更新」：
+
+- **检查更新**：向 GitHub 查询最新 release，比当前版本新就提示，并出现「立即升级」
+- **立即升级**：先在安装目录 `git pull --ff-only`，再后台执行 `install.sh upgrade`（同步代码、装依赖、重启服务）。配置、会话、工作区都会保留；日志写在安装目录的 `update.log`
+
+非 git 安装（例如用 tar.gz 解压装的）不支持一键升级，重新下载并运行 `install.sh` 即可。
+
+也可以在终端里手动升级：
+
+```bash
+cd ~/deckmeido && git pull && bash install.sh upgrade
 ```
 
 自定义位置与端口：`DECKMEIDO_DIR=~/apps/deckmeido DECKMEIDO_PORT=18765 bash install.sh`
@@ -152,6 +169,7 @@ bash install.sh uninstall --purge   # 连配置与工作区一起删
 2. 首次连接会自动弹出设置页——填 **API 地址** 与 **Key**，保存即可开始对话；不配也能进，只是对话不可用
 3. 设置页里可以「随机生成」或自定义访问令牌（4-32 位字母数字，校验不分大小写，保存后立即生效）
 4. 想用手机连？点设置页里的「二维码」，手机扫码直接带令牌进入
+5. 设置页底部能看到版本号，点「检查更新」可直接从网页升级
 
 不跑脚本时的手动启动方式：
 
@@ -182,6 +200,8 @@ bash install.sh uninstall --purge   # 连配置与工作区一起删
 ```
 deckmeido/
 ├── install.sh                 一键安装 / 升级 / 卸载
+├── VERSION                    安装时写入的版本号（设置页与升级检查读它）
+├── uninstall.sh               安装时生成的卸载入口
 ├── assets/logo.png            应用图标（桌面快捷方式、托盘、网页 favicon）
 ├── client/main.py             PySide6 原生客户端（含托盘）
 ├── deploy/

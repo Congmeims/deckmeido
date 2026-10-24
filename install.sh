@@ -66,14 +66,13 @@ PY
 }
 
 system_notes() {
-  # 只提示不自动装：装系统包需要 sudo，交给用户确认更稳妥
   local miss=()
-  need_cmd espeak-ng || miss+=("espeak-ng（语音播报）")
-  need_cmd kdotool   || miss+=("kdotool（按窗口名聚焦，AUR）")
-  need_cmd ydotool   || miss+=("ydotool（Wayland 下模拟点击/输入，AUR）")
+  need_cmd espeak-ng || miss+=("espeak-ng（语音播报回复）")
+  need_cmd kdotool   || miss+=("kdotool（按窗口名切换/聚焦窗口）")
+  need_cmd ydotool   || miss+=("ydotool（模拟鼠标点击、键盘输入）")
   need_cmd spectacle || miss+=("spectacle（KWin 截图，一般自带）")
   if [ ${#miss[@]} -gt 0 ]; then
-    warn "以下可选依赖没装，相关功能会受限："
+    warn "以下系统控件没装，相关功能会受限："
     for m in "${miss[@]}"; do dim "$m"; done
     dim "想自动安装：bash install.sh install --deps"
   fi
@@ -85,10 +84,34 @@ system_notes() {
 }
 
 # ---------- 可选系统依赖 ----------
-# 这些是模拟点击/键盘、截图、语音播报要用的系统包，装它们必须 root。
-# 默认在安装结尾询问一次，或加 --deps 直接装；由 sudo 逐条安装、逐条报告结果。
+# 这些是「替你在桌面上动手」的核心控件，装它们必须 root。
+# 默认在安装结尾说明用途并询问一次，或加 --deps 直接装。
 DEPS_PACMAN=(espeak-ng ydotool)
 DEPS_AUR=(kdotool)
+
+deps_intro() {
+  # 安装前把每个控件是干什么的说清楚，用户才知道为什么要给 sudo
+  local miss_pacman=() miss_aur=() miss_other=()
+  need_cmd espeak-ng || miss_pacman+=("espeak-ng")
+  need_cmd ydotool   || miss_pacman+=("ydotool")
+  need_cmd kdotool   || miss_aur+=("kdotool")
+  need_cmd spectacle || miss_other+=("spectacle")
+
+  echo
+  info "关于控制类系统控件（推荐安装）"
+  dim "DeckMeido 的「帮你在桌面上操作」能力依赖下面这些系统包；"
+  dim "不装也能聊天、截图、执行命令，但没法替你点鼠标、敲键盘、念出回复。"
+  echo
+  printf '  %sydotool%s   模拟鼠标点击 / 键盘输入（搭配 ydotoold 守护进程）\n' "$C_OK" "$C_END"
+  printf '  %skdotool%s   按窗口标题查找并聚焦窗口，配合 ydotool 点击正确的位置\n' "$C_OK" "$C_END"
+  printf '  %sespeak-ng%s 把回复念出来（语音播报）\n' "$C_OK" "$C_END"
+  printf '  %sspectacle%s KDE 截图工具，用于「看看当前屏幕」\n' "$C_OK" "$C_END"
+  echo
+  [ ${#miss_pacman[@]} -gt 0 ] && dim "待安装（pacman）：${miss_pacman[*]}"
+  [ ${#miss_aur[@]}    -gt 0 ] && dim "待安装（AUR）：${miss_aur[*]}（需要 paru 或 yay）"
+  [ ${#miss_other[@]}  -gt 0 ] && dim "未找到：${miss_other[*]}（KDE 一般自带，可忽略）"
+  dim "安装过程会用 sudo 关闭 SteamOS 根分区只读保护并安装系统包，不会改动你的游戏与个人文件。"
+}
 
 ask_yes() {
   # 无 tty（比如从客户端里跑）时默认不装，避免卡住
@@ -198,6 +221,7 @@ sync_files() {
     fi
   done
   chmod +x "$INSTALL_DIR/install.sh" 2>/dev/null || true
+  write_version_file
 }
 
 venv_install() {
@@ -236,6 +260,12 @@ install_service() {
   dim "用户服务已启用：systemctl --user status $UNIT"
 }
 
+# 用 --purge 卸载前先停服务，否则进程会边跑边重建目录；从外部脚本升级时同样先停
+stop_service() {
+  need_cmd systemctl || return 0
+  systemctl --user stop "$UNIT" >/dev/null 2>&1 || true
+}
+
 install_desktop() {
   mkdir -p "$DESKTOP_DIR"
   sed "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
@@ -252,6 +282,50 @@ install_desktop() {
   fi
 
   dim "快捷方式已放到应用菜单和桌面（游戏模式下可加到非 Steam 游戏）"
+}
+
+# 在安装目录留一个卸载入口，用户不必记住 install.sh 的路径和参数
+install_uninstaller() {
+  cat > "$INSTALL_DIR/uninstall.sh" <<'EOS'
+#!/usr/bin/env bash
+# DeckMeido 卸载入口（由 install.sh 自动生成）
+#   bash uninstall.sh            停服务、删快捷方式，保留配置与工作区
+#   bash uninstall.sh --purge    连配置、会话、工作区一起删
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -x "$HERE/install.sh" ]; then
+  exec bash "$HERE/install.sh" uninstall "${1:-}"
+fi
+# 源码里的 install.sh 被删掉时的兜底：自己动手，逻辑与 install.sh 一致
+APP=deckmeido
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+DESKTOP_DIR="$HOME/.local/share/applications"
+DESKTOP_FOLDER="$(command -v xdg-user-dir >/dev/null 2>&1 && xdg-user-dir DESKTOP 2>/dev/null || true)"
+[ -n "$DESKTOP_FOLDER" ] && [ "$DESKTOP_FOLDER" != "$HOME" ] || DESKTOP_FOLDER="$HOME/Desktop"
+[ "$(id -u)" = "0" ] && { echo "不要用 sudo 运行"; exit 1; }
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl --user disable --now deckmeido.service >/dev/null 2>&1 || true
+  rm -f "$UNIT_DIR/deckmeido.service"
+  systemctl --user daemon-reload || true
+fi
+rm -f "$DESKTOP_DIR/DeckMeido.desktop" "$DESKTOP_FOLDER/DeckMeido.desktop"
+if [ "${1:-}" = "--purge" ]; then
+  rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/$APP" "${DECKMEIDO_WORKSPACE:-$HOME/${APP}_workspace}"
+fi
+rm -rf "$HERE/.venv" "$HERE/server/sessions" "$HERE/server/static/shots" "$HERE/server/uploads"
+echo "卸载完成。代码仍在 $HERE，完全删除：rm -rf \"$HERE\""
+EOS
+  chmod +x "$INSTALL_DIR/uninstall.sh"
+}
+
+# 版本号写进安装目录，网页设置页与升级检查都读它
+write_version_file() {
+  local ver
+  ver=$(git -C "$INSTALL_DIR" describe --tags --always 2>/dev/null || true)
+  [ -n "$ver" ] || ver=$(git -C "$HERE" describe --tags --always 2>/dev/null || true)
+  [ -n "$ver" ] || ver="0.1.0"
+  printf '%s\n' "${ver#v}" > "$INSTALL_DIR/VERSION"
+  dim "版本：$(cat "$INSTALL_DIR/VERSION")"
 }
 
 read_token() {
@@ -320,8 +394,10 @@ print_done() {
   dim "局域网访问:  http://$ip:$PORT/?token=$token"
   dim "访问令牌:    $token   （可在网页设置页随机生成或自定义）"
   dim "配置文件:    $INSTALL_DIR/server/config.toml"
+  dim "卸载脚本:    bash $INSTALL_DIR/uninstall.sh   （加 --purge 连配置一起删）"
   echo
   dim "下一步：打开上面的地址，首次会弹出设置页，填 API 地址与 Key 即可对话"
+  dim "以后升级：网页设置页点「检查更新」，或执行 bash $INSTALL_DIR/install.sh upgrade"
 }
 
 # ---------- 子命令 ----------
@@ -332,14 +408,19 @@ do_install() {
   sync_files
   venv_install
   prepare_config
+  stop_service
   install_service
   install_desktop
+  install_uninstaller
   if [ "$deps" = "--deps" ]; then
+    deps_intro
     install_deps
   else
-    system_notes
-    if need_cmd sudo && ask_yes "要现在用 sudo 安装控制类插件（ydotool / kdotool / espeak-ng）吗？"; then
+    deps_intro
+    if need_cmd sudo && ask_yes "这些控件属于「代替你动手操作」的核心能力，推荐安装。现在就用 sudo 安装吗？"; then
       install_deps
+    else
+      dim "已跳过。之后想装：bash install.sh install --deps"
     fi
   fi
   if need_cmd curl && wait_ready; then
@@ -353,10 +434,14 @@ do_upgrade() {
   local deps="${1:-}"
   [ -d "$INSTALL_DIR" ] || die "$INSTALL_DIR 不存在，请先执行安装"
   check_prereq
+  # 先停服务：网页里点「立即升级」时，本进程就是那个服务，重启前先停掉；
+  # 由 systemd 托管时停完会由后续 restart 重新拉起
+  stop_service
   sync_files
   venv_install
   install_service
   install_desktop
+  install_uninstaller
   if [ "$deps" = "--deps" ]; then
     install_deps
   else
@@ -373,6 +458,7 @@ do_uninstall() {
   local purge=0
   [ "${1:-}" = "--purge" ] && purge=1
   check_user
+  stop_service
   if need_cmd systemctl; then
     info "停止并移除用户服务"
     systemctl --user disable --now "$UNIT" >/dev/null 2>&1 || true

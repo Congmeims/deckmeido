@@ -514,6 +514,22 @@
   }
   #cfgHint { text-align: center; font-size: 13px; color: var(--muted); margin-top: 10px; min-height: 18px; }
 
+  /* 设置页底部：版本号 + 检查/安装更新 */
+  .about-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .ver-tag {
+    font-size: 12px; font-weight: 600; color: var(--muted);
+    padding: 3px 8px; border: 1px solid var(--line); border-radius: 999px;
+  }
+  .about-row .mini-btn { margin-left: auto; }
+  .upd-note {
+    margin-top: 8px; font-size: 13px; color: var(--muted);
+    white-space: pre-wrap; word-break: break-word; line-height: 1.5;
+  }
+  .upd-note b { color: var(--text); }
+  #updApply { display: none; width: 100%; margin-top: 8px; padding: 11px;
+    border: none; border-radius: 10px; background: var(--brand); color: #fff;
+    font-size: 15px; font-weight: 600; }
+
   /* ===== 亮暗主题 + 分栏布局 ===== */
   :root {
     --line: rgba(255,255,255,.08); --hover: rgba(255,255,255,.07);
@@ -810,6 +826,15 @@
     </div>
     <button id="saveCfg">保存</button>
     <div id="cfgHint"></div>
+    <div class="field" style="margin-top:18px">
+      <label>关于</label>
+      <div class="about-row">
+        <span class="ver-tag" id="verTag">版本 …</span>
+        <button id="updCheck" class="mini-btn" type="button">检查更新</button>
+      </div>
+      <div class="upd-note" id="updNote"></div>
+      <button id="updApply" type="button">立即升级到最新版</button>
+    </div>
   </div>
 </div>
 
@@ -1523,6 +1548,64 @@
   var cfgUrl = document.getElementById('cfgUrl');
   var qrBtn = document.getElementById('qrBtn');
   var qrBox = document.getElementById('qrBox');
+  var verTag = document.getElementById('verTag');
+  var updCheck = document.getElementById('updCheck');
+  var updNote = document.getElementById('updNote');
+  var updApply = document.getElementById('updApply');
+  var verLoaded = false;
+
+  function loadVersion() {
+    if (verLoaded) return;
+    verLoaded = true;
+    fetch('/api/version?token=' + encodeURIComponent(token))
+      .then(function (r) { return r.json(); })
+      .then(function (v) { verTag.textContent = '版本 v' + (v.version || '?'); })
+      .catch(function () { verTag.textContent = '版本未知'; });
+  }
+
+  updCheck.addEventListener('click', function () {
+    updNote.textContent = '正在查询 GitHub 最新版本…';
+    updApply.style.display = 'none';
+    updCheck.disabled = true;
+    fetch('/api/update/check?token=' + encodeURIComponent(token))
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+      .then(function (res) {
+        updCheck.disabled = false;
+        if (!res.ok) { updNote.textContent = (res.body && res.body.detail) || '检查失败'; return; }
+        var d = res.body;
+        verTag.textContent = '版本 v' + d.current;
+        if (!d.has_update) {
+          updNote.textContent = d.tag
+            ? '已是最新版本（v' + d.current + '）'
+            : '还没有发布版本信息，已是最新';
+          return;
+        }
+        updNote.innerHTML = '发现新版本 <b>v' + d.tag + '</b>' +
+          (d.published_at ? '（' + d.published_at.slice(0, 10) + '）' : '') +
+          '\n升级会自动拉取新代码并重启服务，配置与对话记录都会保留。';
+        updApply.style.display = 'block';
+      })
+      .catch(function () { updCheck.disabled = false; updNote.textContent = '检查失败，请检查网络'; });
+  });
+
+  updApply.addEventListener('click', function () {
+    updApply.disabled = true;
+    updNote.textContent = '正在开始升级…';
+    fetch('/api/update/apply?token=' + encodeURIComponent(token), { method: 'POST' })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+      .then(function (res) {
+        if (!res.ok) {
+          updApply.disabled = false;
+          updNote.textContent = (res.body && res.body.detail) || '升级失败';
+          return;
+        }
+        updNote.textContent = '升级已开始，服务马上会重启，稍等几秒后刷新本页即可。';
+      })
+      .catch(function () {
+        updApply.disabled = false;
+        updNote.textContent = '升级请求失败，请稍后重试';
+      });
+  });
 
   function openSettings() {
     settingsPanel.classList.add('show');
@@ -1530,6 +1613,7 @@
     tokenHint.textContent = '';
     qrBox.classList.remove('show');
     qrBox.innerHTML = '';
+    loadVersion();
     fetch('/api/config?token=' + encodeURIComponent(token))
       .then(function (r) {
         if (!r.ok) throw new Error(r.status === 401 ? '旧令牌已失效，请重新登录' : '读取失败');
