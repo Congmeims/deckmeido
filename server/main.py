@@ -293,7 +293,18 @@ def save_current_session():
     data = {"id": current_sid, "title": title,
             "created": created or time.time(), "updated": time.time(),
             "history": history}
-    p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    # 原子写：先写临时文件再 replace。直接 write_text 覆盖时如果进程被杀/连接中断，
+    # 会留下半个 JSON，下次启动解析失败就等于整轮对话丢了
+    tmp = p.with_name(p.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def init_sessions():
@@ -309,6 +320,12 @@ def init_sessions():
         history = data.get("history", [])
         _ctx_used = _estimate_tokens(history)
     except Exception:
+        # 文件损坏：先留个备份再重开会话，别让一个坏文件把关掉的历史彻底毁掉
+        try:
+            files[0].rename(files[0].with_name(files[0].name + ".broken"))
+        except OSError:
+            pass
+        history.clear()
         save_current_session()
 
 
@@ -419,6 +436,9 @@ def get_status() -> dict:
         "charging": charging or None,
         "load": load or None,
         "mode": "gaming" if gaming else "desktop",
+        # 后端是否正在跑一轮对话：前端重连后据此恢复 ⏹ 按钮状态，
+        # 避免断联时正在跑的那轮看起来像「已经停了」
+        "running": bool(current_task and not current_task.done()),
         "llm_configured": llm.configured,
         "model": llm.model,
         "context": {
@@ -1387,9 +1407,23 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
                     await start_chat(str(data.get("text", "")).strip())
                 except asyncio.CancelledError:
                     pass  # 用户点了终止，保持 ws 连接
+                except Exception as exc:
+                    # 一轮对话内部报错不能把整条 ws 打死：旧逻辑异常直接冒到外层，
+                    # 连接被断 → 前端 busy 卡死 → 后续消息全排队发不出去
+                    try:
+                        await ws.send_json({
+                            "type": "assistant_message",
+                            "text": f"这轮出错了：{exc}",
+                            "ts": time.time(), "events": [],
+                        })
+                    except Exception:
+                        pass
     except WebSocketDisconnect:
         manager.disconnect(ws)
     except Exception:
+        manager.disconnect(ws)
+    finally:
+        # 兜底：不管怎么退出都要摘掉连接，否则 broadcast 会一直往死连接上发
         manager.disconnect(ws)
 
 

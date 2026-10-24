@@ -1257,12 +1257,16 @@
 
   function connect() {
     if (!token) { showAuth(''); return; }
+    // 防重入：已有连接正在建/已建立时不要再开一条，
+    // 否则两条 ws 同时收消息、onclose 互相打架，重连风暴会打乱忙碌态
+    if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
     var proto = location.protocol === 'https:' ? 'wss' : 'ws';
     ws = new WebSocket(proto + '://' + location.host + '/ws?token=' + encodeURIComponent(token));
 
     ws.onopen = function () {
       setConnected(true);
       backoff = 1000;
+      reconnectTimer = null;
       authOverlay.classList.remove('show');
       authErr.textContent = '';
       // 首次使用（还没配模型）自动打开设置页，省得用户找不到入口
@@ -1286,6 +1290,14 @@
             addMsg(m.role === 'user' ? 'user' : 'assistant', m.content, m.ts,
                    m.role === 'assistant' ? m.events : null);
           });
+          // 重连后重建现场：残留的流式气泡/事件容器都指向已经不存在的这一轮
+          streamEl = null; streamBody = null;
+          liveBox = null; liveToolCount = 0; liveThoughtShown = 0; liveThought = null;
+          hideTyping();
+          setBusy(false);
+          // 等服务端紧跟着发的 status：它带着 running 字段，
+          // 据此决定是恢复「运行中」还是把断联期间暂存的消息发出去
+          awaitingResync = true;
           break;
         case 'user_message':
           hideTyping();
@@ -1400,6 +1412,11 @@
     ws.onclose = function (ev) {
       setConnected(false);
       hideTyping();
+      // 断联时把忙碌态复位：旧逻辑保留 busy=true，发送键一直停在 ⏹，
+      // 点了只会发 cancel（完全不发消息），主人看到的就是「按钮卡死」
+      setBusy(false);
+      streamEl = null; streamBody = null;
+      liveBox = null; liveToolCount = 0; liveThoughtShown = 0; liveThought = null;
       if (suppressReconnect) return;
       if (ev.code === 4401) {
         // 令牌被拒：清掉本地缓存并停在鉴权页，不要继续重连（否则会无限弹回）
@@ -1409,7 +1426,7 @@
         showAuth('令牌不正确，请重新输入');
         return;
       }
-      reconnectTimer = setTimeout(connect, backoff);
+      reconnectTimer = setTimeout(function () { reconnectTimer = null; connect(); }, backoff);
       backoff = Math.min(backoff * 2, 10000);
     };
 
@@ -1581,6 +1598,18 @@
 
   function renderStatus(s) {
     renderControls(s.controls);
+    // 重连后的第一次状态回报：对齐「服务端是否还在跑」，
+    // 空闲就把断联期间暂存的队列补发出去，运行中就继续保持 ⏹
+    if (awaitingResync) {
+      awaitingResync = false;
+      if (s.running) {
+        setBusy(true);
+        showTyping('已重连，等待服务端处理完这一轮…');
+      } else {
+        setBusy(false);
+        flushQueue(false);
+      }
+    }
     if (s.battery != null) {
       batteryBadge.hidden = false;
       batteryBadge.textContent = s.battery + '%' + (s.charging === 'Charging' ? ' 充电中' : '');
@@ -1608,19 +1637,24 @@
 
   var busy = false;
   var queueBox = document.getElementById('queueBox');
-  var msgQueue = [];              // 等待发送的消息
+  var msgQueue = [];              // 等待发送的消息 [{id, text}]
+  var qid = 0;
   var forceSendAfterCancel = null; // 「立即发送」：终止当前后要立刻发出去的文本
+  var queuedNoticeShown = false;   // 断联暂存提示只弹一次，别刷屏
+  var awaitingResync = false;      // 刚重连、等第一条 status 来对齐运行状态
 
   // ---------- 等待发送队列 ----------
   function renderQueue() {
     queueBox.innerHTML = '';
     queueBox.classList.toggle('show', msgQueue.length > 0);
-    msgQueue.forEach(function (text, i) {
+    // 用 id 定位而不是数组下标：队列随时会被 flushQueue 消费/重排，
+    // 闭包里的旧下标会指到别的消息上，点「取消等待」就会删错条、文字对不上
+    msgQueue.forEach(function (item) {
       var chip = document.createElement('div');
       chip.className = 'qchip';
       var t = document.createElement('div');
       t.className = 'q-text';
-      t.textContent = text;
+      t.textContent = item.text;
       chip.appendChild(t);
       var wait = document.createElement('button');
       wait.className = 'q-wait';
@@ -1631,16 +1665,10 @@
       var now = document.createElement('button');
       now.className = 'q-now';
       now.textContent = '立即发送（终止当前操作）';
-      now.addEventListener('click', function () { sendQueuedNow(i); });
+      now.addEventListener('click', function () { sendQueuedNow(item.id); });
       var drop = document.createElement('button');
       drop.textContent = '取消等待（放回输入框）';
-      drop.addEventListener('click', function () {
-        msgQueue.splice(i, 1);
-        input.value = input.value ? input.value + '\n' + text : text;
-        input.dispatchEvent(new Event('input'));
-        renderQueue();
-        input.focus();
-      });
+      drop.addEventListener('click', function () { requeueToInput(item.id); });
       menu.appendChild(now);
       menu.appendChild(drop);
       chip.appendChild(menu);
@@ -1649,13 +1677,32 @@
     });
   }
 
-  // 「立即发送」：终止当前操作，完成后发这条
-  function sendQueuedNow(i) {
-    var text = msgQueue[i];
-    msgQueue.splice(i, 1);
+  function takeQueued(id) {
+    var idx = -1;
+    for (var i = 0; i < msgQueue.length; i++) {
+      if (msgQueue[i].id === id) { idx = i; break; }
+    }
+    if (idx < 0) return null;
+    return msgQueue.splice(idx, 1)[0];
+  }
+
+  // 「取消等待」：把这条放回输入框。原文不能丢，所以先确认取到了对象再改输入框
+  function requeueToInput(id) {
+    var item = takeQueued(id);
     renderQueue();
-    if (!busy) { doSend(text); return; }
-    forceSendAfterCancel = text;
+    if (!item) return;
+    input.value = input.value ? input.value + '\n' + item.text : item.text;
+    input.dispatchEvent(new Event('input'));
+    input.focus();
+  }
+
+  // 「立即发送」：终止当前操作，完成后发这条
+  function sendQueuedNow(id) {
+    var item = takeQueued(id);
+    renderQueue();
+    if (!item) return;
+    if (!busy) { doSend(item.text); return; }
+    forceSendAfterCancel = item.text;
     fetch('/api/cancel?token=' + encodeURIComponent(token), { method: 'POST' })
       .catch(function () {});
   }
@@ -1670,7 +1717,7 @@
     }
     // 手动终止后不自动发，保留队列等用户决定
     if (cancelled || !msgQueue.length) return;
-    doSend(msgQueue.shift());
+    doSend(msgQueue.shift().text);
     renderQueue();
   }
 
@@ -1717,7 +1764,20 @@
   }
 
   function doSend(text) {
-    if (!text || !ws || ws.readyState !== 1) return;
+    if (!text) return;
+    if (!ws || ws.readyState !== 1) {
+      // 旧逻辑这里直接 return —— 消息已经从输入框清掉、也没进队列，
+      // 主人的字就这么蒸发了。现在改成先暂存，重连后自动补发
+      msgQueue.unshift({ id: ++qid, text: text });
+      renderQueue();
+      if (!queuedNoticeShown) {
+        queuedNoticeShown = true;
+        addSystem('连接已断开，这条消息已暂存，重连后会自动发出');
+      }
+      if (!reconnectTimer) connect();
+      return;
+    }
+    queuedNoticeShown = false;
     ws.send(JSON.stringify({ type: 'chat', text: text }));
     setBusy(true);
   }
@@ -1727,7 +1787,7 @@
     if (busy) {
       if (text) {
         // agent 运行中：排队等待发送（Trae 式）
-        msgQueue.push(text);
+        msgQueue.push({ id: ++qid, text: text });
         renderQueue();
         input.value = '';
         input.style.height = 'auto';
