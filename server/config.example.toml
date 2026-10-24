@@ -19,7 +19,7 @@ timeout = 60
 # 保留的对话轮数上限
 history_limit = 20
 # agent 单轮最多连续调用工具次数
-max_tool_rounds = 5
+max_tool_rounds = 12
 
 [persona]
 # 人格设定：改这里就能换人格，重启生效

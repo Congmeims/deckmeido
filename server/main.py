@@ -83,7 +83,7 @@ llm = LLMClient(
 
 PERSONA = CFG.get("persona", {})
 HISTORY_LIMIT = int(CFG["agent"].get("history_limit", 20))
-MAX_TOOL_ROUNDS = int(CFG["agent"].get("max_tool_rounds", 5))
+MAX_TOOL_ROUNDS = int(CFG["agent"].get("max_tool_rounds", 12))
 
 
 def build_system_prompt() -> str:
@@ -498,7 +498,11 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
                 events.append(event)
                 await manager.broadcast({"type": "tool_done", "event": event, "ts": time.time()})
                 msgs.append({"role": "tool", "tool_call_id": call["id"], "content": result})
-        return "（工具调用次数超限，换个问法试试吧）"
+        # 工具轮数用尽：最后再不给工具地问一次，让它基于已有结果收尾回答
+        msg = await llm.chat_with_tools_stream(msgs, [], on_delta)
+        if msg.get("reasoning_content"):
+            events.append({"type": "thought", "text": msg["reasoning_content"]})
+        return msg.get("content") or "（操作步骤较多已执行完，以上是过程结果）"
     except Exception as e:
         return f"LLM 调用失败：{e}"
 
