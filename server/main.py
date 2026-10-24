@@ -429,6 +429,9 @@ async def start_chat(text: str, announce: bool = True):
 async def api_cancel():
     if current_task and not current_task.done():
         current_task.cancel()
+        # 遮罩进程在遮罩消失前会重新拉一次状态，这里立刻翻成 false，
+        # 用户点完遮罩就不会出现「已终止」又闪回操作中的画面
+        set_overlay(False)
         return {"ok": True}
     return {"ok": False, "detail": "no active task"}
 
@@ -512,7 +515,7 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
             action, pending_action = pending_action, None
             events.append({"type": "tool", "name": action["name"],
                            "summary": action["description"], "files": [], "approved": True})
-            set_overlay(True, f"正在执行：{action['description'][:60]}")
+            set_overlay(True, f"正在执行：{action['description'][:200]}")
             result = await tools.execute(action["name"], action["args"])
             reply = f"已完成：{action['description']}\n{result}"
         elif pending_action:
@@ -736,7 +739,7 @@ _https_started = False
 
 
 # ---------- 操作遮罩 ----------
-# agent 真正操作设备时，桌面上盖一层可穿透遮罩；用户移动鼠标/触摸板即终止
+# agent 真正操作设备时，桌面上盖一层半透明遮罩；用户点一下遮罩即终止当前操作
 
 _overlay_proc = None
 _overlay_state = {"show": False, "text": ""}
