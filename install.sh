@@ -6,11 +6,17 @@
 #   bash install.sh install --deps      顺带用 sudo 安装控制类插件（不再询问）
 #   bash install.sh upgrade        升级代码与依赖，保留配置
 #   bash install.sh upgrade --deps      升级后顺带检查并安装控制类插件
+#   bash install.sh check          自检：逐个实测控制类控件是否真的能用
 #   bash install.sh uninstall     卸载（默认保留 ~/.config/deckmeido 配置与工作区）
 #   bash install.sh uninstall --purge   连配置一起删
 #
-# 控制类插件（ydotool / kdotool / espeak-ng）是系统包，装它们需要 root：
-# 默认只在结尾提示并询问一次（y/N），回答 y 才走 sudo；无终端时不会卡住。
+# 控制类插件（ydotool / kdotool / wtype / espeak-ng / fakeroot）是系统包，
+# 装它们需要 root：默认只在结尾提示并询问一次（y/N），回答 y 才走 sudo。
+#
+# 为什么装完还要自检：SteamOS 换镜像（BUILD_ID 变动）时，/usr 下由 pacman
+# 装的包会被整片冲掉，而 pacman 的数据库记录不一定同步，所以只查
+# `pacman -Q` 会出现「记录在、命令没了」的假象。install.sh check 一律实测。
+# 同理 ydotoold 必须由 systemd 用户单元托管（enabled），裸跑的进程重启即失效。
 #
 # 环境变量：
 #   DECKMEIDO_DIR   安装目录，默认 ~/deckmeido
@@ -45,6 +51,11 @@ dim()  { printf '%s    %s%s\n' "$C_DIM" "$*" "$C_END"; }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# SteamOS 镜像号：换镜像时 /usr 下 pacman 装的包会被整片冲掉，这是本脚本
+# 一切「装完还要实测」逻辑的根源。之前 BUILD_ID 从未赋值，导致镜像变动
+# 检测（system_notes 里的提示）永远是死的，这里统一从 os-release 读。
+BUILD_ID="$(sed -n 's/^BUILD_ID=//p' /etc/os-release 2>/dev/null | tr -d '"' | head -n1)"
+
 # ---------- 前置检查 ----------
 check_user() {
   if [ "$(id -u)" = "0" ]; then
@@ -70,31 +81,41 @@ system_notes() {
   need_cmd espeak-ng || miss+=("espeak-ng（语音播报回复）")
   need_cmd kdotool   || miss+=("kdotool（按窗口名切换/聚焦窗口）")
   need_cmd ydotool   || miss+=("ydotool（模拟鼠标点击、键盘输入）")
+  need_cmd wtype     || miss+=("wtype（Wayland 原生打字，ydotool 的备选）")
   need_cmd spectacle || miss+=("spectacle（KWin 截图，一般自带）")
   if [ ${#miss[@]} -gt 0 ]; then
     warn "以下系统控件没装，相关功能会受限："
     for m in "${miss[@]}"; do dim "$m"; done
     dim "想自动安装：bash install.sh install --deps"
+    # SteamOS 换镜像会冲掉 /usr 下 pacman 装的包，这情况最常见
+    if [ -n "${BUILD_ID:-}" ] && [ -f "$HOME/.config/deckmeido/.deps-build-id" ]; then
+      local prev; prev="$(cat "$HOME/.config/deckmeido/.deps-build-id" 2>/dev/null || true)"
+      [ "$prev" = "$BUILD_ID" ] || dim "检测到 SteamOS 镜像已更新（$prev → ${BUILD_ID}），系统包可能被冲掉，重装即可恢复"
+    fi
   fi
   # ydotool 装了但 ydotoold 没跑，点击/输入会直接报 socket 错误，这里提前点出来
   if need_cmd ydotool && ! pgrep -x ydotoold >/dev/null 2>&1; then
     warn "ydotool 已装但 ydotoold 守护进程没在运行，模拟点击/输入会失败"
-    dim "临时启动：ydotoold >/dev/null 2>&1 &"
+    dim "修一次：bash install.sh check --fix   （会配置成开机自启）"
   fi
 }
 
 # ---------- 可选系统依赖 ----------
 # 这些是「替你在桌面上动手」的核心控件，装它们必须 root。
 # 默认在安装结尾说明用途并询问一次，或加 --deps 直接装。
-DEPS_PACMAN=(espeak-ng ydotool)
-DEPS_AUR=(kdotool)
+# fakeroot 不是运行时控件，但用 paru/yay 编译 AUR 包（kdotool）必须要它，
+# 缺了会在 makepkg 阶段报「fakeroot not found」，所以一起装。
+DEPS_PACMAN=(espeak-ng ydotool wtype fakeroot)
+# AUR 里叫 kdotool，编译出来很慢；优先用预编译的 kdotool-bin，
+# 找不到 AUR helper 才提示手动装。
+DEPS_AUR=(kdotool-bin)
+DEPS_AUR_FALLBACK=(kdotool)
 
 deps_intro() {
   # 安装前把每个控件是干什么的说清楚，用户才知道为什么要给 sudo
   local miss_pacman=() miss_aur=() miss_other=()
-  need_cmd espeak-ng || miss_pacman+=("espeak-ng")
-  need_cmd ydotool   || miss_pacman+=("ydotool")
-  need_cmd kdotool   || miss_aur+=("kdotool")
+  for p in "${DEPS_PACMAN[@]}"; do need_cmd "$p" || miss_pacman+=("$p"); done
+  need_cmd kdotool   || miss_aur+=("${DEPS_AUR[0]}")
   need_cmd spectacle || miss_other+=("spectacle")
 
   echo
@@ -104,7 +125,9 @@ deps_intro() {
   echo
   printf '  %sydotool%s   模拟鼠标点击 / 键盘输入（搭配 ydotoold 守护进程）\n' "$C_OK" "$C_END"
   printf '  %skdotool%s   按窗口标题查找并聚焦窗口，配合 ydotool 点击正确的位置\n' "$C_OK" "$C_END"
+  printf '  %swtype%s     Wayland 原生打字，ydotool type 不支持中文时的备选\n' "$C_OK" "$C_END"
   printf '  %sespeak-ng%s 把回复念出来（语音播报）\n' "$C_OK" "$C_END"
+  printf '  %sfakeroot%s  编译 AUR 包（kdotool）时 makepkg 必需的构建依赖\n' "$C_OK" "$C_END"
   printf '  %sspectacle%s KDE 截图工具，用于「看看当前屏幕」\n' "$C_OK" "$C_END"
   echo
   [ ${#miss_pacman[@]} -gt 0 ] && dim "待安装（pacman）：${miss_pacman[*]}"
@@ -139,61 +162,315 @@ sudo_warmup() {
 }
 
 install_pacman_deps() {
-  local todo=()
+  local todo=() reinstall=() installed=()
   for p in "${DEPS_PACMAN[@]}"; do
-    need_cmd "$p" || todo+=("$p")
+    if pacman -Qq "$p" >/dev/null 2>&1; then
+      # 记录在：再确认命令真的能用。SteamOS 换镜像后 /usr 被重建，
+      # 包记录还留着但文件没了，这种情况必须「重装」而不是跳过
+      if need_cmd "$p"; then installed+=("$p"); else reinstall+=("$p"); fi
+    else
+      todo+=("$p")
+    fi
   done
-  [ ${#todo[@]} -gt 0 ] || return 0
-  info "用 pacman 安装：${todo[*]}"
+  [ ${#todo[@]} -gt 0 ] || [ ${#reinstall[@]} -gt 0 ] || {
+    dim "pacman 包已齐全：${installed[*]}"; return 0; }
+  if [ ${#reinstall[@]} -gt 0 ]; then
+    warn "以下包记录在但命令找不到（镜像更新冲掉了 /usr），重装：${reinstall[*]}"
+  fi
+  [ ${#todo[@]} -gt 0 ] && info "用 pacman 安装：${todo[*]}"
   # SteamOS 的根分区是只读的，装包前要先关掉只读保护
   if [ -f /etc/steamos-readonly.conf ] || need_cmd steamos-readonly; then
     sudo steamos-readonly disable 2>/dev/null || true
   fi
-  # --needed：已装的不会重装；-Sy 而不 -Syu，避免顺带滚系统
-  if won=$(sudo pacman -Sy --needed --noconfirm "${todo[@]}" 2>&1); then
-    info "pacman 安装完成"
-  else
-    warn "pacman 安装失败："
-    dim "$won"
-    dim "SteamOS 换过 keyring 的话先执行：sudo pacman-key --init && sudo pacman-key --populate archlinux holo"
+  # 先装缺的（--needed）；再对「记录在、文件没了」的强制重装（不能带 --needed，
+  # 否则 pacman 会认为已装而直接跳过）。-Sy 而不 -Syu，避免顺带滚系统
+  local log ok=1 pkgs=()
+  [ ${#todo[@]} -gt 0 ] && pkgs+=("${todo[@]}")
+  if [ ${#pkgs[@]} -gt 0 ]; then
+    if log=$(sudo pacman -Sy --needed --noconfirm "${pkgs[@]}" 2>&1); then
+      info "pacman 安装完成"
+    else
+      # 最常见失败原因：SteamOS 换镜像后 keyring 对不上，签名校验直接报错
+      warn "pacman 安装失败，尝试修复 keyring 后重试"
+      dim "$(printf '%s' "$log" | tail -5)"
+      sudo pacman-key --init >/dev/null 2>&1 || true
+      sudo pacman-key --populate archlinux holo >/dev/null 2>&1 || true
+      if log=$(sudo pacman -Sy --needed --noconfirm "${pkgs[@]}" 2>&1); then
+        info "修复 keyring 后安装成功"
+      else
+        warn "pacman 安装仍然失败："
+        dim "$(printf '%s' "$log" | tail -20)"
+        dim "手动排查：sudo pacman -Sy ${pkgs[*]}"
+        ok=0
+      fi
+    fi
   fi
+  if [ ${#reinstall[@]} -gt 0 ] && [ "$ok" = 1 ]; then
+    if sudo pacman -S --noconfirm "${reinstall[@]}" >/dev/null 2>&1; then
+      info "重装完成：${reinstall[*]}"
+    else
+      warn "重装失败：${reinstall[*]}"
+      dim "手动排查：sudo pacman -S ${reinstall[*]}"
+    fi
+  fi
+  # 装完立刻实测，避免「pacman 说装了但命令不在」的假成功
+  local bad=()
+  for p in "${todo[@]}" "${reinstall[@]}"; do need_cmd "$p" || bad+=("$p"); done
+  if [ ${#bad[@]} -gt 0 ]; then
+    warn "以下包装完仍找不到命令，可能是镜像更新冲掉了 /usr：${bad[*]}"
+    dim "重跑一次：bash install.sh install --deps"
+  fi
+  record_deps_build
 }
 
 install_aur_deps() {
   local todo=() helper
-  for p in "${DEPS_AUR[@]}"; do
-    need_cmd "$p" || todo+=("$p")
-  done
+  need_cmd kdotool || todo=("${DEPS_AUR[@]}")
   [ ${#todo[@]} -gt 0 ] || return 0
   helper=""
   for h in paru yay; do
     need_cmd "$h" && { helper="$h"; break; }
   done
   if [ -z "$helper" ]; then
-    warn "这些包在 AUR 里，但没找到 paru / yay，跳过：${todo[*]}"
-    dim "手动装法：git clone https://aur.archlinux.org/<包名>.git && cd <包名> && makepkg -si"
+    warn "kdotool 在 AUR 里，但没找到 paru / yay，跳过"
+    dim "手动装法（推荐预编译版，不用编译）："
+    dim "  git clone https://aur.archlinux.org/kdotool-bin.git && cd kdotool-bin && makepkg -si"
+    dim "或先装个 AUR helper：sudo pacman -S --needed base-devel git && git clone https://aur.archlinux.org/paru-bin.git"
     return 0
   fi
+  # 编译 AUR 包需要 fakeroot，缺了会在 makepkg 阶段直接失败
+  if ! need_cmd fakeroot; then
+    warn "缺少 fakeroot，AUR 编译会失败，先补装"
+    sudo pacman -S --needed --noconfirm fakeroot >/dev/null 2>&1 || true
+  fi
   info "用 $helper 安装：${todo[*]}"
-  if won=$("$helper" -S --needed --noconfirm "${todo[@]}" 2>&1); then
+  local log
+  if log=$("$helper" -S --needed --noconfirm "${todo[@]}" 2>&1); then
     info "$helper 安装完成"
   else
-    warn "$helper 安装失败："
-    dim "$won"
+    warn "$helper 安装失败，改用源码版（需要编译，耗时较久）：${DEPS_AUR_FALLBACK[*]}"
+    dim "$(printf '%s' "$log" | tail -8)"
+    if log=$("$helper" -S --needed --noconfirm "${DEPS_AUR_FALLBACK[@]}" 2>&1); then
+      info "$helper 安装源码版完成"
+    else
+      warn "$helper 安装失败："
+      dim "$(printf '%s' "$log" | tail -15)"
+      dim "手动装法：git clone https://aur.archlinux.org/kdotool-bin.git && cd kdotool-bin && makepkg -si"
+    fi
   fi
 }
 
-# ydotoold 是 ydotool 的守护进程，不跑的话点击/输入用不了
+# ydotoold 是 ydotool 的守护进程，不跑的话点击/输入用不了。
+# 注意：不能用 `ydotoold &` 裸跑——那种进程重启就没了，用户会以为装了却不能用。
+# 包自带 /usr/lib/systemd/user/ydotool.service（Restart=always），交给 systemd 托管。
 setup_ydotoold() {
   need_cmd ydotool || return 0
-  pgrep -x ydotoold >/dev/null 2>&1 && return 0
-  info "启动 ydotoold 守护进程"
-  setsid ydotoold >/dev/null 2>&1 < /dev/null &
-  sleep 1
-  if pgrep -x ydotoold >/dev/null 2>&1; then
-    dim "已启动（重启后需要再启动一次，或用 systemd 用户单元托管）"
+  if ! need_cmd systemctl; then
+    # 没有 systemd 的极端情况才退回裸跑
+    pgrep -x ydotoold >/dev/null 2>&1 && return 0
+    setsid ydotoold >/dev/null 2>&1 < /dev/null &
+    sleep 1
+    pgrep -x ydotoold >/dev/null 2>&1 \
+      && dim "ydotoold 已启动（无 systemd，重启后需手动再启动）" \
+      || warn "ydotoold 启动失败，模拟点击/输入可能不可用"
+    return 0
+  fi
+  # 已有裸跑进程时先停掉，否则 systemd 抢占 socket 会失败
+  if pgrep -x ydotoold >/dev/null 2>&1 && \
+     ! systemctl --user is-active ydotool.service >/dev/null 2>&1; then
+    dim "停掉手动启动的 ydotoold，改由 systemd 托管"
+    pkill -x ydotoold 2>/dev/null || true
+    sleep 1
+    rm -f "/run/user/$(id -u)/.ydotool_socket"
+  fi
+  # 注意：is-enabled 对 static/indirect 等状态也返回 0，必须比对输出字符串，
+  # 否则会把「没设自启」误判成已设好
+  local en ac
+  en=$(systemctl --user is-enabled ydotool.service 2>/dev/null || true)
+  ac=$(systemctl --user is-active  ydotool.service 2>/dev/null || true)
+  if [ "$en" = enabled ] && [ "$ac" = active ]; then
+    dim "ydotoold 已由 systemd 托管并开机自启"
+    return 0
+  fi
+  if [ "$en" != enabled ]; then
+    info "设置 ydotool 开机自启（之前：${en:-未知}）"
+    systemctl --user enable ydotool.service >/dev/null 2>&1 || \
+      warn "enable ydotool.service 失败，重启后可能要手动启动"
+  fi
+  # 已 enabled 但没跑（手动 stop 过 / 刚开机还没拉起）时也要拉起来
+  if [ "$ac" != active ]; then
+    info "启动 ydotool 守护进程（之前：${ac:-未知}）"
+    systemctl --user start ydotool.service >/dev/null 2>&1 || true
+    sleep 1
+  fi
+  if systemctl --user is-active ydotool.service >/dev/null 2>&1; then
+    dim "ydotoold 已由 systemd 托管，重启后自动恢复"
   else
-    warn "ydotoold 启动失败，模拟点击/输入可能不可用"
+    warn "ydotool.service 没起来，模拟点击/输入可能不可用"
+    dim "手动排查：systemctl --user status ydotool.service"
+  fi
+}
+
+# 记下这次装依赖时的 SteamOS 镜像号，下次镜像变动就能提醒用户重装
+record_deps_build() {
+  mkdir -p "$CONFIG_DIR"
+  printf '%s\n' "${BUILD_ID:-unknown}" > "$CONFIG_DIR/.deps-build-id" 2>/dev/null || true
+}
+
+# ---------- 控件自检 ----------
+# 只查 pacman -Q 不够：SteamOS 换镜像会冲掉 /usr 下的包而数据库仍留记录。
+# 所以这里逐项实测「命令在不在 + 真的能不能跑」。
+probe_ydotool() {
+  need_cmd ydotool || { echo "未安装（模拟鼠标点击、键盘输入）"; return 1; }
+  need_cmd ydotoold || { echo "守护进程缺失，需重装 ydotool"; return 1; }
+  local sock="/run/user/$(id -u)/.ydotool_socket"
+  [ -S "$sock" ] || { echo "ydotoold 守护进程没在跑（$sock 不存在），点击/输入会失败"; return 1; }
+  # 只连 socket 验活，不发 mousemove 之类的命令——那会把用户的光标真的挪走。
+  # ydotoold 用 SOCK_DGRAM，用 SOCK_STREAM 连会报 Protocol wrong type for socket
+  if python3 - "$sock" <<'PY' >/dev/null 2>&1
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.settimeout(1.0)
+try:
+    s.connect(sys.argv[1])
+finally:
+    s.close()
+PY
+  then
+    return 0
+  fi
+  echo "socket 通信失败（ydotoold 可能在重启中）"; return 1
+}
+# ydotoold 的托管状态：enabled 决定重启后还在不在，active 决定现在能不能用
+ydotoold_state() {
+  if ! need_cmd systemctl; then
+    pgrep -x ydotoold >/dev/null 2>&1 && echo "运行中（无 systemd，重启需手动）" || echo "未运行"
+    return 0
+  fi
+  local en ac
+  en=$(systemctl --user is-enabled ydotool.service 2>/dev/null || echo unknown)
+  ac=$(systemctl --user is-active  ydotool.service 2>/dev/null || echo unknown)
+  if [ "$ac" = active ] && [ "$en" = enabled ]; then
+    echo "运行中 · 已设开机自启"
+  elif [ "$ac" = active ]; then
+    echo "运行中 · 未设开机自启（重启会失效）"
+  elif [ "$en" = enabled ]; then
+    echo "已设开机自启 · 当前未运行（手动 stop 过，或刚开机还没拉起）"
+  else
+    echo "未运行 · 未设开机自启"
+  fi
+}
+probe_kdotool() {
+  need_cmd kdotool || { echo "未安装（按窗口名聚焦）"; return 1; }
+  KDE_SESSION_VERSION=6 kdotool getactivewindow >/dev/null 2>&1 && return 0
+  echo "调用失败（需要 KDE Plasma 6 会话）"; return 1
+}
+probe_wtype() {
+  need_cmd wtype || { echo "未安装（Wayland 原生打字）"; return 1; }
+  wtype >/dev/null 2>&1
+  # 无参数时 wtype 返回 1 并打印用法；返回 127/命令不存在才是真坏
+  [ $? -ne 127 ] && return 0
+  echo "命令无法执行"; return 1
+}
+probe_espeak() {
+  need_cmd espeak-ng || { echo "未安装（语音播报）"; return 1; }
+  espeak-ng --version >/dev/null 2>&1 && return 0
+  echo "调用失败"; return 1
+}
+probe_fakeroot() {
+  need_cmd fakeroot || { echo "未安装（编译 AUR 包需要）"; return 1; }
+  fakeroot true >/dev/null 2>&1 && return 0
+  echo "调用失败"; return 1
+}
+probe_spectacle() {
+  need_cmd spectacle || { echo "未安装（KWin 截图，KDE 一般自带）"; return 1; }
+  return 0
+}
+
+# 返回缺失/异常的控件名列表（空格分隔）
+deps_broken() {
+  local broken=() f
+  for f in probe_ydotool probe_kdotool probe_wtype probe_espeak probe_fakeroot probe_spectacle; do
+    "$f" >/dev/null 2>&1 || broken+=("${f#probe_}")
+  done
+  echo "${broken[*]:-}"
+}
+
+do_check() {
+  local fix=0
+  [ "${1:-}" = "--fix" ] && fix=1
+  check_user
+  info "控制类控件自检"
+  local broken=() name
+  for name in ydotool kdotool wtype espeak fakeroot spectacle; do
+    local msg
+    if msg=$("probe_$name" 2>&1); then
+      printf '  %s● OK %s %-10s %s\n' "$C_OK" "$C_END" "$name" "$(probe_label "$name")"
+    else
+      printf '  %s○ BAD%s %-10s %s\n' "$C_ERR" "$C_END" "$name" "$msg"
+      broken+=("$name")
+    fi
+  done
+  echo
+  # ydotoold 是否被 systemd 托管，单独一行看清楚：这是「重启后还能不能用」的关键
+  need_cmd ydotool && { printf '  %-10s %s\n' "ydotoold" "$(ydotoold_state)"; echo; }
+  if [ ${#broken[@]} -eq 0 ]; then
+    info "全部正常"
+    return 0
+  fi
+  warn "异常项：${broken[*]}"
+  if [ "$fix" = 1 ]; then
+    info "尝试自动修复"
+    sudo_warmup || return 0
+    install_pacman_deps
+    install_aur_deps
+    setup_ydotoold
+    echo
+    do_check
+  else
+    dim "自动修复：bash install.sh check --fix"
+  fi
+}
+
+probe_label() {
+  case "$1" in
+    ydotool)  echo "模拟鼠标点击 / 键盘输入" ;;
+    kdotool)  echo "按窗口标题聚焦窗口" ;;
+    wtype)    echo "Wayland 原生打字（备选）" ;;
+    espeak)   echo "语音播报回复" ;;
+    fakeroot) echo "编译 AUR 包的构建依赖" ;;
+    spectacle) echo "KWin 截图" ;;
+  esac
+}
+
+# 镜像更新后自动补齐：SteamOS 换镜像会冲掉 /usr 下 pacman 装的包
+# （wtype 就这么消失过一次）。已有 sudo 授权时不必再问用户，直接重装。
+maybe_autorepair_after_image_update() {
+  [ -n "$BUILD_ID" ] || return 0
+  local stamp="$CONFIG_DIR/.deps-build-id"
+  [ -f "$stamp" ] || return 0
+  local prev; prev="$(cat "$stamp" 2>/dev/null || true)"
+  [ "$prev" = "$BUILD_ID" ] && return 0
+  info "检测到 SteamOS 镜像已更新（${prev:-未知} → $BUILD_ID）"
+  dim "镜像更新会重建 /usr，之前装的控件可能已被冲掉，现在重新检查一遍"
+  local broken; broken="$(deps_broken)"
+  if [ -z "$broken" ]; then
+    dim "实测控件都还在，无需重装"
+    record_deps_build
+    return 0
+  fi
+  warn "以下控件已被冲掉：$broken"
+  sudo_warmup || return 0
+  install_pacman_deps
+  install_aur_deps
+  setup_ydotoold
+  record_deps_build
+  local left; left="$(deps_broken)"
+  if [ -n "$left" ]; then
+    warn "重装后仍不可用：$left"
+    dim "逐个看原因：bash install.sh check"
+  else
+    info "控件已全部恢复"
   fi
 }
 
@@ -203,6 +480,12 @@ install_deps() {
   install_pacman_deps
   install_aur_deps
   setup_ydotoold
+  # 装完跑一遍实测，把「记录在、命令没了」的情况直接暴露出来
+  local broken; broken="$(deps_broken)"
+  if [ -n "$broken" ]; then
+    warn "以下控件装完仍不可用：$broken"
+    dim "逐个看原因：bash install.sh check"
+  fi
   system_notes
 }
 
@@ -425,6 +708,7 @@ do_install() {
   install_uninstaller
   if [ "$deps" = "--deps" ]; then
     deps_intro
+    maybe_autorepair_after_image_update
     install_deps
   else
     deps_intro
@@ -454,6 +738,7 @@ do_upgrade() {
   install_desktop
   install_uninstaller
   if [ "$deps" = "--deps" ]; then
+    maybe_autorepair_after_image_update
     install_deps
   else
     system_notes
@@ -493,8 +778,9 @@ do_uninstall() {
 case "${1:-install}" in
   install|"")   do_install "${2:-}" ;;
   upgrade|update) do_upgrade "${2:-}" ;;
+  check)        do_check "${2:-}" ;;
   uninstall)    do_uninstall "${2:-}" ;;
   -h|--help|help)
-    grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -n 16 ;;
-  *) die "未知命令：$1（可用：install / upgrade / uninstall）" ;;
+    grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -n 22 ;;
+  *) die "未知命令：$1（可用：install / upgrade / check / uninstall）" ;;
 esac

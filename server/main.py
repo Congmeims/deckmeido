@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .llm import LLMClient
-from . import tools, updater
+from . import depcheck, tools, updater
 from .tts import TTS
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -107,6 +107,11 @@ MAX_TOOL_ROUNDS = int(CFG["agent"].get("max_tool_rounds", 0))
 # 用量优先取服务商返回的 usage.prompt_tokens，拿不到再按字符估算。
 CONTEXT_WINDOW = int(CFG["agent"].get("context_window", 0))
 COMPACT_RATIO = float(CFG["agent"].get("compact_ratio", 0.95))
+# 单次输出上限（0 / 留空 = 用满上下文剩余空间）。默认跟随上下文窗口，
+# 这样长答复不会再被 4096 这种固定值硬截断。
+MAX_OUTPUT_TOKENS = int(CFG["llm"].get("max_output_tokens", 0) or 0) or CONTEXT_WINDOW
+# 撞到输出上限时最多自动续写几轮（0 = 不续写）
+MAX_CONTINUATIONS = int(CFG["llm"].get("max_continuations", 3))
 # 最近一次请求的 token 用量：由服务商 usage 或字符估算更新
 _ctx_used = 0
 
@@ -425,6 +430,9 @@ def get_status() -> dict:
             "compact_at": round(COMPACT_RATIO * 100),
         },
         "workspace": str(tools.WORKSPACE),
+        # 控制类控件（点击输入/窗口聚焦/原生打字/构建依赖）的实测结果，
+        # 前端在电量徽章左侧显示成「x/x + 绿灯/黄灯/红灯」
+        "controls": depcheck.summary(),
     }
 
 
@@ -1083,6 +1091,52 @@ async def set_overlay_lift(on: bool) -> None:
 tools.ON_OVERLAY_LIFT = set_overlay_lift
 
 
+@app.get("/api/controls", dependencies=[Depends(check_token)])
+async def api_controls(force: int = Query(default=0)):
+    """控件自检：force=1 时跳过缓存重新实测（网页上点徽章刷新用）"""
+    return depcheck.summary(force=bool(force))
+
+
+@app.post("/api/controls/fix", dependencies=[Depends(check_token)])
+async def api_controls_fix(full: int = Query(default=0)):
+    """修复控件。
+
+    默认只做不需要 root 的那半：把 ydotoold 交给 systemd 用户单元托管。
+    full=1 时会去装系统包，那要 sudo 密码，而服务是 systemd 托管的后台进程，
+    没法接终端输入，所以这条路只会在能免密 sudo 时才真的执行。
+    """
+    out: dict = {"results": []}
+
+    ok, msg = await asyncio.to_thread(depcheck.fix_ydotoold)
+    out["results"].append({"key": "ydotoold", "ok": ok, "message": msg})
+
+    if full:
+        if not depcheck.sudo_nopasswd():
+            out["need_sudo"] = True
+            out["hint"] = "装系统包需要 sudo 密码，后台服务接不到输入。请在终端执行：bash install.sh check --fix"
+        else:
+            script = INSTALL_DIR / "install.sh"
+            if not script.is_file():
+                out["hint"] = f"找不到 {script}"
+            else:
+                p = await asyncio.to_thread(
+                    subprocess.run,
+                    ["bash", str(script), "check", "--fix"],
+                    capture_output=True, text=True, timeout=280, cwd=str(INSTALL_DIR),
+                )
+                tail = "\n".join((p.stdout + p.stderr).strip().splitlines()[-12:])
+                out["results"].append({
+                    "key": "deps", "ok": p.returncode == 0,
+                    "message": "安装完成" if p.returncode == 0 else "安装有失败项",
+                    "log": tail,
+                })
+                depcheck.invalidate()
+
+    out["controls"] = depcheck.summary(force=True)
+    await manager.broadcast({"type": "status", "data": get_status()})
+    return out
+
+
 @app.get("/api/overlay_state", dependencies=[Depends(check_token)])
 async def api_overlay_state(ack: int = 0):
     # 遮罩进程带 ack=1 轮询时，表示它已经按本次返回的状态生效过了
@@ -1158,6 +1212,19 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
             await manager.broadcast({"type": "thought_start", "ts": time.time()})
         await manager.broadcast({"type": "thought_delta", "text": text})
 
+    def _output_budget(used_msgs: list[dict]) -> int:
+        """按当前上下文剩余空间算出本次调用的输出上限。
+
+        旧逻辑固定 4096，长答复/长工具参数会在中途被硬截断，正文漏出半截标记。
+        现在：输出额度 = min(配置上限, 上下文窗口 - 已用 - 预留)，且不低于 4096。
+        """
+        win = context_window()
+        used = _estimate_tokens(used_msgs)
+        # 预留一小块给下一轮的用户消息 / 工具结果
+        room = max(win - used - 2048, 4096)
+        cap = MAX_OUTPUT_TOKENS if MAX_OUTPUT_TOKENS > 0 else win
+        return max(min(cap, room), 4096)
+
     try:
         round_no = 0
         while MAX_TOOL_ROUNDS <= 0 or round_no < MAX_TOOL_ROUNDS:
@@ -1169,10 +1236,40 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
                     {"role": m["role"], "content": m.get("content", "")} for m in history]
                 streaming = False
 
-            msg = await llm.chat_with_tools_stream(msgs, tools.TOOLS, on_delta=on_delta, on_thought=on_thought)
+            msg = await llm.chat_with_tools_stream(msgs, tools.TOOLS, on_delta=on_delta,
+                                                   on_thought=on_thought,
+                                                   max_tokens=_output_budget(msgs))
             if thought_open:
                 await manager.broadcast({"type": "thought_end", "ts": time.time()})
                 thought_open = False
+
+            # 撞到输出上限时自动续写，把后半段接上（不再把用户丢给「请拆小步骤」）
+            cont = 0
+            while (msg.get("finish_reason") == "length" and not (msg.get("tool_calls") or [])
+                   and cont < MAX_CONTINUATIONS):
+                cont += 1
+                partial = (msg.get("content") or "")
+                if not partial.strip():
+                    break
+                msgs.append({"role": "assistant", "content": partial})
+                msgs.append({"role": "user", "content":
+                             "（回复被输出长度上限截断了，请从断点处直接继续，不要重复已写内容，"
+                             "也不要重新开头。）"})
+                cont_msg = await llm.chat_with_tools_stream(
+                    msgs, [], on_delta=on_delta,
+                    max_tokens=_output_budget(msgs))
+                more = (cont_msg.get("content") or "")
+                if cont_msg.get("reasoning_content"):
+                    events.append({"type": "thought", "text": cont_msg["reasoning_content"]})
+                msg = {"role": "assistant", "content": partial + more,
+                       "finish_reason": cont_msg.get("finish_reason")}
+                if cont_msg.get("usage"):
+                    msg["usage"] = cont_msg["usage"]
+                # 续写时模型改了主意想调工具：停止续写，按无工具收尾处理
+                if cont_msg.get("tool_calls"):
+                    break
+                if not more.strip():
+                    break
 
             # 记录本轮真实占用：优先服务商的 prompt_tokens，拿不到就按字符估算
             _ctx_used = _split_usage(msg.get("usage")) or _estimate_tokens(msgs)
@@ -1185,10 +1282,12 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
 
             tool_calls = msg.get("tool_calls") or []
             if not tool_calls:
-                # 输出被 max_tokens 截断：正文多半是半截工具调用标记，不能当答复返回
+                # 续写后仍被截断：内容已经流式显示给用户了，别丢，末尾加一句说明
                 if msg.get("finish_reason") == "length":
-                    return ("这次回答被长度上限截断了，没能完成。"
-                            "可以让我拆成更小的步骤再来一次。")
+                    body = (msg.get("content") or "").strip()
+                    note = ("\n\n（以上内容到了输出上限，续写也没能收尾；"
+                            "要我接着写就说「继续」。）")
+                    return (body + note) if body else note.strip()
                 return msg.get("content") or "（没有回复内容）"
 
             # 有工具调用：本轮流式输出的内容是中间话，作废（最终答复会重新流式）
@@ -1257,7 +1356,7 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
                     except Exception:
                         pass
         # 工具轮数用尽：最后再不给工具地问一次，让它基于已有结果收尾回答
-        msg = await llm.chat_with_tools_stream(msgs, [], on_delta)
+        msg = await llm.chat_with_tools_stream(msgs, [], on_delta, max_tokens=_output_budget(msgs))
         if msg.get("reasoning_content"):
             events.append({"type": "thought", "text": msg["reasoning_content"]})
         answer = (msg.get("content") or "").strip()

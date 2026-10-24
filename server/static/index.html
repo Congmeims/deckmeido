@@ -62,6 +62,23 @@
   }
   .badge.warn { color: #b8860b; }
   .badge.danger { color: #d0492b; }
+  /* 控件自检徽章：小灯 + 「x/x」计数，位置在电量徽章左侧 */
+  .badge.ctrl {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-variant-numeric: tabular-nums;
+  }
+  .ctrl .lamp {
+    width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto;
+    background: var(--muted); box-shadow: 0 0 0 1px rgba(0,0,0,.18) inset;
+  }
+  .ctrl.ok .lamp { background: #2ecc71; }
+  .ctrl.warn .lamp { background: #e6b422; }
+  .ctrl.danger .lamp { background: #e04a4a; animation: ctrlPulse 1.6s ease-in-out infinite; }
+  .ctrl.ok { color: var(--muted); }
+  .ctrl.warn { color: #b8860b; }
+  .ctrl.danger { color: #d0492b; }
+  @keyframes ctrlPulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  @media (prefers-reduced-motion: reduce) { .ctrl .lamp { animation: none !important; } }
   /* 右上角状态区：整组靠右对齐 */
   .hdr-right {
     margin-left: auto;
@@ -684,6 +701,50 @@
     #send { min-width: 48px; padding: 0 12px; font-size: 14px; }
     .cb-btn { padding: 0 8px; }
   }
+  /* 控件自检面板：点右上角徽章弹出 */
+  #ctrlPanel {
+    position: fixed; inset: 0;
+    background: var(--overlay);
+    display: none;
+    align-items: flex-end;
+    z-index: 22;
+  }
+  #ctrlPanel.show { display: flex; }
+  #ctrlBadge { cursor: pointer; }
+  #ctrlBadge:active { opacity: .7; }
+  .ctrl-list { display: flex; flex-direction: column; gap: 2px; margin-bottom: 12px; }
+  .ctrl-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 2px;
+    border-bottom: 1px solid var(--line);
+    font-size: 14px;
+  }
+  .ctrl-row:last-child { border-bottom: none; }
+  .ctrl-row .lamp {
+    width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto;
+    background: var(--muted);
+    box-shadow: 0 0 0 1px rgba(0,0,0,.18) inset;
+  }
+  .ctrl-row.ok .lamp { background: #2ecc71; }
+  .ctrl-row.bad .lamp { background: #e04a4a; }
+  .ctrl-row .nm { flex: 0 0 auto; min-width: 62px; }
+  .ctrl-row .ds { flex: 1; min-width: 0; color: var(--muted); font-size: 12.5px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ctrl-row.bad .ds { color: #d0492b; }
+  .ctrl-yd {
+    font-size: 12.5px; color: var(--muted);
+    background: var(--surface-2); border-radius: 10px;
+    padding: 10px 12px; line-height: 1.6; margin-bottom: 12px;
+  }
+  .ctrl-yd b { color: var(--text); font-weight: 600; }
+  .ctrl-actions { display: flex; gap: 10px; }
+  .ctrl-actions button { flex: 1; }
+  .ctrl-actions button.mini-btn { flex: 0 0 auto; }
+  .ctrl-log {
+    margin-top: 10px; font-family: ui-monospace, monospace; font-size: 11.5px;
+    color: var(--muted); white-space: pre-wrap; word-break: break-word;
+    max-height: 160px; overflow: auto;
+  }
   /* 代码块全屏查看 */
   #codeView { display: none; position: fixed; inset: 0; z-index: 45; background: var(--overlay); align-items: center; justify-content: center; }
   #codeView.show { display: flex; }
@@ -721,6 +782,7 @@
   <span class="spacer"></span>
   <div class="hdr-right">
     <span class="badge" id="ctxBadge" hidden></span>
+    <span class="badge ctrl" id="ctrlBadge" hidden></span>
     <span class="badge" id="batteryBadge" hidden></span>
     <span class="badge" id="modeBadge" hidden></span>
   </div>
@@ -861,6 +923,21 @@
   </div>
 </div>
 
+<div id="ctrlPanel">
+  <div class="sheet">
+    <h2>桌面控件自检</h2>
+    <div class="ctrl-list" id="ctrlList"></div>
+    <div class="ctrl-yd" id="ctrlYd"></div>
+    <div class="ctrl-actions">
+      <button id="ctrlFix" type="button">一键修复</button>
+      <button id="ctrlReflash" class="mini-btn" type="button">重新实测</button>
+    </div>
+    <div id="ctrlHint" class="upd-note"></div>
+    <div id="ctrlLog" class="ctrl-log"></div>
+    <button id="ctrlClose" class="mini-btn" type="button" style="margin-top:12px;width:100%">关闭</button>
+  </div>
+</div>
+
 <script>
 (function () {
   var messages = document.getElementById('messages');
@@ -869,6 +946,7 @@
   var dot = document.getElementById('dot');
   var statusText = document.getElementById('statusText');
   var batteryBadge = document.getElementById('batteryBadge');
+  var ctrlBadge = document.getElementById('ctrlBadge');
   var modeBadge = document.getElementById('modeBadge');
   var ctxBadge = document.getElementById('ctxBadge');
   var authOverlay = document.getElementById('authOverlay');
@@ -1376,7 +1454,133 @@
     return String(n);
   }
 
+  function renderControls(c) {
+    // 控制类控件自检：绿/黄/红灯 + 「可用数/总数」，点开可看明细与修复
+    lastControls = c || null;
+    if (!c || !c.total) { ctrlBadge.hidden = true; return; }
+    ctrlBadge.hidden = false;
+    ctrlBadge.className = 'badge ctrl ' + (c.level || 'ok');
+    var lamp = document.createElement('span');
+    lamp.className = 'lamp';
+    var txt = document.createElement('span');
+    txt.textContent = c.ok + '/' + c.total;
+    ctrlBadge.replaceChildren(lamp, txt);
+
+    // 悬停看明细（桌面端）；触屏点开面板看同样的内容
+    var lines = ['控制类控件 ' + c.ok + '/' + c.total + ' 可用（点击查看明细）'];
+    (c.items || []).forEach(function (it) {
+      lines.push((it.ok ? '✓ ' : '✗ ') + it.label + (it.ok ? '' : '：' + (it.detail || '不可用')));
+    });
+    var yd = c.ydotoold;
+    if (yd) {
+      lines.push('ydotoold：' + (yd.active ? '运行中' : '未运行')
+        + (yd.enabled ? '（已设开机自启）' : '（未设开机自启）'));
+    }
+    ctrlBadge.title = lines.join('\n');
+    if (ctrlPanel.classList.contains('show')) fillCtrlPanel(c);
+  }
+
+  // ---------- 控件自检面板 ----------
+  var ctrlPanel = document.getElementById('ctrlPanel');
+  var ctrlList = document.getElementById('ctrlList');
+  var ctrlYd = document.getElementById('ctrlYd');
+  var ctrlHint = document.getElementById('ctrlHint');
+  var ctrlLog = document.getElementById('ctrlLog');
+  var ctrlFixBtn = document.getElementById('ctrlFix');
+  var lastControls = null;
+
+  function fillCtrlPanel(c) {
+    if (!c || !c.total) return;
+    ctrlList.replaceChildren();
+    (c.items || []).forEach(function (it) {
+      var row = document.createElement('div');
+      row.className = 'ctrl-row ' + (it.ok ? 'ok' : 'bad');
+      var lamp = document.createElement('span'); lamp.className = 'lamp';
+      var nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = it.label;
+      var ds = document.createElement('span'); ds.className = 'ds';
+      ds.textContent = it.ok ? '可用' : (it.detail || '不可用');
+      if (!it.ok && it.detail) ds.title = it.detail;
+      row.append(lamp, nm, ds);
+      ctrlList.appendChild(row);
+    });
+
+    var yd = c.ydotoold || {};
+    ctrlYd.replaceChildren();
+    var b1 = document.createElement('b');
+    b1.textContent = 'ydotoold：';
+    var s1 = document.createElement('span');
+    s1.textContent = (yd.active ? '运行中' : '未运行')
+      + (yd.enabled ? '，已设开机自启（重启后自动恢复）' : '，未设开机自启（重启后会失效）');
+    ctrlYd.append(b1, s1);
+
+    // 免密 sudo 才可能一键装包；否则引导去终端
+    if (c.sudo_nopasswd) {
+      ctrlFixBtn.textContent = '一键修复';
+      ctrlHint.textContent = '';
+    } else {
+      ctrlFixBtn.textContent = '修复守护进程';
+      ctrlHint.textContent = '装系统包需要 sudo 密码，网页这边只能修守护进程。'
+        + '要补装控件请在终端执行：bash install.sh check --fix';
+    }
+  }
+
+  function openCtrlPanel() {
+    ctrlLog.textContent = '';
+    ctrlPanel.classList.add('show');
+    ctrlHint.textContent = '正在实测…';
+    fetchCtrl(true);
+  }
+  function closeCtrlPanel() { ctrlPanel.classList.remove('show'); }
+
+  function fetchCtrl(force) {
+    return fetch('/api/controls?force=' + (force ? 1 : 0) + '&token=' + encodeURIComponent(token))
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (c) {
+        if (!c) { ctrlHint.textContent = '读取失败'; return null; }
+        fillCtrlPanel(c);
+        renderControls(c);
+        return c;
+      })
+      .catch(function () { ctrlHint.textContent = '读取失败（连接异常）'; return null; });
+  }
+
+  function runCtrlFix(full) {
+    ctrlFixBtn.disabled = true;
+    ctrlHint.textContent = '处理中…';
+    ctrlLog.textContent = '';
+    fetch('/api/controls/fix?full=' + (full ? 1 : 0) + '&token=' + encodeURIComponent(token), { method: 'POST' })
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        var lines = (res.results || []).map(function (x) {
+          return (x.ok ? '✓ ' : '✗ ') + x.message;
+        });
+        ctrlLog.textContent = lines.join('\n');
+        if (res.results && res.results.length === 1 && res.results[0].key === 'ydotoold'
+            && !res.results[0].ok && !res.hint) {
+          ctrlLog.textContent += '\n（完整修复请在终端：bash install.sh check --fix）';
+        }
+        if (res.hint) ctrlHint.textContent = res.hint;
+        if (res.controls) { fillCtrlPanel(res.controls); renderControls(res.controls); }
+      })
+      .catch(function () { ctrlLog.textContent = '修复请求失败（连接异常）'; })
+      .then(function () { ctrlFixBtn.disabled = false; });
+  }
+
+  ctrlBadge.addEventListener('click', openCtrlPanel);
+  document.getElementById('ctrlClose').addEventListener('click', closeCtrlPanel);
+  ctrlPanel.addEventListener('click', function (e) { if (e.target === ctrlPanel) closeCtrlPanel(); });
+  document.getElementById('ctrlReflash').addEventListener('click', function () {
+    ctrlHint.textContent = '重新实测中…';
+    fetchCtrl(true);
+  });
+  ctrlFixBtn.addEventListener('click', function () {
+    var c = lastControls;
+    // 能免密 sudo 才尝试装包；否则只修守护进程
+    runCtrlFix(!!(c && c.sudo_nopasswd));
+  });
+
   function renderStatus(s) {
+    renderControls(s.controls);
     if (s.battery != null) {
       batteryBadge.hidden = false;
       batteryBadge.textContent = s.battery + '%' + (s.charging === 'Charging' ? ' 充电中' : '');

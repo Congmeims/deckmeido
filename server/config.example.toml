@@ -18,6 +18,11 @@ timeout = 60
 # 思维链强度：low / medium / high。多数服务商不传这个字段就不返回 reasoning_content，
 # 留空字符串则不发送该参数（由服务商默认决定）
 reasoning_effort = "high"
+# 单次输出上限（tokens）。0 = 用满上下文剩余空间（跟随 context_window），
+# 长答复因此不会被固定的小额度硬截断；填具体数字可自行收窄。
+max_output_tokens = 0
+# 撞到输出上限时自动续写几轮（0 = 不续写，直接以当前内容收尾）
+max_continuations = 3
 
 [agent]
 # agent 单轮最多连续调用工具次数（0 = 不限，直到模型自己收尾）

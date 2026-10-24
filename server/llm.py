@@ -81,12 +81,18 @@ class LLMClient:
         return data["choices"][0]["message"]
 
     async def chat_with_tools_stream(self, messages: list[dict], tools: list[dict],
-                                     on_delta=None, on_thought=None) -> dict:
-        """流式调用：正文增量经 on_delta、思维链增量经 on_thought 回调，最终返回聚合后的完整 message"""
+                                     on_delta=None, on_thought=None,
+                                     max_tokens: int | None = None) -> dict:
+        """流式调用：正文增量经 on_delta、思维链增量经 on_thought 回调，最终返回聚合后的完整 message
+
+        max_tokens 传入时覆盖实例默认值，供上层按当前上下文剩余空间动态放大输出额度。
+        """
+        budget = self.max_tokens if max_tokens is None else max_tokens
         payload = {"model": self.model, "messages": messages,
                    "tools": tools, "tool_choice": "auto", "stream": True,
-                   "stream_options": {"include_usage": True},
-                   "max_tokens": self.max_tokens}
+                   "stream_options": {"include_usage": True}}
+        if budget and budget > 0:
+            payload["max_tokens"] = budget
         if self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort
         content_parts: list[str] = []
