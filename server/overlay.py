@@ -1,4 +1,4 @@
-"""DeckMate 操作遮罩
+"""DeckMeido 操作遮罩
 
 agent 操作这台设备期间，在桌面上叠加一层半透明全屏遮罩，显示当前正在做什么。
 用户点一下遮罩（触摸屏轻触、鼠标点击、触摸板点击均可）立刻调用 /api/cancel
@@ -210,7 +210,7 @@ class Mask(QWidget):
             return
         self.phase = (self.phase + 1) % 60
         dots = "." * (1 + (self.phase // 20) % 3)
-        self.title.setText(f"DeckMate 正在操作这台设备{dots}")
+        self.title.setText(f"DeckMeido 正在操作这台设备{dots}")
         self.update()
 
     def paintEvent(self, _ev):
@@ -229,7 +229,7 @@ class Mask(QWidget):
 
 def main() -> int:
     app = QApplication([])
-    app.setApplicationName("DeckMateOverlay")
+    app.setApplicationName("DeckMeidoOverlay")
     app.setFont(ui_font(13))
     mask = Mask()
     mask.hide()

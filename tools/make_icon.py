@@ -4,20 +4,24 @@
 输出：assets/logo.png、server/static/logo.png、server/static/favicon.png
 """
 import base64
+import subprocess
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "assets" / "icon-src" / "icon.svg"
 
+CHROME = [r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+          r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+          r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+          r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"]
+
 
 def _from_chrome(svg: bytes, size: int) -> bytes:
     """用本机浏览器渲染 SVG（无第三方依赖）"""
-    import subprocess
-    import tempfile
-
     html = (
         '<html><body style="margin:0">'
-        f'<img id="i" src="data:image/svg+xml;base64,{base64.b64encode(svg).decode()}" '
+        f'<img src="data:image/svg+xml;base64,{base64.b64encode(svg).decode()}" '
         f'width="{size}" height="{size}">'
         "</body></html>"
     )
@@ -25,10 +29,7 @@ def _from_chrome(svg: bytes, size: int) -> bytes:
         p = Path(d) / "i.html"
         p.write_text(html, encoding="utf-8")
         out = Path(d) / "i.png"
-        for exe in (r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-                    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-                    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-                    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"):
+        for exe in CHROME:
             if not Path(exe).exists():
                 continue
             subprocess.run([exe, "--headless", "--disable-gpu", "--hide-scrollbars",

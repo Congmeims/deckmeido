@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0f1117">
 <link rel="icon" type="image/png" href="/favicon.png">
-<title>DeckMate</title>
+<title>DeckMeido</title>
 <style>
   :root {
     --bg: #0f1117;
@@ -78,6 +78,7 @@
     -webkit-overflow-scrolling: touch;
   }
   .msg {
+    position: relative;
     max-width: 85%;
     padding: 10px 14px;
     border-radius: 16px;
@@ -116,6 +117,31 @@
     font-size: 12px; padding: 2px 6px; border-radius: 6px; cursor: pointer;
   }
   .msg-act:hover { background: var(--hover); color: var(--text); }
+
+  /* 分享选择模式：每条回合左侧出现对勾，选中后高亮 */
+  #messages.share-pick .msg { padding-left: 30px; cursor: pointer; }
+  #messages.share-pick .msg::before {
+    content: ''; position: absolute; left: 6px; top: 12px;
+    width: 18px; height: 18px; border-radius: 50%;
+    border: 1.5px solid var(--line); background: var(--surface);
+  }
+  #messages.share-pick .msg.on::before {
+    border-color: var(--brand); background: var(--brand);
+  }
+  #messages.share-pick .msg.on::after {
+    content: ''; position: absolute; left: 11px; top: 18px;
+    width: 8px; height: 4px; border-left: 2px solid #fff; border-bottom: 2px solid #fff;
+    transform: rotate(-45deg);
+  }
+  #messages.share-pick .msg-act, #messages.share-pick .msg-foot { display: none; }
+  #shareBar {
+    display: none; position: sticky; bottom: 0; z-index: 30;
+    padding: 10px 16px; gap: 10px; align-items: center;
+    background: var(--surface-2); border-top: 1px solid var(--line);
+  }
+  #shareBar.show { display: flex; }
+  #shareBar button:disabled { opacity: .45; cursor: default; }
+  #shareBar .grow { flex: 1; font-size: 13px; color: var(--muted); }
 
   /* markdown 内容 */
   .msg pre { background: var(--code-bg); padding: 10px 12px; border-radius: 8px; overflow-x: auto; margin: 6px 0; font-size: 13px; }
@@ -348,24 +374,14 @@
   }
 
   /* 设置按钮与面板 */
-  /* 顶部右侧两个按钮并排：主题占 1/4，设置占 3/4，等距间隔 */
-  .hdr-acts {
-    flex: 0 0 auto;
-    display: flex; align-items: center; gap: 8px;
-    width: 200px;
-  }
-  .hdr-acts > button {
-    height: 36px; padding: 0 6px;
-    border: 1px solid var(--line); border-radius: 10px;
+  /* 主题与设置放在输入栏左下角，排在 ＋ 之前 */
+  #btnTheme, #settingsBtn {
+    height: 30px; padding: 0 12px;
+    border: 1px solid var(--line); border-radius: 8px;
     background: var(--surface-2); color: var(--muted);
     font-size: 13px; cursor: pointer; white-space: nowrap;
-    min-width: 0;
   }
-  #btnTheme { flex: 1 1 0; }
-  #settingsBtn { flex: 3 1 0; }
-  @media (max-width: 760px) {
-    .hdr-acts { width: 150px; }
-  }
+  #btnTheme:hover, #settingsBtn:hover { color: var(--text); }
   #settingsPanel {
     position: fixed; inset: 0;
     background: var(--overlay);
@@ -545,23 +561,19 @@
 <header>
   <button class="cb-btn" id="btnMenu" title="菜单">菜单</button>
   <span class="dot" id="dot"></span>
-  <span class="logo">DeckMate</span>
+  <span class="logo">DeckMeido</span>
   <span class="status-text" id="statusText">连接中…</span>
   <span class="spacer"></span>
   <span class="badge" id="ctxBadge" hidden></span>
   <span class="badge" id="batteryBadge" hidden></span>
   <span class="badge" id="modeBadge" hidden></span>
-  <div class="hdr-acts">
-    <button id="btnTheme">深色模式</button>
-    <button id="settingsBtn" title="设置">设置</button>
-  </div>
 </header>
 
 <div id="shareOverlay">
   <div class="share-box">
     <img id="shareImg" alt="对话分享图">
     <div style="display:flex; gap:10px; margin-top:12px;">
-      <a id="shareDownload" download="deckmate-chat.png"><button class="menu-btn" style="padding:10px 20px;">下载图片</button></a>
+      <a id="shareDownload" download="deckmeido-chat.png"><button class="menu-btn" style="padding:10px 20px;">下载图片</button></a>
       <button class="menu-btn" id="shareClose" style="padding:10px 20px;">关闭</button>
     </div>
   </div>
@@ -569,11 +581,20 @@
 
 <div id="messages"></div>
 
+<div id="shareBar">
+  <button class="menu-btn" id="shareAll">全选</button>
+  <span class="grow" id="shareCount">已选 0 条</span>
+  <button class="menu-btn" id="shareGen">生成图片</button>
+  <button class="menu-btn" id="shareCancel">取消</button>
+</div>
+
 <div id="composer">
   <div id="queueBox"></div>
   <textarea id="input" rows="1" placeholder="@ 添加上下文，/ 使用命令" enterkeyhint="send"></textarea>
   <div id="composerBar">
     <div class="cb-left">
+      <button class="cb-btn" id="btnTheme" title="切换主题">深色模式</button>
+      <button class="cb-btn" id="settingsBtn" title="设置">设置</button>
       <button class="cb-btn" id="btnPlus" title="添加附件/引用" style="font-size:16px">＋</button>
       <select class="cb-select" id="permSelect" title="AI 控制权限">
         <option value="manual">手动审批</option>
@@ -611,7 +632,7 @@
 <input type="file" id="imgInput" accept="image/*" hidden>
 
 <div id="authOverlay">
-  <h1>DeckMate 控制台</h1>
+  <h1>DeckMeido 控制台</h1>
   <p>请输入访问令牌（token）。<br>令牌可在 Deck 的 ~/deckmate/server/config.toml 中查看。</p>
   <input id="tokenInput" type="password" placeholder="token" autocomplete="off">
   <button id="tokenBtn">连接</button>
@@ -744,7 +765,7 @@
     var acts = document.createElement('div');
     acts.className = 'msg-acts';
     acts.appendChild(makeActBtn('重试', function () { retryMsg(el); }));
-    acts.appendChild(makeActBtn('分享', function () { shareMsg(el); }));
+    acts.appendChild(makeActBtn('分享', function () { enterSharePick(el); }));
     foot.appendChild(acts);
     var t = document.createElement('span');
     t.className = 'time';
@@ -1368,19 +1389,75 @@
   var shareImg = document.getElementById('shareImg');
   var shareDownload = document.getElementById('shareDownload');
 
-  function shareMsg(el) {
-    // 分享内容取这条回复 + 紧邻在它前面的事件容器，还原上下文
-    var picked = [el];
-    var prev = el.previousElementSibling;
-    if (prev && prev.classList.contains('events')) picked.unshift(prev);
-    renderShare(picked);
+  // ---------- 分享：进入选择模式，勾选需要分享的回合再生成图片 ----------
+  var shareBar = document.getElementById('shareBar');
+  var shareCount = document.getElementById('shareCount');
+
+  function enterSharePick(el) {
+    // 只有一条回复时就近选它，其余情况默认全不选，避免误带整段对话
+    var all = messages.querySelectorAll('.msg.user, .msg.assistant');
+    if (all.length === 1) el.classList.add('on');
+    else if (el && el.classList.contains('msg')) el.classList.add('on');
+    messages.classList.add('share-pick');
+    shareBar.classList.add('show');
+    updateShareCount();
+    messages.scrollTop = 0;
   }
+
+  function exitSharePick() {
+    messages.classList.remove('share-pick');
+    shareBar.classList.remove('show');
+    Array.prototype.forEach.call(messages.querySelectorAll('.msg.on'), function (m) {
+      m.classList.remove('on');
+    });
+  }
+
+  function updateShareCount() {
+    var n = messages.querySelectorAll('.msg.on').length;
+    shareCount.textContent = '已选 ' + n + ' 条';
+    document.getElementById('shareGen').disabled = !n;
+  }
+
+  // 选择模式下点消息气泡即切换勾选
+  messages.addEventListener('click', function (e) {
+    if (!messages.classList.contains('share-pick')) return;
+    var el = e.target.closest('.msg');
+    if (!el || !(el.classList.contains('user') || el.classList.contains('assistant'))) return;
+    el.classList.toggle('on');
+    updateShareCount();
+  });
+
+  document.getElementById('shareAll').addEventListener('click', function () {
+    var all = messages.querySelectorAll('.msg.user, .msg.assistant');
+    var on = messages.querySelectorAll('.msg.on').length === all.length;
+    Array.prototype.forEach.call(all, function (m) { m.classList.toggle('on', !on); });
+    updateShareCount();
+  });
+
+  document.getElementById('shareCancel').addEventListener('click', exitSharePick);
+
+  document.getElementById('shareGen').addEventListener('click', function () {
+    // 按屏幕上的顺序收集选中的回合
+    var picked = [];
+    Array.prototype.forEach.call(messages.children, function (node) {
+      if (node.classList.contains('msg') && node.classList.contains('on')) picked.push(node);
+    });
+    if (!picked.length) return;
+    exitSharePick();
+    renderShare(picked);
+  });
 
   document.getElementById('shareClose').addEventListener('click', function () {
     shareOverlay.classList.remove('show');
   });
 
-  // 把消息画到 canvas（深色卡片风格）
+  // 从气泡里只取正文，跳过思维链/事件/时间/操作按钮
+  function bubbleText(el) {
+    var body = el.querySelector(':scope > div:not(.msg-foot)');
+    return (body ? body.innerText : el.textContent).trim();
+  }
+
+  // 把选中的回合画到 canvas（深色卡片风格）
   function renderShare(picked) {
     var W = 760, PAD = 28, GAP = 14, BW = W - PAD * 2;
     var canvas = document.createElement('canvas');
@@ -1390,7 +1467,7 @@
     // 预排版：每条消息算出行和高度
     var items = picked.map(function (el) {
       var isUser = el.classList.contains('user');
-      var text = el.textContent.replace(/\d{2}:\d{2}$/, '').trim();  // 去掉末尾时间
+      var text = bubbleText(el);
       var words = text.split(''), lines = [], line = '';
       var maxW = BW * (isUser ? 0.75 : 0.85) - 28;
       for (var i = 0; i < words.length; i++) {
@@ -1409,7 +1486,7 @@
     ctx.fillRect(0, 0, W, H);
     ctx.font = 'bold 22px system-ui, sans-serif';
     ctx.fillStyle = '#1a9fff';
-    ctx.fillText('DeckMate 对话', PAD, PAD + 10);
+    ctx.fillText('DeckMeido 对话', PAD, PAD + 10);
     ctx.font = '13px system-ui, sans-serif';
     ctx.fillStyle = '#8b91a3';
     ctx.fillText(new Date().toLocaleString(), PAD, PAD + 34);

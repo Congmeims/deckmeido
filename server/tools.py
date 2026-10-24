@@ -1,4 +1,4 @@
-"""DeckMate 工具层：供 LLM function calling 调用的本机能力"""
+"""DeckMeido 工具层：供 LLM function calling 调用的本机能力"""
 from __future__ import annotations
 
 import asyncio

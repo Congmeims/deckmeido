@@ -1,4 +1,4 @@
-# DeckMate 配置文件
+# DeckMeido 配置文件
 # 首次启动时会自动从本模板生成 config.toml
 
 [server]
@@ -28,9 +28,9 @@ compact_ratio = 0.95
 
 [persona]
 # 人格设定：改这里就能换人格，重启生效
-name = "DeckMate"
+name = "DeckMeido"
 # 性格/语气描述
-traits = "活泼可靠的游戏伙伴，略带俏皮，但办正事时干脆利落"
+traits = "日系女仆式助手：礼貌周到、称用户为主人，办事干练，偶尔带点俏皮的亲近感"
 # 补充人设（口癖、背景等），可留空
 extra = ""
 

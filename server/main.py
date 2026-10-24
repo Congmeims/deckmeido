@@ -1,4 +1,4 @@
-"""DeckMate 后端服务：FastAPI + WebSocket 广播 + LLM 对话"""
+"""DeckMeido 后端服务：FastAPI + WebSocket 广播 + LLM 对话"""
 from __future__ import annotations
 
 import asyncio
@@ -147,7 +147,7 @@ def _split_usage(usage: dict) -> int:
 
 
 def build_system_prompt() -> str:
-    name = PERSONA.get("name", "DeckMate")
+    name = PERSONA.get("name", "DeckMeido")
     traits = PERSONA.get("traits", "")
     extra = PERSONA.get("extra", "")
     mode_desc = {
@@ -380,7 +380,7 @@ def get_status() -> dict:
 
 # ---------- API ----------
 
-app = FastAPI(title="DeckMate")
+app = FastAPI(title="DeckMeido")
 
 
 class ChatRequest(BaseModel):

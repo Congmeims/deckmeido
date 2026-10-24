@@ -1,6 +1,6 @@
 [Desktop Entry]
-Name=DeckMate
-Comment=DeckMate AI 客户端
+Name=DeckMeido
+Comment=DeckMeido AI 客户端
 Exec=/home/deck/deckmate/.venv/bin/python /home/deck/deckmate/client/main.py
 Icon=/home/deck/deckmate/assets/logo.png
 Type=Application

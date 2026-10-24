@@ -1,4 +1,4 @@
-"""DeckMate 原生客户端（PySide6 + QWebEngineView）
+"""DeckMeido 原生客户端（PySide6 + QWebEngineView）
 
 内嵌与网页端同一个界面（http://127.0.0.1:18765），两端功能界面永远一致：
 以后每次更新只改 server/static/index.html 一处。
@@ -63,7 +63,7 @@ def main() -> int:
     except ImportError:
         app = QApplication(sys.argv)
         QMessageBox.critical(
-            None, "DeckMate",
+            None, "DeckMeido",
             "缺少 PySide6-WebEngine 组件，请在终端运行：\n"
             "~/deckmate/.venv/bin/pip install PySide6-WebEngine",
         )
@@ -84,15 +84,15 @@ def main() -> int:
 
     QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
-    app.setApplicationName("DeckMate")
+    app.setApplicationName("DeckMeido")
 
     if not ensure_backend():
-        QMessageBox.critical(None, "DeckMate", "后端核心启动失败，请检查 ~/deckmate 是否完整。")
+        QMessageBox.critical(None, "DeckMeido", "后端核心启动失败，请检查 ~/deckmate 是否完整。")
         return 1
 
     view = QWebEngineView()
     view.setPage(WebPage(view))
-    view.setWindowTitle("DeckMate")
+    view.setWindowTitle("DeckMeido")
     view.resize(WINDOW_W, WINDOW_H)
     icon_path = DECKMATE_DIR / "assets" / "logo.png"
     if icon_path.exists():
@@ -100,7 +100,7 @@ def main() -> int:
     view.load(QUrl(f"{API}/?token={load_token()}&native=1"))
     view.show()
     # 只放大这个网页，不影响系统里其他 Qt 程序；网页端（浏览器打开）保持原样
-    view.setZoomFactor(2.0)
+    view.setZoomFactor(1.2)
     return app.exec()
 
 
