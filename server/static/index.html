@@ -56,6 +56,12 @@
   }
   .badge.warn { color: #b8860b; }
   .badge.danger { color: #d0492b; }
+  /* 右上角状态区：整组靠右对齐 */
+  .hdr-right {
+    margin-left: auto;
+    display: flex; align-items: center; justify-content: flex-end;
+    gap: 8px; flex-wrap: wrap;
+  }
 
   /* 通用胶囊按钮（分享弹窗等） */
   .menu-btn {
@@ -200,6 +206,13 @@
     max-height: 280px; overflow-y: auto;
   }
   .tl.open .tl-body { display: block; }
+  /* 截图行：正文块收缩到图片宽度，并解除 280px 高度裁切，完整显示整张图 */
+  .tl.open .tl-body.pic {
+    width: fit-content; max-width: 92%;
+    max-height: none; overflow: visible;
+    padding: 6px; white-space: normal;
+  }
+  .tl-body.pic .shot { display: block; width: auto; max-width: 100%; height: auto; }
   .tl-body.term {
     background: var(--code-bg); color: var(--code-text);
     font-family: ui-monospace, monospace; font-size: 12px;
@@ -211,7 +224,9 @@
   .tl-file .fname { color: var(--brand); }
   .tl-file .add { color: #2ecc71; }
   .tl-file .del { color: #e8463a; }
-  .tl-body .shot { display: block; max-width: 100%; border-radius: 8px; border: 1px solid var(--line); }
+  .tl-body .shot { display: block; width: auto; max-width: 100%; height: auto; border-radius: 8px; border: 1px solid var(--line); cursor: zoom-in; }
+  /* 截图缩略图：按对话区宽度的 30% 显示，气泡跟着收缩；窄屏保底 160px */
+  .tl-body.pic .shot { width: 30vw; min-width: 160px; max-width: 100%; }
   .stream-body { white-space: pre-wrap; word-break: break-word; }
   #send.stop { background: var(--danger); }
 
@@ -244,6 +259,7 @@
     padding-bottom: calc(10px + env(safe-area-inset-bottom));
     background: var(--surface);
     border-top: 1px solid var(--line);
+    position: relative;   /* 供 ＋ 菜单 / 命令菜单定位 */
   }
   #composerBar { display: flex; align-items: center; gap: 8px; }
   .cb-left { display: flex; gap: 8px; flex: 0 0 auto; }
@@ -279,16 +295,20 @@
   }
   .msg img.chat-img { display: block; max-width: 100%; border-radius: 8px; margin: 6px 0; }
   /* 附件菜单 / 文件选择弹层 */
+  /* 弹层贴输入框左上方展开，左边距与下边距保持同一间距 */
   #plusMenu, #fileList {
-    display: none; position: fixed; z-index: 25;
-    left: 12px; bottom: 120px;
+    display: none; position: absolute; z-index: 25;
+    left: 12px; bottom: calc(100% + 12px);
     background: var(--surface-2); border: 1px solid var(--line);
     border-radius: 12px; padding: 6px; min-width: 200px;
+    max-width: calc(100% - 24px);
     flex-direction: column; gap: 2px;
-    box-shadow: 0 8px 30px rgba(0,0,0,.5);
+    box-shadow: 0 4px 14px rgba(0,0,0,.16);
   }
   #plusMenu.show { display: flex; }
   #fileList.show { display: flex; max-height: 40dvh; overflow-y: auto; }
+  /* 命令菜单内容较多，给个更宽的底宽，左对齐展开 */
+  #fileList { min-width: 260px; }
   #plusMenu button, #fileList button {
     border: none; background: none; color: var(--text);
     text-align: left; padding: 10px 12px; border-radius: 8px;
@@ -374,13 +394,18 @@
   }
 
   /* 设置按钮与面板 */
-  /* 主题与设置放在输入栏左下角，排在 ＋ 之前 */
-  #btnTheme, #settingsBtn {
-    height: 30px; padding: 0 12px;
-    border: 1px solid var(--line); border-radius: 8px;
-    background: var(--surface-2); color: var(--muted);
-    font-size: 13px; cursor: pointer; white-space: nowrap;
+  /* 主题与设置放在侧栏「会话」区域底部 */
+  .sb-foot {
+    display: flex; gap: 8px; padding: 8px 8px 10px;
+    border-top: 1px solid var(--line);
   }
+  #btnTheme, #settingsBtn {
+    height: 34px; border: 1px solid var(--line); border-radius: 10px;
+    background: var(--surface-2); color: var(--muted);
+    font-size: 12.5px; cursor: pointer; white-space: nowrap;
+  }
+  #btnTheme { flex: 3; }
+  #settingsBtn { flex: 1; }
   #btnTheme:hover, #settingsBtn:hover { color: var(--text); }
   #settingsPanel {
     position: fixed; inset: 0;
@@ -555,6 +580,10 @@
   </div>
   <div class="sb-sess-head"><span>会话</span><button id="btnNewSess" title="新会话">＋</button></div>
   <div id="sessList"></div>
+  <div class="sb-foot">
+    <button id="btnTheme" title="切换主题">深色模式</button>
+    <button id="settingsBtn" title="设置">设置</button>
+  </div>
 </aside>
 <main id="main">
 
@@ -564,9 +593,11 @@
   <span class="logo">DeckMeido</span>
   <span class="status-text" id="statusText">连接中…</span>
   <span class="spacer"></span>
-  <span class="badge" id="ctxBadge" hidden></span>
-  <span class="badge" id="batteryBadge" hidden></span>
-  <span class="badge" id="modeBadge" hidden></span>
+  <div class="hdr-right">
+    <span class="badge" id="ctxBadge" hidden></span>
+    <span class="badge" id="batteryBadge" hidden></span>
+    <span class="badge" id="modeBadge" hidden></span>
+  </div>
 </header>
 
 <div id="shareOverlay">
@@ -589,12 +620,16 @@
 </div>
 
 <div id="composer">
+  <div id="plusMenu">
+    <button id="pmImage">附加图片</button>
+    <button id="pmFile">引用工作区文件</button>
+    <button id="pmShot">引用当前屏幕截图</button>
+  </div>
+  <div id="fileList"></div>
   <div id="queueBox"></div>
   <textarea id="input" rows="1" placeholder="@ 添加上下文，/ 使用命令" enterkeyhint="send"></textarea>
   <div id="composerBar">
     <div class="cb-left">
-      <button class="cb-btn" id="btnTheme" title="切换主题">深色模式</button>
-      <button class="cb-btn" id="settingsBtn" title="设置">设置</button>
       <button class="cb-btn" id="btnPlus" title="添加附件/引用" style="font-size:16px">＋</button>
       <select class="cb-select" id="permSelect" title="AI 控制权限">
         <option value="manual">手动审批</option>
@@ -623,12 +658,6 @@
   </div>
 </div>
 
-<div id="plusMenu">
-  <button id="pmImage">附加图片</button>
-  <button id="pmFile">引用工作区文件</button>
-  <button id="pmShot">引用当前屏幕截图</button>
-</div>
-<div id="fileList"></div>
 <input type="file" id="imgInput" accept="image/*" hidden>
 
 <div id="authOverlay">
@@ -864,10 +893,13 @@
     } else {
       var arrow = document.createElement('span');
       arrow.className = 'tl-arrow';
-      arrow.textContent = '▸';
+      arrow.textContent = ev.image ? '▾' : '▸';
       r.head.appendChild(arrow);
+      // 截图默认展开，让用户直接看到画面
+      if (ev.image) r.tl.classList.add('open');
       var body = document.createElement('div');
-      body.className = 'tl-body' + (ev.name === 'run_command' ? ' term' : '');
+      body.className = 'tl-body' + (ev.name === 'run_command' ? ' term' : '')
+                       + (ev.image ? ' pic' : '');
       if (ev.diff && ev.path) {
         // 文件改动行：文件名 + 增删行数
         var fr = document.createElement('div');
@@ -1067,7 +1099,10 @@
         case 'assistant_message':
           hideTyping();
           setBusy(false);
-          if (streamEl && streamEl.parentNode) streamEl.parentNode.removeChild(streamEl);
+          if (streamEl && streamEl.parentNode) {
+            // 只发了工具调用、没有正文的中间轮：流式容器只剩底部按钮和时间，整块丢掉
+            streamEl.parentNode.removeChild(streamEl);
+          }
           streamEl = null; streamBody = null;
           if (msg.events && msg.events.length) {
             if (liveBox) {

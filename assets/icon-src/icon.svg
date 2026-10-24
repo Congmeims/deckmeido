@@ -1,12 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#22305A"/>
-      <stop offset="1" stop-color="#0D1424"/>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F7EDF3"/>
+      <stop offset="1" stop-color="#E7D6E2"/>
     </linearGradient>
-    <linearGradient id="hair" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#A6B8E4"/>
-      <stop offset="1" stop-color="#7286BE"/>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3A3644"/>
+      <stop offset="1" stop-color="#26232E"/>
     </linearGradient>
     <clipPath id="clip">
       <rect width="512" height="512" rx="112"/>
@@ -14,66 +14,56 @@
   </defs>
 
   <g clip-path="url(#clip)">
-    <rect width="512" height="512" fill="url(#bg)"/>
-    <circle cx="256" cy="256" r="200" fill="#34497C" opacity="0.5"/>
+    <rect width="512" height="512" fill="#FBF7FA"/>
 
-    <!-- 后发：垂到肩的长发 -->
-    <path fill="url(#hair)" d="M 256 74 q 132 0 140 142 q 6 92 -6 172 q -6 42 -44 48 q -30 4 -40 -26 q -6 -20 0 -62 h -100 q 6 42 0 62 q -10 30 -40 26 q -38 -6 -44 -48 q -12 -80 -6 -172 q 8 -142 140 -142 z"/>
-
-    <!-- 脸 -->
-    <path fill="#FDE7D8" d="M 256 132 q 88 0 88 104 q 0 60 -24 90 q -26 34 -64 34 q -38 0 -64 -34 q -24 -30 -24 -90 q 0 -104 88 -104 z"/>
-
-    <!-- 前发：齐刘海 + 两侧鬓发 -->
-    <path fill="url(#hair)" d="M 256 74 q 122 0 132 126 q -20 -36 -48 -50 q -14 30 -46 34 q -8 -20 -22 -26 q -14 6 -22 26 q -32 -4 -46 -34 q -28 14 -48 50 q 10 -126 132 -126 z"/>
-
-    <!-- 眉毛 -->
-    <path d="M 198 222 q 18 -9 36 -3" stroke="#8697C4" stroke-width="6" fill="none" stroke-linecap="round"/>
-    <path d="M 278 219 q 18 -6 36 3" stroke="#8697C4" stroke-width="6" fill="none" stroke-linecap="round"/>
-
-    <!-- 眼睛：大眼，上深下浅的动漫渐变 -->
-    <ellipse cx="214" cy="256" rx="23" ry="28" fill="#FFFFFF"/>
-    <ellipse cx="298" cy="256" rx="23" ry="28" fill="#FFFFFF"/>
-    <ellipse cx="214" cy="258" rx="17" ry="23" fill="#4FD1CE"/>
-    <ellipse cx="298" cy="258" rx="17" ry="23" fill="#4FD1CE"/>
-    <ellipse cx="214" cy="262" rx="9" ry="13" fill="#12385C"/>
-    <ellipse cx="298" cy="262" rx="9" ry="13" fill="#12385C"/>
-    <circle cx="221" cy="247" r="6.5" fill="#FFFFFF"/>
-    <circle cx="305" cy="247" r="6.5" fill="#FFFFFF"/>
-    <circle cx="206" cy="270" r="4" fill="#FFFFFF" opacity="0.8"/>
-    <circle cx="290" cy="270" r="4" fill="#FFFFFF" opacity="0.8"/>
-    <path d="M 189 236 q 25 -15 50 0" stroke="#39466B" stroke-width="8" fill="none" stroke-linecap="round"/>
-    <path d="M 273 236 q 25 -15 50 0" stroke="#39466B" stroke-width="8" fill="none" stroke-linecap="round"/>
-
-    <!-- 腮红 -->
-    <ellipse cx="178" cy="296" rx="19" ry="10" fill="#F8A9A9" opacity="0.5"/>
-    <ellipse cx="334" cy="296" rx="19" ry="10" fill="#F8A9A9" opacity="0.5"/>
-
-    <!-- 鼻与嘴 -->
-    <path d="M 256 292 q 5 7 -3 9" stroke="#E3B69F" stroke-width="4" fill="none" stroke-linecap="round"/>
-    <path d="M 241 314 q 15 13 30 0" stroke="#DB7C77" stroke-width="5" fill="none" stroke-linecap="round"/>
-
-    <!-- 女仆头饰：白色蕾丝发带 -->
-    <path fill="#FFFFFF" d="M 152 180 q 104 -70 208 0 q -12 24 -32 30 q -72 -46 -144 0 q -20 -6 -32 -30 z"/>
-    <g fill="#FFFFFF">
-      <circle cx="164" cy="194" r="10"/>
-      <circle cx="202" cy="166" r="9"/>
-      <circle cx="256" cy="152" r="9"/>
-      <circle cx="310" cy="166" r="9"/>
-      <circle cx="348" cy="194" r="10"/>
+    <!-- 女仆蕾丝头饰（Steam Deck 顶部） -->
+    <path fill="#FFFFFF" stroke="#DDD2DD" stroke-width="3"
+          d="M 132 190 q 124 -92 248 0 q -12 28 -38 36 q -86 -56 -172 0 q -26 -8 -38 -36 z"/>
+    <g fill="#FFFFFF" stroke="#DDD2DD" stroke-width="3">
+      <circle cx="140" cy="204" r="13"/>
+      <circle cx="186" cy="170" r="12"/>
+      <circle cx="256" cy="152" r="12"/>
+      <circle cx="326" cy="170" r="12"/>
+      <circle cx="372" cy="204" r="13"/>
     </g>
-    <!-- 发带蝴蝶结 -->
-    <path fill="#EC6E92" d="M 138 216 q -36 -34 -46 -8 q -8 22 20 30 q 18 4 26 -22 z"/>
-    <path fill="#EC6E92" d="M 138 216 q -30 24 -18 44 q 10 16 28 4 q 16 -12 4 -48 z"/>
-    <circle cx="142" cy="218" r="12" fill="#C9506F"/>
+    <!-- 头顶黑色蝴蝶结 -->
+    <path fill="#1B1A20" d="M 256 216 q -58 -50 -78 -14 q -14 32 32 42 q 30 6 46 -28 z"/>
+    <path fill="#1B1A20" d="M 256 216 q 58 -50 78 -14 q 14 32 -32 42 q -30 6 -46 -28 z"/>
+    <path fill="#2E2D38" d="M 246 232 l -24 46 l 20 8 l 14 -42 z"/>
+    <path fill="#2E2D38" d="M 266 232 l 24 46 l -20 8 l -14 -42 z"/>
+    <circle cx="256" cy="220" r="16" fill="#111116"/>
+    <!-- 两侧小蝴蝶结 -->
+    <path fill="#1B1A20" d="M 96 222 q -38 -32 -50 -8 q -8 24 22 32 q 20 4 28 -24 z"/>
+    <path fill="#1B1A20" d="M 96 222 q -30 24 -18 44 q 12 16 30 4 q 16 -12 4 -48 z"/>
+    <path fill="#1B1A20" d="M 416 222 q 38 -32 50 -8 q 8 24 -22 32 q -20 4 -28 -24 z"/>
+    <path fill="#1B1A20" d="M 416 222 q 30 24 18 44 q -12 16 -30 4 q -16 -12 -4 -48 z"/>
 
-    <!-- 颈与肩 -->
-    <rect x="234" y="336" width="44" height="26" fill="#F4D8C5"/>
-    <path fill="#F2F6FE" d="M 88 512 q 18 -108 168 -108 q 150 0 168 108 z"/>
-    <!-- 围裙上缘 -->
-    <path fill="#DCE6F7" d="M 200 414 q 56 -26 112 0 q -8 42 -56 58 q -48 -16 -56 -58 z"/>
-    <!-- 领结 -->
-    <path fill="#EC6E92" d="M 256 436 l -50 -26 v 52 z"/>
-    <path fill="#EC6E92" d="M 256 436 l 50 -26 v 52 z"/>
-    <circle cx="256" cy="436" r="14" fill="#C9506F"/>
+    <!-- 机身 -->
+    <path fill="url(#body)" stroke="#B9A6B6" stroke-width="5"
+          d="M 88 258 q 8 -28 48 -28 h 240 q 40 0 48 28 q 34 16 38 62 q 6 56 -12 82 q -16 22 -46 12 q -26 -8 -40 -32 h -232 q -14 24 -40 32 q -30 10 -46 -12 q -18 -26 -12 -82 q 4 -46 38 -62 z"/>
+
+    <!-- 屏幕 -->
+    <rect x="196" y="256" width="120" height="128" rx="8" fill="url(#screen)" stroke="#0F0F14" stroke-width="4"/>
+
+    <!-- 左侧：十字键 + 摇杆 + 触控板 + 功能键 -->
+    <path fill="#2B2A33" d="M 152 272 h 14 v 16 h 16 v 14 h -16 v 16 h -14 v -16 h -16 v -14 h 16 z"/>
+    <circle cx="164" cy="336" r="17" fill="#2B2A33"/>
+    <circle cx="164" cy="336" r="10" fill="#3D3C48"/>
+    <rect x="132" y="352" width="42" height="30" rx="7" fill="#2B2A33"/>
+    <rect x="142" y="392" width="22" height="8" rx="4" fill="#2B2A33"/>
+    <rect x="142" y="406" width="22" height="8" rx="4" fill="#2B2A33"/>
+
+    <!-- 右侧：四键 + 摇杆 + 触控板 + 功能键 -->
+    <g fill="#2B2A33">
+      <circle cx="330" cy="272" r="8.5"/>
+      <circle cx="352" cy="294" r="8.5"/>
+      <circle cx="308" cy="294" r="8.5"/>
+      <circle cx="330" cy="316" r="8.5"/>
+    </g>
+    <circle cx="348" cy="336" r="17" fill="#2B2A33"/>
+    <circle cx="348" cy="336" r="10" fill="#3D3C48"/>
+    <rect x="338" y="352" width="42" height="30" rx="7" fill="#2B2A33"/>
+    <rect x="348" y="392" width="22" height="8" rx="4" fill="#2B2A33"/>
+    <rect x="348" y="406" width="22" height="8" rx="4" fill="#2B2A33"/>
   </g>
 </svg>

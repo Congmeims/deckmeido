@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1B1F2E"/>
+      <stop offset="1" stop-color="#0B0E16"/>
+    </linearGradient>
+    <clipPath id="clip"><rect width="512" height="512" rx="112"/></clipPath>
+  </defs>
+  <g clip-path="url(#clip)">
+    <rect width="512" height="512" fill="url(#bg)"/>
+    <circle cx="256" cy="270" r="190" fill="#3B8CFF" opacity="0.08"/>
+
+    <!-- 顶部：女仆头饰卷纹（粉色） -->
+    <g fill="none" stroke="#FF7FA8" stroke-width="10" stroke-linecap="round">
+      <path d="M 256 84 q -38 -32 -10 -58 q 24 -20 34 4"/>
+      <path d="M 256 84 q 38 -32 10 -58 q -24 -20 -34 4"/>
+      <path d="M 256 84 q -76 -6 -102 26 q -16 26 4 34"/>
+      <path d="M 256 84 q 76 -6 102 26 q 16 26 -4 34"/>
+    </g>
+    <circle cx="256" cy="84" r="14" fill="#FF7FA8"/>
+    <circle cx="256" cy="84" r="5" fill="#1B1F2E"/>
+
+    <!-- Steam Deck 机身 -->
+    <path fill="#3B8CFF" d="
+      M 76 252
+      q 0 -88 80 -88
+      l 22 0
+      q 12 0 12 12
+      l 0 156
+      q 0 12 -12 12
+      l -22 0
+      q -80 0 -80 -88
+      z
+      M 436 252
+      q 0 -88 -80 -88
+      l -22 0
+      q -12 0 -12 12
+      l 0 156
+      q 0 12 12 12
+      l 22 0
+      q 80 0 80 -88
+      z
+      M 190 186
+      q -12 0 -12 12
+      l 0 152
+      q 0 12 12 12
+      l 132 0
+      q 12 0 12 -12
+      l 0 -152
+      q 0 -12 -12 -12
+      z"/>
+
+    <!-- 屏幕 -->
+    <rect x="198" y="200" width="116" height="124" rx="10" fill="#0B0E16"/>
+    <rect x="208" y="210" width="54" height="14" rx="5" fill="#3B8CFF" opacity="0.5"/>
+
+    <!-- 左侧十字键 -->
+    <g fill="#0B0E16">
+      <rect x="118" y="218" width="46" height="15" rx="6"/>
+      <rect x="133" y="203" width="15" height="46" rx="6"/>
+    </g>
+    <!-- 左侧摇杆 -->
+    <circle cx="140" cy="304" r="24" fill="#0B0E16"/>
+    <circle cx="140" cy="304" r="12" fill="#3B8CFF"/>
+    <circle cx="140" cy="304" r="5" fill="#0B0E16"/>
+
+    <!-- 右侧四键 -->
+    <g fill="#0B0E16">
+      <circle cx="358" cy="214" r="10"/>
+      <circle cx="380" cy="236" r="10"/>
+      <circle cx="336" cy="236" r="10"/>
+      <circle cx="358" cy="258" r="10"/>
+    </g>
+    <!-- 右侧摇杆 -->
+    <circle cx="372" cy="304" r="24" fill="#0B0E16"/>
+    <circle cx="372" cy="304" r="12" fill="#3B8CFF"/>
+    <circle cx="372" cy="304" r="5" fill="#0B0E16"/>
+  </g>
+</svg>

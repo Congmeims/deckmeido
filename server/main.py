@@ -273,7 +273,7 @@ def save_current_session():
 
 def init_sessions():
     """启动时恢复最近的会话；没有历史则创建默认会话"""
-    global current_sid, history
+    global current_sid, history, _ctx_used
     files = sorted(SESSIONS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not files:
         save_current_session()
@@ -282,6 +282,7 @@ def init_sessions():
         data = json.loads(files[0].read_text(encoding="utf-8"))
         current_sid = data.get("id", "default")
         history = data.get("history", [])
+        _ctx_used = _estimate_tokens(history)
     except Exception:
         save_current_session()
 
@@ -744,10 +745,12 @@ async def api_sessions():
 
 @app.post("/api/sessions/create", dependencies=[Depends(check_token)])
 async def api_session_create():
-    global current_sid, history
+    global current_sid, history, _ctx_used
     save_current_session()
     current_sid = secrets.token_hex(4)
-    history = []
+    history.clear()
+    # 上下文占用计数必须一起清零，否则新会话会沿用上一个会话的用量
+    _ctx_used = 0
     save_current_session()
     await manager.broadcast({"type": "history", "messages": history})
     await manager.broadcast({"type": "session_changed", "current": current_sid})
@@ -762,14 +765,15 @@ class SwitchReq(BaseModel):
 
 @app.post("/api/sessions/switch", dependencies=[Depends(check_token)])
 async def api_session_switch(req: SwitchReq):
-    global current_sid, history
+    global current_sid, history, _ctx_used
     p = _sess_path(req.id)
     if not p.exists():
         raise HTTPException(status_code=404, detail="session not found")
     save_current_session()
     data = json.loads(p.read_text(encoding="utf-8"))
     current_sid = data.get("id", req.id)
-    history = data.get("history", [])
+    history[:] = data.get("history", [])
+    _ctx_used = _estimate_tokens(history)
     await manager.broadcast({"type": "history", "messages": history})
     await manager.broadcast({"type": "session_changed", "current": current_sid})
     return {"ok": True}
@@ -777,14 +781,15 @@ async def api_session_switch(req: SwitchReq):
 
 @app.delete("/api/sessions/{sid}", dependencies=[Depends(check_token)])
 async def api_session_delete(sid: str):
-    global current_sid, history
+    global current_sid, history, _ctx_used
     p = _sess_path(sid)
     if p.exists():
         p.unlink()
     if sid == current_sid:
         # 删掉的是当前会话：开一个全新会话顶上
         current_sid = secrets.token_hex(4)
-        history = []
+        history.clear()
+        _ctx_used = 0
         save_current_session()
         await manager.broadcast({"type": "history", "messages": history})
         await manager.broadcast({"type": "session_changed", "current": current_sid})
@@ -849,8 +854,8 @@ async def api_qrcode():
 # agent 真正操作设备时，桌面上盖一层半透明遮罩；用户点一下遮罩即终止当前操作
 
 _overlay_proc = None
-_overlay_state = {"show": False, "text": "", "passthrough": False}
-_overlay_ack = {"passthrough": False}  # 遮罩进程确认已让开鼠标
+_overlay_state = {"show": False, "text": "", "passthrough": False, "lift": False}
+_overlay_ack = {"passthrough": False, "lift": False}  # 遮罩进程确认已让开鼠标 / 已抬高
 
 
 def _overlay_env() -> dict:
@@ -918,11 +923,31 @@ async def set_overlay_passthrough(on: bool) -> None:
 tools.ON_OVERLAY_PASSTHROUGH = set_overlay_passthrough
 
 
+async def set_overlay_lift(on: bool) -> None:
+    """截图期间把遮罩收起来，拍完再放回来。
+
+    打开时要等遮罩真正隐藏（它每 25ms 轮询并回报 ack），否则这张截图里还是有遮罩。
+    """
+    _overlay_state["lift"] = on
+    if not on:
+        return
+    if _overlay_proc is None or _overlay_proc.poll() is not None:
+        return  # 遮罩没跑，不用等
+    for _ in range(20):  # 最多等 200ms
+        if _overlay_ack["lift"]:
+            return
+        await asyncio.sleep(0.01)
+
+
+tools.ON_OVERLAY_LIFT = set_overlay_lift
+
+
 @app.get("/api/overlay_state", dependencies=[Depends(check_token)])
 async def api_overlay_state(ack: int = 0):
-    # 遮罩进程带 ack=1 轮询时，表示它已经按本次返回的 passthrough 生效过了
+    # 遮罩进程带 ack=1 轮询时，表示它已经按本次返回的状态生效过了
     if ack:
         _overlay_ack["passthrough"] = _overlay_state["passthrough"]
+        _overlay_ack["lift"] = _overlay_state["lift"]
     return _overlay_state
 
 

@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import shutil
+import tempfile
 from pathlib import Path
 
 import httpx
@@ -131,7 +132,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "run_command",
-            "description": "在设备上执行 bash 命令（通用能力：文件/进程/桌面操作 xdotool/截屏/软件管理等）。环境：SteamOS、桌面模式 X11 DISPLAY=:0、家目录 /home/deck。避免交互式参数，长任务放后台",
+            "description": "在设备上执行 bash 命令（通用能力：文件/进程/桌面操作 xdotool/截屏/软件管理等）。环境：SteamOS、桌面模式 X11 DISPLAY=:0、家目录 /home/deck。避免交互式参数。启动浏览器/播放器/游戏这类常驻程序直接写命令即可，系统会自动判定已拉起并返回，不用加 nohup 或 &；需要拿到输出的命令才会等待执行完成",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -169,7 +170,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "screenshot",
-            "description": "截取当前桌面屏幕画面，直接展示给用户。排查问题、用户要求看屏幕时使用",
+            "description": "截取当前桌面屏幕画面，直接展示给用户。排查问题、用户要求看屏幕时使用。截图时会自动收起操作遮罩，不需要为了避开遮罩而等待",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -239,8 +240,9 @@ TOOLS: list[dict] = [
 DANGEROUS = {"install_game"}
 
 # 会实际控制设备的工具：只有这些才弹出操作遮罩。
-# 联网搜索、查天气、读写文件等都只是后台任务，遮罩会白挡一层，还会被误当成「正在操作」
-DEVICE_TOOLS = {"desktop", "screenshot", "run_command"}
+# 联网搜索、查天气、读写文件等都只是后台任务，遮罩会白挡一层，还会被误当成「正在操作」；
+# 截屏是只读采集，且遮罩本身会被拍进截图里，所以也不弹
+DEVICE_TOOLS = {"desktop", "run_command"}
 
 # 智能审批（auto）模式下的危险命令特征：命中则需要用户确认
 DANGER_PATTERNS = [
@@ -285,14 +287,39 @@ def extract_writes(cmd: str) -> list[str]:
 _MOUSE_CLICK_RE = re.compile(
     r"\b(?:ydotool|xdotool)\b[^\n;&|]*\b(?:click|mousedown|mouseup)\b")
 
-# 由 main 注入：切换遮罩的鼠标穿透状态
+# 由 main 注入：切换遮罩的鼠标穿透状态 / 截图时收起遮罩
 ON_OVERLAY_PASSTHROUGH = None
+ON_OVERLAY_LIFT = None
+
+# 判断「这条命令是在拉起一个常驻程序」：浏览器、播放器、游戏这类进程不会自己退出，
+# 傻等只会一直卡到超时。单纯启动器（单条命令、无管道/重定向/后台符）且首个程序命中下表，
+# 就只等几秒拿到启动输出即可
+_LAUNCHER_RE = re.compile(
+    r"^\s*(?:env\s+)?(?:\S*/)?(?:"
+    r"flatpak|snap|steam|chromium|chromium-browser|google-chrome|google-chrome-stable|"
+    r"firefox|mpv|vlc|gedit|kate|dolphin|konsole|steam-rom-manager|retroarch|"
+    r"xdg-open|gio|kdesu|prime-run|gamemoderun"
+    r")\b")
+# 出现这些说明用户/agent 需要命令的真实结果，不能提前返回
+_LAUNCHER_HOLD_RE = re.compile(r"[|;&><]|`|\$\(")
+
+
+def _is_launcher(cmd: str) -> bool:
+    if _LAUNCHER_HOLD_RE.search(cmd.replace("2>&1", "")):
+        return False
+    return bool(_LAUNCHER_RE.match(cmd))
 
 
 async def _set_overlay_passthrough(on: bool):
     """通知后端：遮罩是否暂时不接鼠标事件（避免 agent 的点击被遮罩当成用户终止）"""
     if ON_OVERLAY_PASSTHROUGH:
         await ON_OVERLAY_PASSTHROUGH(on)
+
+
+async def _set_overlay_lift(on: bool):
+    """通知后端：截图时先把遮罩收起来，免得挡住要拍的画面"""
+    if ON_OVERLAY_LIFT:
+        await ON_OVERLAY_LIFT(on)
 
 
 def _fix_display_env(env: dict):
@@ -322,6 +349,13 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
         # 用 script 包一层伪终端：/dev/tty 读取和交互菜单都能收到 stdin 输入
         command = f"script -qefc {shlex.quote(command)} /dev/null"
         feed = (stdin if stdin.endswith("\n") else stdin + "\n").encode()
+    # 命令里的程序一启动就记录进程组号；进程自己退出后组号不会复用，事后可据此判断「到底起没起来」
+    group_file = None
+    if _is_launcher(command) and not stdin:
+        tmp = tempfile.NamedTemporaryFile(prefix="deckmeido_pgid_", delete=False)
+        tmp.close()
+        group_file = Path(tmp.name)
+        command = f"echo $$ > {shlex.quote(str(group_file))}; {command}"
     proc = await asyncio.create_subprocess_shell(
         command,
         stdin=asyncio.subprocess.PIPE if feed else None,
@@ -330,9 +364,23 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
         cwd=str(Path.home()),
         env=env,
         executable="/bin/bash",
+        start_new_session=True,
     )
+    launcher = group_file is not None
+    launch_wait = 3.0
+    # 真·超时（命令卡死）要杀掉；启动器等满 launch_wait 只是「它在常驻运行」，不能杀
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(feed), timeout)
+        if launcher:
+            # 常驻程序不会退出：等几秒看它是正常启动还是报错，能拿到输出就先交差
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(), launch_wait)
+                launcher_done = True
+            except asyncio.TimeoutError:
+                launcher_done = False
+                out = b""
+        else:
+            launcher_done = True
+            out, _ = await asyncio.wait_for(proc.communicate(feed), timeout)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
@@ -355,6 +403,25 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
                 text = text.replace(line.strip(), "***")
     if len(text) > 4000:
         text = text[:4000] + "\n…（输出过长已截断）"
+    if not launcher_done:
+        # 进程还在前台跑：确认程序确实起来了，再放它继续跑，不阻塞后续对话
+        started = False
+        if group_file is not None:
+            try:
+                pgid = int(group_file.read_text().strip() or 0)
+                started = bool(pgid) and Path(f"/proc/{pgid}").exists()
+            except Exception:
+                pass
+            group_file.unlink(missing_ok=True)
+        if not started:
+            proc.kill()
+            await proc.wait()
+            return ("命令没有正常启动（进程已退出且没有留下运行中的程序）。"
+                    f"\n{text}" if text else "命令没有正常启动（进程已退出且没有留下运行中的程序）。")
+        msg = f"已在后台启动（等了 {launch_wait:.0f}s 程序仍在前台运行，判定为常驻程序，已放它继续跑）。"
+        return f"{msg}\n{text}" if text else msg
+    if group_file is not None:
+        group_file.unlink(missing_ok=True)
     return f"exit={proc.returncode}\n{text}" if text else f"exit={proc.returncode}（无输出）"
 
 _CONFIRM_WORDS = {"确认", "好", "好的", "执行", "可以", "yes", "y", "ok"}
@@ -615,18 +682,22 @@ async def _screenshot() -> str:
 
     env = dict(os.environ)
     _fix_display_env(env)
-    done = False
-    if shutil.which("spectacle"):
-        proc = await asyncio.create_subprocess_exec(
-            "spectacle", "-bno", str(path),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
-        )
-        await proc.wait()
-    if not path.exists() or path.stat().st_size < 10000:
-        # spectacle 不可用或截到黑屏（Xwayland rootless）时退回 mss
-        import mss
-        with mss.mss() as sct:
-            sct.shot(output=str(path))
+    # 遮罩会盖住整个桌面，先把它收起来，截完再放回来
+    await _set_overlay_lift(True)
+    try:
+        if shutil.which("spectacle"):
+            proc = await asyncio.create_subprocess_exec(
+                "spectacle", "-bno", str(path),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
+            )
+            await proc.wait()
+        if not path.exists() or path.stat().st_size < 10000:
+            # spectacle 不可用或截到黑屏（Xwayland rootless）时退回 mss
+            import mss
+            with mss.mss() as sct:
+                sct.shot(output=str(path))
+    finally:
+        await _set_overlay_lift(False)
     if not path.exists():
         return "截图失败：spectacle 与 mss 都不可用"
     # 压缩一份给多模态模型看（1280 宽 JPEG）

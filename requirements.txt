@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+websockets
+httpx
+mss
+pillow
+python-multipart
+
+# 原生客户端（可选）
+# PySide6
+# PySide6-WebEngine

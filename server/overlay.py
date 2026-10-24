@@ -23,6 +23,7 @@ TOKEN = os.environ.get("DECKMATE_TOKEN", "")
 
 POLL_MS = 100          # 向后端询问「是否在操作」的常规间隔
 URGENT_MS = 25         # 穿透期间的快速轮询间隔（后端马上要点，等不起）
+LIFT_MS = 25           # 截图期间抬高遮罩时的轮询间隔
 MIN_SHOW_MS = 700      # 最短显示时长，避免秒级工具闪一下就消失
 
 # 遮罩进程不读 KDE 字体配置。优先等宽字体：它的空格宽度明确，
@@ -94,6 +95,8 @@ class Mask(QWidget):
         self._shown_at = 0.0
         self._cancelled = False
         self._passthrough = False
+        self._lifted = False
+        self._show_wanted = False
 
         self.anim = QTimer(self)
         self.anim.timeout.connect(self._tick)
@@ -133,14 +136,17 @@ class Mask(QWidget):
     def _poll(self):
         state = self._fetch()
         show = bool(state.get("show"))
+        self._show_wanted = show
         self._set_text(state.get("text") or "")
         now = time.monotonic()
         # agent 发送鼠标点击期间后端会打开穿透，否则那一下会点在遮罩上变成「用户终止」
         self._set_passthrough(bool(state.get("passthrough")))
-        # 正在显示或者刚要求穿透时，切到快速轮询
-        self._urgent = bool(show or self._passthrough)
+        # 截图期间后端要求把遮罩藏起来，免得挡住要拍的画面
+        self._set_lifted(bool(state.get("lift")))
+        # 正在显示、刚要求穿透、或刚要求抬高遮罩时，切到快速轮询
+        self._urgent = bool(show or self._passthrough or self._lifted)
         if show:
-            if not self.isVisible() and not self._passthrough:
+            if not self.isVisible() and not self._passthrough and not self._lifted:
                 self._show_mask()
                 self._shown_at = now
                 self._cancelled = False
@@ -156,6 +162,17 @@ class Mask(QWidget):
         if on:
             self.hide()
         self.setAttribute(Qt.WA_TransparentForMouseEvents, on)
+
+    def _set_lifted(self, on: bool):
+        """截图期间把遮罩藏起来，拍完立刻恢复，不影响「点一下终止」"""
+        if on == self._lifted:
+            return
+        self._lifted = on
+        if on:
+            self.hide()
+        elif self._show_wanted and not self._passthrough:
+            self._show_mask()
+            self._shown_at = time.monotonic()
 
     def _cancel(self):
         if self._cancelled:

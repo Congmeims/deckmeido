@@ -13,3 +13,9 @@ nohup.out
 # 系统
 .DS_Store
 Thumbs.db
+
+# 会话记录与运行产物
+server/sessions/
+server/static/shots/
+server/uploads/
+_sess.json
