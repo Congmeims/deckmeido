@@ -476,12 +476,16 @@
     box-sizing: border-box;
   }
   .field-row { display: flex; align-items: center; justify-content: space-between; }
+  .field-row > label:not(.switch) { display: inline-block; margin: 0; }
+  /* 开关外层的 label 同时也是 .field label，会把「块级 + 灰色小字」带进来，
+     这里复位成与开关等大的容器 */
+  .field label.switch { display: inline-block; margin: 0; font-size: 0; }
   /* 开关里的 checkbox 要排除在 .field input 之外，否则会被撑成整行输入框，
-     把 .slider 挤到看不见，点上去像没反应 */
-  .field .switch { display: inline-block; flex: none; }
+     把 .slider 挤到看不见；再让外层 label 撑满点击区域，点哪都能切换 */
+  .field .switch { display: inline-block; flex: none; position: relative; }
   .field .switch input {
-    position: absolute; opacity: 0; width: 1px; height: 1px;
-    padding: 0; border: 0; margin: 0; pointer-events: none;
+    position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%;
+    padding: 0; border: 0; margin: 0; cursor: pointer; z-index: 2;
   }
   /* 令牌一行：输入框 + 随机生成按钮 */
   .token-row { display: flex; gap: 8px; align-items: center; }
@@ -504,11 +508,16 @@
   .qr-box.show { display: block; }
   .qr-box img { width: 180px; height: 180px; border-radius: 10px; background: #fff; padding: 8px; }
   .qr-box p { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
-  .switch { position: relative; width: 46px; height: 26px; }
-  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch { position: relative; display: inline-block; width: 46px; height: 26px; cursor: pointer; }
+  .switch input {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    margin: 0; padding: 0; opacity: 0; cursor: pointer; z-index: 2;
+  }
+  /* 拇指和轨道都要让点击穿到 checkbox 上 */
   .slider {
     position: absolute; inset: 0; border-radius: 999px;
     background: var(--surface-2); transition: .15s; cursor: pointer;
+    pointer-events: none;
   }
   .slider::before {
     content: ''; position: absolute; width: 20px; height: 20px;
@@ -804,10 +813,10 @@
     </div>
     <div class="field field-row">
       <label style="margin:0">语音播报回复</label>
-      <span class="switch">
+      <label class="switch">
         <input id="cfgTts" type="checkbox">
         <span class="slider"></span>
-      </span>
+      </label>
     </div>
     <div class="field">
       <label>AI 控制权限</label>
