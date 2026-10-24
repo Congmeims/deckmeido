@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from .llm import LLMClient
 from . import tools
+from .tts import TTS
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.toml"
@@ -73,6 +74,15 @@ def build_system_prompt() -> str:
 
 
 SYSTEM_PROMPT = build_system_prompt()
+
+_tts_cfg = CFG.get("tts", {})
+tts = TTS(
+    enable=bool(_tts_cfg.get("enable", False)),
+    engine=_tts_cfg.get("engine", "espeak-ng"),
+    voice=_tts_cfg.get("voice", "cmn"),
+    speed=int(_tts_cfg.get("speed", 170)),
+    max_chars=int(_tts_cfg.get("max_chars", 300)),
+)
 
 # 内存中的对话历史（单会话，MVP）
 history: list[dict] = []
@@ -190,6 +200,8 @@ async def handle_chat(text: str) -> str:
 
     history.append({"role": "assistant", "content": reply})
     await manager.broadcast({"type": "assistant_message", "text": reply, "ts": time.time()})
+    # 语音播报（后台进行，不阻塞回复）
+    asyncio.create_task(tts.speak(reply))
     return reply
 
 

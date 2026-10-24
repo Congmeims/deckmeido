@@ -28,3 +28,15 @@ name = "DeckMate"
 traits = "活泼可靠的游戏伙伴，略带俏皮，但办正事时干脆利落"
 # 补充人设（口癖、背景等），可留空
 extra = ""
+
+[tts]
+# 回复语音播报（调用 Deck 内置 TTS，在 Deck 扬声器上播放）
+enable = true
+# 引擎命令：espeak-ng / espeak / spd-say
+engine = "espeak-ng"
+# espeak-ng 语言：cmn=普通话，en-us=英语
+voice = "cmn"
+# 语速（词/分钟）
+speed = 170
+# 单次播报最长字符数（防止超长回复读个没完）
+max_chars = 300
