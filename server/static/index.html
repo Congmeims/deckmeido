@@ -119,25 +119,67 @@
   .msg ul { padding-left: 20px; margin: 4px 0; }
   .msg a { color: var(--brand); }
 
-  /* 事件区：思维链 / 工具调用 / 文件改动 */
-  .events { align-self: flex-start; max-width: 90%; display: flex; flex-direction: column; gap: 6px; }
-  .ev { font-size: 13px; border-radius: 10px; padding: 7px 12px; }
-  .ev.thought { background: rgba(138,147,163,.1); color: var(--muted); }
-  .ev.thought summary { cursor: pointer; user-select: none; }
-  .ev.thought .thought-body { margin-top: 6px; white-space: pre-wrap; line-height: 1.5; font-size: 12.5px; opacity: .85; }
-  .ev.tool { background: rgba(26,159,255,.12); color: #9fd4ff; font-family: ui-monospace, monospace; font-size: 12.5px; word-break: break-all; }
-  .ev.tool .ev-name { font-weight: 700; color: var(--brand); margin-right: 6px; }
-  .ev.tool.approved { background: rgba(232,179,57,.12); color: #e8b339; }
-  .ev.tool .term {
-    display: block; margin-top: 6px;
-    background: #0b0d13; color: #c8d3e0;
-    padding: 8px 10px; border-radius: 7px;
-    font-size: 12px; line-height: 1.5;
-    white-space: pre-wrap; word-break: break-all;
-    max-height: 220px; overflow-y: auto;
+  /* 操作流水（Trae 式时间线：思考 / 工具调用 / 文件改动） */
+  .events {
+    align-self: flex-start;
+    max-width: 92%;
+    position: relative;
+    padding-left: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
   }
-  .ev.file { background: rgba(46,204,113,.1); color: #7ddba3; font-family: ui-monospace, monospace; font-size: 12px; margin-left: 18px; }
-  .ev .shot { display: block; margin-top: 8px; max-width: 100%; border-radius: 8px; border: 1px solid rgba(255,255,255,.12); }
+  .events::before {
+    content: '';
+    position: absolute; left: 8px; top: 12px; bottom: 12px;
+    width: 1.5px; border-radius: 1px;
+    background: rgba(255,255,255,.09);
+  }
+  .tl { position: relative; }
+  .tl-head {
+    display: flex; align-items: center; gap: 7px;
+    font-size: 13px; color: var(--muted);
+    padding: 3px 4px; border-radius: 7px;
+    user-select: none; line-height: 1.4;
+  }
+  .tl-head.clickable { cursor: pointer; }
+  .tl-head.clickable:hover { color: var(--text); background: rgba(255,255,255,.04); }
+  .tl-ico {
+    position: absolute; left: -24px; top: 4px;
+    width: 17px; text-align: center; font-size: 12px;
+    background: var(--bg); padding: 1px 0;
+  }
+  .tl-chip {
+    background: var(--surface-2); border-radius: 6px;
+    padding: 1px 7px; font-size: 12px;
+    font-family: ui-monospace, monospace; color: #9fd4ff;
+    max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tl-arrow { font-size: 10px; opacity: .6; }
+  .tl-body {
+    display: none;
+    margin: 3px 0 7px 4px;
+    background: var(--surface-2);
+    border-radius: 10px;
+    padding: 9px 12px;
+    font-size: 12.5px; line-height: 1.55;
+    white-space: pre-wrap; word-break: break-word;
+    color: var(--muted);
+    max-height: 280px; overflow-y: auto;
+  }
+  .tl.open .tl-body { display: block; }
+  .tl-body.term {
+    background: #0b0d13; color: #c8d3e0;
+    font-family: ui-monospace, monospace; font-size: 12px;
+  }
+  .tl-file {
+    display: flex; gap: 8px; align-items: center;
+    font-family: ui-monospace, monospace; font-size: 12.5px;
+  }
+  .tl-file .fname { color: #9fd4ff; }
+  .tl-file .add { color: #2ecc71; }
+  .tl-file .del { color: #e8463a; }
+  .tl-body .shot { display: block; max-width: 100%; border-radius: 8px; border: 1px solid rgba(255,255,255,.12); }
   .stream-body { white-space: pre-wrap; word-break: break-word; }
   #send.stop { background: var(--danger); }
 
@@ -557,51 +599,130 @@
     scrollBottomSafe();
   }
 
+  // 工具事件 → 时间线行文案（Trae 式：已读取/已编辑/已运行…）
+  function toolRowInfo(ev) {
+    var fname = ev.path ? (ev.path.split(/[\\/]/).pop() || ev.path) : '';
+    switch (ev.name) {
+      case 'read_file':   return { ico: '👓', text: '已读取', chip: fname || ev.summary };
+      case 'list_dir':    return { ico: '📂', text: '已查看目录', chip: fname || ev.summary };
+      case 'write_file':
+      case 'edit_file':   return { ico: '✏️', text: '已编辑 1个文件' };
+      case 'run_command': return { ico: '💻', text: '已运行', chip: ev.summary };
+      case 'screenshot':  return { ico: '📷', text: '已截屏' };
+      case 'get_weather': return { ico: '🌤', text: '已查询天气', chip: ev.summary };
+      case 'web_search':  return { ico: '🔍', text: '已搜索', chip: ev.summary };
+      case 'list_installed_games': return { ico: '🎮', text: '已查询游戏库' };
+      case 'find_game':   return { ico: '🎮', text: '已在商店搜索', chip: ev.summary };
+      case 'list_emulator_roms': return { ico: '🕹', text: '已扫描模拟器 ROM' };
+      case 'check_system_updates': return { ico: '⬆️', text: '已检查系统更新' };
+      case 'install_game': return { ico: '📥', text: '已安装游戏', chip: ev.summary };
+      default:            return { ico: '🔧', text: '已调用 ' + ev.name, chip: ev.summary };
+    }
+  }
+
+  // 通用时间线行：head（图标+文案+箭头）+ 可展开 body
+  function makeTlRow(ico, text, chip, open) {
+    var tl = document.createElement('div');
+    tl.className = 'tl';
+    var head = document.createElement('div');
+    head.className = 'tl-head clickable';
+    var ic = document.createElement('span');
+    ic.className = 'tl-ico'; ic.textContent = ico;
+    var tx = document.createElement('span');
+    tx.textContent = text;
+    head.appendChild(ic); head.appendChild(tx);
+    head.addEventListener('click', function () {
+      tl.classList.toggle('open');
+      var a = head.querySelector('.tl-arrow');
+      if (a) a.textContent = tl.classList.contains('open') ? '▾' : '▸';
+    });
+    tl.appendChild(head);
+    return { tl: tl, head: head };
+  }
+
+  // 思维链行（live 流式与历史渲染共用）
+  function makeThoughtRow(text, open) {
+    var r = makeTlRow('🧠', '思考', null, open);
+    var arrow = document.createElement('span');
+    arrow.className = 'tl-arrow';
+    arrow.textContent = open ? '▾' : '▸';
+    r.head.appendChild(arrow);
+    var body = document.createElement('div');
+    body.className = 'tl-body';
+    body.textContent = text || '';
+    r.tl.appendChild(body);
+    if (open) r.tl.classList.add('open');
+    return r.tl;
+  }
+
   // 渲染单个事件（思维链 / 工具调用+终端输出 / 文件改动）到容器
   function renderEvent(ev, box) {
     if (ev.type === 'thought') {
-      var d = document.createElement('details');
-      d.className = 'ev thought';
-      var sum = document.createElement('summary');
-      sum.textContent = '🧠 思维链（点击展开）';
+      box.appendChild(makeThoughtRow(ev.text, false));
+      return;
+    }
+    if (ev.type !== 'tool') return;
+    var info = toolRowInfo(ev);
+    var hasBody = !!(ev.output || ev.image || ev.diff || (ev.files && ev.files.length));
+    var r = makeTlRow(ev.approved ? '✓' : info.ico,
+                      ev.approved ? ('已批准：' + (ev.summary || '')) : info.text, null, false);
+    if (!ev.approved && info.chip) {
+      var chipEl = document.createElement('span');
+      chipEl.className = 'tl-chip';
+      chipEl.textContent = info.chip;
+      r.head.appendChild(chipEl);
+    }
+    if (!hasBody) {
+      r.head.classList.remove('clickable');
+    } else {
+      var arrow = document.createElement('span');
+      arrow.className = 'tl-arrow';
+      arrow.textContent = '▸';
+      r.head.appendChild(arrow);
       var body = document.createElement('div');
-      body.className = 'thought-body';
-      body.textContent = ev.text;
-      d.appendChild(sum);
-      d.appendChild(body);
-      box.appendChild(d);
-    } else if (ev.type === 'tool') {
-      var t = document.createElement('div');
-      t.className = 'ev tool' + (ev.approved ? ' approved' : '');
-      var name = document.createElement('span');
-      name.className = 'ev-name';
-      name.textContent = (ev.approved ? '✓ ' : '🔧 ') + ev.name;
-      var summary = document.createElement('span');
-      summary.textContent = ev.summary || '';
-      t.appendChild(name);
-      t.appendChild(summary);
-      if (ev.output) {
-        var term = document.createElement('pre');
-        term.className = 'term';
-        term.textContent = ev.output;
-        t.appendChild(term);
-      }
-      if (ev.image) {
+      body.className = 'tl-body' + (ev.name === 'run_command' ? ' term' : '');
+      if (ev.diff && ev.path) {
+        // 文件改动行：文件名 + 增删行数
+        var fr = document.createElement('div');
+        fr.className = 'tl-file';
+        var fn = document.createElement('span'); fn.className = 'fname';
+        fn.textContent = ev.path.split(/[\\/]/).pop() || ev.path;
+        var ad = document.createElement('span'); ad.className = 'add';
+        ad.textContent = '+' + (ev.diff.add || 0);
+        var dl = document.createElement('span'); dl.className = 'del';
+        dl.textContent = '-' + (ev.diff.del || 0);
+        fr.appendChild(fn); fr.appendChild(ad); fr.appendChild(dl);
+        body.appendChild(fr);
+        // 编辑失败时附上输出
+        if (ev.output && /失败|不存在|错误/.test(ev.output)) {
+          var err = document.createElement('div');
+          err.style.marginTop = '6px';
+          err.textContent = ev.output;
+          body.appendChild(err);
+        }
+      } else if (ev.image) {
         var img = document.createElement('img');
         img.className = 'shot';
         img.src = ev.image + '?token=' + encodeURIComponent(token);
         img.alt = '屏幕截图';
         img.addEventListener('click', function () { window.open(img.src, '_blank'); });
-        t.appendChild(img);
+        body.appendChild(img);
+      } else if (ev.output) {
+        body.textContent = ev.output;
       }
-      box.appendChild(t);
+      // run_command 识别到的写入文件
       (ev.files || []).forEach(function (f) {
-        var fc = document.createElement('div');
-        fc.className = 'ev file';
-        fc.textContent = '📄 写入 ' + f;
-        box.appendChild(fc);
+        var fr2 = document.createElement('div');
+        fr2.className = 'tl-file';
+        fr2.textContent = '📄 写入 ';
+        var fn2 = document.createElement('span'); fn2.className = 'fname';
+        fn2.textContent = f;
+        fr2.appendChild(fn2);
+        body.appendChild(fr2);
       });
+      r.tl.appendChild(body);
     }
+    box.appendChild(r.tl);
   }
 
   // 渲染整批事件（历史/兜底用）
@@ -717,17 +838,9 @@
             liveBox.className = 'events';
             messages.appendChild(liveBox);
           }
-          var td = document.createElement('details');
-          td.className = 'ev thought';
-          td.open = true;
-          var tsum = document.createElement('summary');
-          tsum.textContent = '🧠 思维链（思考中…）';
-          var tbody = document.createElement('div');
-          tbody.className = 'thought-body';
-          td.appendChild(tsum);
-          td.appendChild(tbody);
-          liveBox.appendChild(td);
-          liveThought = tbody;
+          var trow = makeThoughtRow('', true);
+          liveBox.appendChild(trow);
+          liveThought = trow.querySelector('.tl-body');
           scrollBottomSafe();
           break;
         case 'thought_delta':
@@ -738,9 +851,11 @@
           break;
         case 'thought_end':
           if (liveThought) {
-            var sum2 = liveThought.previousSibling;
-            if (sum2) sum2.textContent = '🧠 思维链（点击展开）';
-            if (liveThought.parentNode) liveThought.parentNode.open = false;
+            // 思考结束后折叠为「思考 ▸」行，点击可展开
+            var trow2 = liveThought.parentNode;
+            trow2.classList.remove('open');
+            var tarr = trow2.querySelector('.tl-arrow');
+            if (tarr) tarr.textContent = '▸';
           }
           liveThought = null;
           liveThoughtShown++;

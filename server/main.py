@@ -632,11 +632,15 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
                 # 文件改动识别（run_command）
                 files = tools.extract_writes(str(args.get("command", ""))) if name == "run_command" else []
                 event = {"type": "tool", "name": name, "summary": summarize_tool(name, args), "files": files}
+                if name in ("read_file", "write_file", "edit_file", "list_dir"):
+                    event["path"] = str(args.get("path", ""))
                 await manager.broadcast({"type": "tool_activity", "text": f"{name}：{event['summary']}", "ts": time.time()})
 
                 result = await tools.execute(name, args)
                 # 终端输出截断后随事件展示（网页端显示为终端块）
                 event["output"] = result[:1500] + ("\n…（截断）" if len(result) > 1500 else "")
+                if name in ("write_file", "edit_file") and tools.LAST_DIFF:
+                    event["diff"] = tools.LAST_DIFF
                 if name == "screenshot":
                     m = re.search(r"/shots/\S+?\.png", result)
                     if m:

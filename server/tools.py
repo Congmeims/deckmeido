@@ -535,6 +535,9 @@ async def _screenshot() -> str:
 # 最近一次截图的模型可读版本路径（供 run_agent 注入多模态消息）
 LAST_VISION: Path | None = None
 
+# 最近一次文件写入/编辑的增删行数（供 UI 展示 diff 统计）
+LAST_DIFF: dict | None = None
+
 
 WORKSPACE = Path.home() / "deckmate_workspace"
 
@@ -577,13 +580,19 @@ async def _read_file(path: str, offset: int = 1, limit: int = 400) -> str:
 
 
 async def _write_file(path: str, content: str) -> str:
+    global LAST_DIFF
+    LAST_DIFF = None
     p = _resolve(path)
     p.parent.mkdir(parents=True, exist_ok=True)
+    old_lines = len(p.read_text(encoding="utf-8", errors="replace").splitlines()) if p.is_file() else 0
     p.write_text(content, encoding="utf-8")
+    LAST_DIFF = {"add": len(content.splitlines()), "del": old_lines}
     return f"已写入 {p}（{len(content)} 字符）"
 
 
 async def _edit_file(path: str, old: str, new: str) -> str:
+    global LAST_DIFF
+    LAST_DIFF = None
     p = _resolve(path)
     if not p.is_file():
         return f"文件不存在：{p}"
@@ -594,6 +603,7 @@ async def _edit_file(path: str, old: str, new: str) -> str:
     if count > 1:
         return f"替换失败：old 文本出现了 {count} 次，请扩大范围使其唯一"
     p.write_text(text.replace(old, new, 1), encoding="utf-8")
+    LAST_DIFF = {"add": len(new.splitlines()), "del": len(old.splitlines())}
     return f"已修改 {p}（替换 1 处）"
 
 
