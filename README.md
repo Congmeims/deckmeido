@@ -117,8 +117,7 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 ### 一键安装
 
 ```bash
-git clone https://github.com/Congmeims/deckmeido.git
-cd deckmeido && bash install.sh
+git clone https://github.com/Congmeims/deckmeido.git && cd deckmeido && bash install.sh
 ```
 
 脚本会：建虚拟环境 → 装依赖（含 PySide6）→ 生成配置 → 注册 `deckmeido.service` 用户服务并开机自启 → 装好应用菜单快捷方式，最后打印带令牌的访问地址。
@@ -128,9 +127,7 @@ cd deckmeido && bash install.sh
 不想用 git 的话，直接下载 Release 里的包：
 
 ```bash
-wget https://github.com/Congmeims/deckmeido/releases/latest/download/deckmeido-0.1.0.tar.gz
-tar -xzf deckmeido-0.1.0.tar.gz
-cd deckmeido-0.1.0 && bash install.sh
+wget https://github.com/Congmeims/deckmeido/releases/latest/download/deckmeido-0.1.0.tar.gz && tar -xzf deckmeido-0.1.0.tar.gz && cd deckmeido-0.1.0 && bash install.sh
 ```
 
 ```bash
