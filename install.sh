@@ -3,9 +3,14 @@
 #
 #   bash install.sh              安装或升级到当前目录（可重复执行）
 #   bash install.sh install       同上
+#   bash install.sh install --deps      顺带用 sudo 安装控制类插件（不再询问）
 #   bash install.sh upgrade        升级代码与依赖，保留配置
+#   bash install.sh upgrade --deps      升级后顺带检查并安装控制类插件
 #   bash install.sh uninstall     卸载（默认保留 ~/.config/deckmeido 配置与工作区）
 #   bash install.sh uninstall --purge   连配置一起删
+#
+# 控制类插件（ydotool / kdotool / espeak-ng）是系统包，装它们需要 root：
+# 默认只在结尾提示并询问一次（y/N），回答 y 才走 sudo；无终端时不会卡住。
 #
 # 环境变量：
 #   DECKMEIDO_DIR   安装目录，默认 ~/deckmeido
@@ -70,13 +75,104 @@ system_notes() {
   if [ ${#miss[@]} -gt 0 ]; then
     warn "以下可选依赖没装，相关功能会受限："
     for m in "${miss[@]}"; do dim "$m"; done
-    dim "SteamOS 装 AUR 包：先设置 → 开发者模式，再用 pacman/paru 安装"
+    dim "想自动安装：bash install.sh install --deps"
   fi
   # ydotool 装了但 ydotoold 没跑，点击/输入会直接报 socket 错误，这里提前点出来
   if need_cmd ydotool && ! pgrep -x ydotoold >/dev/null 2>&1; then
     warn "ydotool 已装但 ydotoold 守护进程没在运行，模拟点击/输入会失败"
     dim "临时启动：ydotoold >/dev/null 2>&1 &"
   fi
+}
+
+# ---------- 可选系统依赖 ----------
+# 这些是模拟点击/键盘、截图、语音播报要用的系统包，装它们必须 root。
+# 默认在安装结尾询问一次，或加 --deps 直接装；由 sudo 逐条安装、逐条报告结果。
+DEPS_PACMAN=(espeak-ng ydotool)
+DEPS_AUR=(kdotool)
+
+ask_yes() {
+  # 无 tty（比如从客户端里跑）时默认不装，避免卡住
+  [ -t 0 ] || return 1
+  local ans
+  printf '%s?%s %s [y/N] ' "$C_WARN" "$C_END" "$1"
+  read -r ans
+  case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+sudo_warmup() {
+  need_cmd sudo || { warn "没有 sudo，跳过系统依赖安装"; return 1; }
+  if ! sudo -n true 2>/dev/null; then
+    info "安装系统依赖需要 root 权限，接下来会提示输入密码"
+  fi
+  sudo -v || { warn "sudo 授权失败，跳过系统依赖安装"; return 1; }
+}
+
+install_pacman_deps() {
+  local todo=()
+  for p in "${DEPS_PACMAN[@]}"; do
+    need_cmd "$p" || todo+=("$p")
+  done
+  [ ${#todo[@]} -gt 0 ] || return 0
+  info "用 pacman 安装：${todo[*]}"
+  # SteamOS 的根分区是只读的，装包前要先关掉只读保护
+  if [ -f /etc/steamos-readonly.conf ] || need_cmd steamos-readonly; then
+    sudo steamos-readonly disable 2>/dev/null || true
+  fi
+  # --needed：已装的不会重装；-Sy 而不 -Syu，避免顺带滚系统
+  if won=$(sudo pacman -Sy --needed --noconfirm "${todo[@]}" 2>&1); then
+    info "pacman 安装完成"
+  else
+    warn "pacman 安装失败："
+    dim "$won"
+    dim "SteamOS 换过 keyring 的话先执行：sudo pacman-key --init && sudo pacman-key --populate archlinux holo"
+  fi
+}
+
+install_aur_deps() {
+  local todo=() helper
+  for p in "${DEPS_AUR[@]}"; do
+    need_cmd "$p" || todo+=("$p")
+  done
+  [ ${#todo[@]} -gt 0 ] || return 0
+  helper=""
+  for h in paru yay; do
+    need_cmd "$h" && { helper="$h"; break; }
+  done
+  if [ -z "$helper" ]; then
+    warn "这些包在 AUR 里，但没找到 paru / yay，跳过：${todo[*]}"
+    dim "手动装法：git clone https://aur.archlinux.org/<包名>.git && cd <包名> && makepkg -si"
+    return 0
+  fi
+  info "用 $helper 安装：${todo[*]}"
+  if won=$("$helper" -S --needed --noconfirm "${todo[@]}" 2>&1); then
+    info "$helper 安装完成"
+  else
+    warn "$helper 安装失败："
+    dim "$won"
+  fi
+}
+
+# ydotoold 是 ydotool 的守护进程，不跑的话点击/输入用不了
+setup_ydotoold() {
+  need_cmd ydotool || return 0
+  pgrep -x ydotoold >/dev/null 2>&1 && return 0
+  info "启动 ydotoold 守护进程"
+  setsid ydotoold >/dev/null 2>&1 < /dev/null &
+  sleep 1
+  if pgrep -x ydotoold >/dev/null 2>&1; then
+    dim "已启动（重启后需要再启动一次，或用 systemd 用户单元托管）"
+  else
+    warn "ydotoold 启动失败，模拟点击/输入可能不可用"
+  fi
+}
+
+install_deps() {
+  info "检查可选系统依赖（模拟点击/输入、截图、语音播报）"
+  sudo_warmup || return 0
+  install_pacman_deps
+  install_aur_deps
+  setup_ydotoold
+  system_notes
 }
 
 # ---------- 代码同步 ----------
@@ -230,6 +326,7 @@ print_done() {
 
 # ---------- 子命令 ----------
 do_install() {
+  local deps="${1:-}"
   check_prereq
   info "安装目录：$INSTALL_DIR"
   sync_files
@@ -237,7 +334,14 @@ do_install() {
   prepare_config
   install_service
   install_desktop
-  system_notes
+  if [ "$deps" = "--deps" ]; then
+    install_deps
+  else
+    system_notes
+    if need_cmd sudo && ask_yes "要现在用 sudo 安装控制类插件（ydotool / kdotool / espeak-ng）吗？"; then
+      install_deps
+    fi
+  fi
   if need_cmd curl && wait_ready; then
     print_done
   else
@@ -246,12 +350,18 @@ do_install() {
 }
 
 do_upgrade() {
+  local deps="${1:-}"
   [ -d "$INSTALL_DIR" ] || die "$INSTALL_DIR 不存在，请先执行安装"
   check_prereq
   sync_files
   venv_install
   install_service
   install_desktop
+  if [ "$deps" = "--deps" ]; then
+    install_deps
+  else
+    system_notes
+  fi
   if need_cmd curl && wait_ready; then
     print_done
   else
@@ -284,8 +394,8 @@ do_uninstall() {
 }
 
 case "${1:-install}" in
-  install|"")   do_install ;;
-  upgrade|update) do_upgrade ;;
+  install|"")   do_install "${2:-}" ;;
+  upgrade|update) do_upgrade "${2:-}" ;;
   uninstall)    do_uninstall "${2:-}" ;;
   -h|--help|help)
     grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -n 16 ;;
