@@ -32,6 +32,7 @@ TOOL_CN: dict[str, str] = {
     "read_file": "读取文件",
     "write_file": "写入文件",
     "edit_file": "编辑文件",
+    "self_update": "更新软件",
 }
 
 
@@ -231,6 +232,22 @@ TOOLS: list[dict] = [
                     "new": {"type": "string", "description": "替换后的内容"},
                 },
                 "required": ["path", "old", "new"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "self_update",
+            "description": ("检查并更新 DeckMeido 自身。action=check 查询有没有新版本；"
+                            "action=upgrade 拉取最新代码并重启服务（会短暂断开，需用户确认）"),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["check", "upgrade"],
+                               "description": "check 只查版本，upgrade 真的升级"},
+                },
+                "required": ["action"],
             },
         },
     },
@@ -462,6 +479,8 @@ def summarize_tool(name: str, args: dict) -> str:
     # 无需参数的简单操作：不显示多余说明
     if name in ("screenshot", "list_installed_games", "check_system_updates", "list_emulator_roms"):
         return ""
+    if name == "self_update":
+        return "查询新版本" if args.get("action") != "upgrade" else "升级并重启服务"
     if not args:
         return ""
     s = json.dumps(args, ensure_ascii=False)
@@ -472,6 +491,8 @@ def describe(name: str, args: dict) -> str:
     """危险操作的人类可读描述"""
     if name == "install_game":
         return f"下载安装 Steam 游戏（appid: {args.get('appid')}）"
+    if name == "self_update":
+        return "把 DeckMeido 升级到最新版：拉取新代码并重启服务（当前对话会中断）"
     if name == "run_command":
         return f"执行命令：{args.get('command', '')}\n目的：{args.get('reason', '')}"
     detail = summarize_tool(name, args)
@@ -565,6 +586,30 @@ async def _find_game(name: str) -> str:
         return f"Steam 商店没找到：{name}"
     lines = [f"- {it['name']}（appid {it['id']}）" for it in items]
     return "搜索结果：\n" + "\n".join(lines)
+
+
+async def _self_update(action: str = "check") -> str:
+    """检查或升级 DeckMeido 自身（复用 server/updater.py，与设置页的按钮同一套逻辑）"""
+    from . import updater
+
+    if action != "upgrade":
+        try:
+            info = await updater.check()
+        except RuntimeError as e:
+            return f"检查更新失败：{e}"
+        if not info["tag"]:
+            return f"当前版本 {info['current']}，GitHub 上还没有发布版本信息"
+        if not info["has_update"]:
+            return f"当前已是最新版本（{info['current']}）"
+        return (f"当前 {info['current']}，最新版本 {info['tag']}"
+                + (f"（{info['published_at'][:10]}）" if info.get("published_at") else "")
+                + "\n需要我升级的话说一声，升级时服务会重启一下。")
+
+    try:
+        res = await asyncio.to_thread(updater.apply, True)
+    except RuntimeError as e:
+        return f"升级失败：{e}"
+    return f"{res['message']}。日志：{res.get('log', '')}"
 
 
 async def _check_system_updates() -> str:
@@ -897,6 +942,7 @@ EXECUTORS = {
     "read_file": _read_file,
     "write_file": _write_file,
     "edit_file": _edit_file,
+    "self_update": _self_update,
 }
 
 

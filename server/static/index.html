@@ -436,6 +436,12 @@
   #btnTheme { flex: 3; }
   #settingsBtn { flex: 1; }
   #btnTheme:hover, #settingsBtn:hover { color: var(--text); }
+  /* 有新版本时在「设置」上打个小红点 */
+  #settingsBtn.has-update { position: relative; }
+  #settingsBtn.has-update::after {
+    content: ''; position: absolute; top: 3px; right: 3px;
+    width: 7px; height: 7px; border-radius: 50%; background: #e5484d;
+  }
   #settingsPanel {
     position: fixed; inset: 0;
     background: var(--overlay);
@@ -1289,6 +1295,9 @@
         case 'session_changed':
           loadSessions();
           break;
+        case 'update_available':
+          markUpdate(msg.latest, msg.current);
+          break;
       }
     };
 
@@ -1554,12 +1563,25 @@
   var updApply = document.getElementById('updApply');
   var verLoaded = false;
 
+  // 后台自动查到新版本时：设置按钮打红点，设置页里也把提示填好
+  function markUpdate(latest, current) {
+    settingsBtn.classList.add('has-update');
+    settingsBtn.title = '有新版本 v' + latest;
+    verTag.textContent = '版本 v' + (current || '?');
+    updNote.innerHTML = '发现新版本 <b>v' + latest + '</b>，点下方按钮即可升级';
+    updApply.style.display = 'block';
+  }
+
   function loadVersion() {
     if (verLoaded) return;
     verLoaded = true;
     fetch('/api/version?token=' + encodeURIComponent(token))
       .then(function (r) { return r.json(); })
-      .then(function (v) { verTag.textContent = '版本 v' + (v.version || '?'); })
+      .then(function (v) {
+        verTag.textContent = '版本 v' + (v.version || '?');
+        // 后台已查到新版本：打开设置页就能直接看到并升级
+        if (v.update && v.update.has_update) markUpdate(v.update.latest, v.version);
+      })
       .catch(function () { verTag.textContent = '版本未知'; });
   }
 
