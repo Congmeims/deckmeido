@@ -169,23 +169,38 @@
   .typing i:nth-child(3) { animation-delay: .4s; }
   @keyframes blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
 
-  /* 底部输入区 */
+  /* 底部输入区（两行：输入框 + 工具栏） */
   #composer {
     flex: 0 0 auto;
     display: flex;
+    flex-direction: column;
     gap: 8px;
     padding: 10px 12px;
     padding-bottom: calc(10px + env(safe-area-inset-bottom));
     background: var(--surface);
     border-top: 1px solid rgba(255,255,255,.06);
   }
+  #composerBar { display: flex; align-items: center; gap: 8px; }
+  .cb-left { display: flex; gap: 8px; flex: 0 0 auto; }
+  .cb-right { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+  .cb-btn {
+    width: 34px; height: 34px; border: none; border-radius: 10px;
+    background: var(--surface-2); color: var(--muted);
+    font-size: 16px; cursor: pointer; flex: 0 0 auto;
+  }
+  .cb-btn.rec { color: #e8463a; }
+  .cb-select {
+    height: 34px; border: 1px solid rgba(255,255,255,.1); border-radius: 10px;
+    background: var(--surface-2); color: var(--muted);
+    font-size: 12.5px; padding: 0 8px; outline: none; max-width: 130px;
+  }
   #input {
-    flex: 1;
-    min-height: 46px;
+    width: 100%;
+    min-height: 44px;
     max-height: 120px;
     padding: 12px 14px;
     border: none;
-    border-radius: 23px;
+    border-radius: 14px;
     background: var(--surface-2);
     color: var(--text);
     font-size: 16px;
@@ -193,17 +208,35 @@
     resize: none;
     outline: none;
   }
+  .msg img.chat-img { display: block; max-width: 100%; border-radius: 8px; margin: 6px 0; }
+  /* 附件菜单 / 文件选择弹层 */
+  #plusMenu, #fileList {
+    display: none; position: fixed; z-index: 25;
+    left: 12px; bottom: 120px;
+    background: var(--surface-2); border: 1px solid rgba(255,255,255,.12);
+    border-radius: 12px; padding: 6px; min-width: 200px;
+    flex-direction: column; gap: 2px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.5);
+  }
+  #plusMenu.show { display: flex; }
+  #fileList.show { display: flex; max-height: 40dvh; overflow-y: auto; }
+  #plusMenu button, #fileList button {
+    border: none; background: none; color: var(--text);
+    text-align: left; padding: 10px 12px; border-radius: 8px;
+    font-size: 14px; cursor: pointer;
+  }
+  #plusMenu button:hover, #fileList button:hover { background: rgba(255,255,255,.08); }
   #send {
     flex: 0 0 auto;
-    min-width: 46px;
-    height: 46px;
+    min-width: 52px;
+    height: 34px;
     border: none;
-    border-radius: 23px;
+    border-radius: 10px;
     background: var(--brand);
     color: #fff;
-    font-size: 16px;
+    font-size: 15px;
     font-weight: 600;
-    padding: 0 18px;
+    padding: 0 16px;
     cursor: pointer;
   }
   #send:disabled { opacity: .4; }
@@ -346,9 +379,31 @@
 <div id="messages"></div>
 
 <div id="composer">
-  <textarea id="input" rows="1" placeholder="输入消息…" enterkeyhint="send"></textarea>
-  <button id="send">发送</button>
+  <textarea id="input" rows="1" placeholder="@ 添加上下文，/ 使用命令" enterkeyhint="send"></textarea>
+  <div id="composerBar">
+    <div class="cb-left">
+      <button class="cb-btn" id="btnPlus" title="添加附件/引用">＋</button>
+      <select class="cb-select" id="permSelect" title="AI 控制权限">
+        <option value="manual">🛡 手动审批</option>
+        <option value="auto">🛡 智能审批</option>
+        <option value="full">🛡 完全访问</option>
+      </select>
+    </div>
+    <div class="cb-right">
+      <select class="cb-select" id="modelSelect" title="模型"></select>
+      <button class="cb-btn" id="btnMic" title="语音输入">🎤</button>
+      <button id="send">发送</button>
+    </div>
+  </div>
 </div>
+
+<div id="plusMenu">
+  <button id="pmImage">🖼 附加图片</button>
+  <button id="pmFile">📄 引用工作区文件</button>
+  <button id="pmShot">📷 引用当前屏幕截图</button>
+</div>
+<div id="fileList"></div>
+<input type="file" id="imgInput" accept="image/*" hidden>
 
 <div id="authOverlay">
   <h1>DeckMate 控制台</h1>
@@ -448,6 +503,7 @@
       return p + '<ul>' + items + '</ul>';
     });
     s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    s = s.replace(/!\[([^\]]*)\]\((\/uploads\/[^)\s]+)\)/g, '<img class="chat-img" src="$2">');
     s = s.replace(/\n{2,}/g, '<br><br>').replace(/\n/g, '<br>');
     return s;
   }
@@ -455,7 +511,7 @@
   function addMsg(role, text, ts) {
     var el = document.createElement('div');
     el.className = 'msg ' + role;
-    if (role === 'assistant') {
+    if (role === 'assistant' || role === 'user') {
       var body = document.createElement('div');
       body.innerHTML = renderMd(text);
       el.appendChild(body);
@@ -972,6 +1028,172 @@
     shareDownload.href = url;
     shareOverlay.classList.add('show');
     document.getElementById('btnShare').click();  // 退出选择模式
+  });
+
+  // ---------- 输入框工具栏：＋附件 / 权限 / 模型 / 语音 ----------
+  var plusMenu = document.getElementById('plusMenu');
+  var fileList = document.getElementById('fileList');
+  var imgInput = document.getElementById('imgInput');
+  var permSelect = document.getElementById('permSelect');
+  var modelSelect = document.getElementById('modelSelect');
+  var btnMic = document.getElementById('btnMic');
+
+  function postConfig(patch) {
+    return fetch('/api/config?token=' + encodeURIComponent(token), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch)
+    }).catch(function () {});
+  }
+
+  function loadToolbar() {
+    fetch('/api/config?token=' + encodeURIComponent(token))
+      .then(function (r) { return r.json(); })
+      .then(function (c) {
+        if (c.permission_mode) permSelect.value = c.permission_mode;
+        // 模型下拉：当前模型 + 常用预设
+        var presets = ['deepseek-v4.1-flash', 'deepseek-reasoner', 'gpt-4o-mini', 'gpt-4o', 'qwen-max', 'qwen-qwq-plus'];
+        var opts = [c.model].concat(presets.filter(function (m) { return m !== c.model; }));
+        modelSelect.innerHTML = '';
+        opts.forEach(function (m) {
+          if (!m) return;
+          var o = document.createElement('option');
+          o.value = m; o.textContent = m;
+          modelSelect.appendChild(o);
+        });
+        if (c.model) modelSelect.value = c.model;
+      })
+      .catch(function () {});
+  }
+  permSelect.addEventListener('change', function () {
+    postConfig({ permission_mode: permSelect.value });
+    addSystem('权限模式已切换：' + permSelect.options[permSelect.selectedIndex].text);
+  });
+  modelSelect.addEventListener('change', function () {
+    postConfig({ model: modelSelect.value });
+    addSystem('模型已切换为 ' + modelSelect.value);
+  });
+
+  // ＋ 附件菜单
+  document.getElementById('btnPlus').addEventListener('click', function (e) {
+    e.stopPropagation();
+    fileList.classList.remove('show');
+    plusMenu.classList.toggle('show');
+  });
+  document.addEventListener('click', function (e) {
+    if (!plusMenu.contains(e.target)) plusMenu.classList.remove('show');
+    if (!fileList.contains(e.target) && e.target.id !== 'pmFile') fileList.classList.remove('show');
+  });
+
+  // 附加图片：上传后把图片标记插入输入框（发送时模型能看到图）
+  document.getElementById('pmImage').addEventListener('click', function () {
+    plusMenu.classList.remove('show');
+    imgInput.click();
+  });
+  imgInput.addEventListener('change', function () {
+    if (!imgInput.files.length) return;
+    var fd = new FormData();
+    fd.append('file', imgInput.files[0]);
+    addSystem('上传图片中…');
+    fetch('/api/upload?token=' + encodeURIComponent(token), { method: 'POST', body: fd })
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        if (res.url) {
+          input.value += (input.value ? '\n' : '') + '![图片](' + res.url + ')';
+          input.focus();
+        } else addSystem('上传失败');
+      })
+      .catch(function () { addSystem('上传失败'); });
+    imgInput.value = '';
+  });
+
+  // 引用工作区文件：@{路径}
+  document.getElementById('pmFile').addEventListener('click', function (e) {
+    e.stopPropagation();
+    plusMenu.classList.remove('show');
+    fetch('/api/files?token=' + encodeURIComponent(token))
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        fileList.innerHTML = '';
+        if (!res.files.length) {
+          fileList.innerHTML = '<button disabled style="color:var(--muted)">（工作区还没有文件）</button>';
+        }
+        res.files.forEach(function (f) {
+          var b = document.createElement('button');
+          b.textContent = '📄 ' + f;
+          b.addEventListener('click', function () {
+            input.value += (input.value ? ' ' : '') + '@{' + f + '}';
+            fileList.classList.remove('show');
+            input.focus();
+          });
+          fileList.appendChild(b);
+        });
+        fileList.classList.add('show');
+      })
+      .catch(function () { addSystem('读取工作区失败'); });
+  });
+
+  // 引用当前屏幕截图
+  document.getElementById('pmShot').addEventListener('click', function () {
+    plusMenu.classList.remove('show');
+    if (ws && ws.readyState === 1 && !busy) {
+      ws.send(JSON.stringify({ type: 'chat', text: '截屏，把当前桌面画面展示给我' }));
+      setBusy(true);
+    }
+  });
+
+  // 语音输入（浏览器 SpeechRecognition，支持中文）
+  var recog = null;
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
+    btnMic.style.opacity = .35;
+    btnMic.title = '当前浏览器不支持语音识别';
+  }
+  btnMic.addEventListener('click', function () {
+    if (!SR) { addSystem('当前浏览器不支持语音识别'); return; }
+    if (recog) { recog.stop(); return; }
+    recog = new SR();
+    recog.lang = 'zh-CN';
+    recog.interimResults = false;
+    btnMic.classList.add('rec');
+    recog.onresult = function (e) {
+      var t = e.results[0][0].transcript;
+      input.value += (input.value ? ' ' : '') + t;
+      input.focus();
+    };
+    recog.onend = function () { btnMic.classList.remove('rec'); recog = null; };
+    recog.onerror = function () { btnMic.classList.remove('rec'); recog = null; };
+    try { recog.start(); } catch (e) { recog = null; }
+  });
+
+  loadToolbar();
+
+  // ---------- / 快捷命令 ----------
+  var COMMANDS = [
+    { cmd: 'shot', label: '📷 截屏并展示', run: function () { document.getElementById('pmShot').click(); } },
+    { cmd: 'new', label: '🆕 新会话', run: function () { document.getElementById('btnNew').click(); } },
+    { cmd: 'compact', label: '🗜 压缩上下文', run: function () { document.getElementById('btnCompact').click(); } },
+    { cmd: 'retry', label: '↻ 重试上一轮', run: function () { document.getElementById('btnRetry').click(); } },
+    { cmd: 'weather', label: '🌤 查天气（发送询问）', run: function () { input.value = '查一下现在上海的天气'; } }
+  ];
+  input.addEventListener('input', function () {
+    var v = input.value;
+    if (!v.startsWith('/')) { fileList.classList.remove('show'); return; }
+    var q = v.slice(1).toLowerCase();
+    var hits = COMMANDS.filter(function (c) { return c.cmd.startsWith(q); });
+    fileList.innerHTML = '';
+    if (!hits.length) { fileList.classList.remove('show'); return; }
+    hits.forEach(function (c) {
+      var b = document.createElement('button');
+      b.textContent = '/' + c.cmd + '  ' + c.label;
+      b.addEventListener('click', function () {
+        input.value = '';
+        fileList.classList.remove('show');
+        c.run();
+      });
+      fileList.appendChild(b);
+    });
+    fileList.classList.add('show');
   });
 
   connect();

@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 import tomllib
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Header, HTTPException, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Header, HTTPException, Depends, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -267,6 +267,72 @@ class ChatRequest(BaseModel):
     message: str
 
 
+_UPLOAD_RE = re.compile(r"!\[[^\]]*\]\((/uploads/[^\s)]+\.(?:png|jpe?g|webp))\)", re.I)
+_CTX_RE = re.compile(r"@\{([^}]+)\}")
+
+
+def _expand_context(text: str) -> str:
+    """把 @{路径} 引用展开为文件内容（每个最多 6000 字符）"""
+    def repl(m):
+        p = Path(m.group(1)).expanduser()
+        if not p.is_absolute():
+            p = tools.WORKSPACE / p
+        try:
+            body = p.read_text(encoding="utf-8", errors="replace")[:6000]
+            return f"\n[文件 {p} 的内容]：\n```\n{body}\n```\n"
+        except OSError as e:
+            return f"\n[文件 {p} 读取失败：{e}]\n"
+    return _CTX_RE.sub(_expand_context, text) if "@{" in text else text
+
+
+def _to_vision_content(text: str):
+    """消息里含上传图片引用时转成多模态 content（供 vision 模型看图）"""
+    matches = _UPLOAD_RE.findall(text)
+    if not matches:
+        return text
+    parts = []
+    for url in matches:
+        fp = STATIC_DIR / url.lstrip("/")
+        if not fp.is_file():
+            continue
+        import base64
+        ext = "jpeg" if fp.suffix.lower() in (".jpg", ".jpeg") else fp.suffix.lstrip(".").lower()
+        b64 = base64.b64encode(fp.read_bytes()).decode()
+        parts.append({"type": "image_url", "image_url": {"url": f"data:image/{ext};base64,{b64}"}})
+    if not parts:
+        return text
+    parts.append({"type": "text", "text": _UPLOAD_RE.sub("[图片]", text)})
+    return parts
+
+
+@app.post("/api/upload", dependencies=[Depends(check_token)])
+async def api_upload(file: UploadFile):
+    """上传图片附件（随消息一起发给模型）"""
+    up = STATIC_DIR / "uploads"
+    up.mkdir(exist_ok=True)
+    ext = Path(file.filename or "img.png").suffix.lower() or ".png"
+    if ext not in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+        ext = ".png"
+    name = f"up_{int(time.time())}{ext}"
+    (up / name).write_bytes(await file.read())
+    return {"url": f"/uploads/{name}"}
+
+
+@app.get("/api/files", dependencies=[Depends(check_token)])
+async def api_files():
+    """列出工作区文件（@ 引用候选）"""
+    out = []
+    try:
+        for p in sorted(tools.WORKSPACE.rglob("*")):
+            if p.is_file() and not any(part.startswith(".") for part in p.parts):
+                out.append(str(p.relative_to(tools.WORKSPACE)))
+                if len(out) >= 300:
+                    break
+    except OSError:
+        pass
+    return {"workspace": str(tools.WORKSPACE), "files": out}
+
+
 @app.get("/api/status", dependencies=[Depends(check_token)])
 async def api_status():
     return get_status()
@@ -373,7 +439,8 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
     if announce:
         await manager.broadcast({"type": "user_message", "text": text, "ts": time.time()})
         feed_push("user_message", text=text)
-    history.append({"role": "user", "content": text})
+    # @{文件} 展开为内容；图片标记在 run_agent 里转成多模态 content
+    history.append({"role": "user", "content": text, "llm": _expand_context(text)})
     events: list[dict] = []
 
     # 上下文超长时自动压缩（摘要替换旧对话，不再直接丢弃）
@@ -498,7 +565,12 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
     """LLM + 工具调用循环（流式），思考链/工具调用/终端输出写入 events 供 UI 展示"""
     global pending_action
     sys_prompt = SYSTEM_PROMPT + (f"\n{extra_system}" if extra_system else "")
-    msgs = [{"role": "system", "content": sys_prompt}] + list(history)
+    msgs = [{"role": "system", "content": sys_prompt}]
+    for m in history:
+        content = m.get("llm") or m.get("content", "")
+        if m["role"] == "user":
+            content = _to_vision_content(content) if isinstance(content, str) else content
+        msgs.append({"role": m["role"], "content": content})
     streaming = False  # 是否已开始向用户流式输出正文
 
     async def on_delta(text: str):
