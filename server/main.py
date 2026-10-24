@@ -743,14 +743,6 @@ async def _start_https():
     asyncio.create_task(uvicorn.Server(cfg2).serve())
 
 
-def summarize_tool(name: str, args: dict) -> str:
-    if name == "run_command":
-        cmd = str(args.get("command", ""))
-        return cmd if len(cmd) <= 120 else cmd[:120] + "…"
-    s = json.dumps(args, ensure_ascii=False)
-    return s if len(s) <= 120 else s[:120] + "…"
-
-
 _REFUSAL_MARKS = ["我不会", "我不能", "无法执行", "无法直接执行", "恕我不能", "不执行", "拒绝执行",
                   "我不会执行", "我没办法", "不允许", "不建议执行"]
 
@@ -851,10 +843,14 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
 
                 # 文件改动识别（run_command）
                 files = tools.extract_writes(str(args.get("command", ""))) if name == "run_command" else []
-                event = {"type": "tool", "name": name, "summary": summarize_tool(name, args), "files": files}
+                label = tools.cn_name(name)
+                summary = tools.summarize_tool(name, args)
+                event = {"type": "tool", "name": name, "label": label,
+                         "summary": summary, "files": files}
                 if name in ("read_file", "write_file", "edit_file", "list_dir"):
                     event["path"] = str(args.get("path", ""))
-                await manager.broadcast({"type": "tool_activity", "text": f"{name}：{event['summary']}", "ts": time.time()})
+                activity = f"正在{label}：{summary}" if summary else f"正在{label}"
+                await manager.broadcast({"type": "tool_activity", "text": activity, "ts": time.time()})
 
                 result = await tools.execute(name, args)
                 # 终端输出截断后随事件展示（网页端显示为终端块）

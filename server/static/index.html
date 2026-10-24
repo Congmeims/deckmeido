@@ -738,7 +738,7 @@
       case 'list_emulator_roms': return { ico: '🕹', text: '已扫描模拟器 ROM' };
       case 'check_system_updates': return { ico: '⬆️', text: '已检查系统更新' };
       case 'install_game': return { ico: '📥', text: '已安装游戏', chip: ev.summary };
-      default:            return { ico: '🔧', text: '已调用 ' + ev.name, chip: ev.summary };
+      default:            return { ico: '🔧', text: '已完成 ' + (ev.label || ev.name), chip: ev.summary };
     }
   }
 

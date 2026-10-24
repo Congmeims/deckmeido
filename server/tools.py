@@ -14,6 +14,30 @@ import httpx
 
 HTTP = httpx.AsyncClient(timeout=20, follow_redirects=True)
 
+# ---------- 工具中文名（界面提示统一用中文，不暴露内部函数名） ----------
+
+TOOL_CN: dict[str, str] = {
+    "get_weather": "查询天气",
+    "web_search": "联网搜索",
+    "list_installed_games": "查看游戏库",
+    "find_game": "搜索商店游戏",
+    "check_system_updates": "检查系统更新",
+    "install_game": "安装游戏",
+    "list_emulator_roms": "扫描模拟器游戏",
+    "run_command": "执行命令",
+    "screenshot": "截取屏幕",
+    "list_dir": "查看目录",
+    "read_file": "读取文件",
+    "write_file": "写入文件",
+    "edit_file": "编辑文件",
+}
+
+
+def cn_name(name: str) -> str:
+    """工具中文名，未登记的回退为原名"""
+    return TOOL_CN.get(name, name)
+
+
 # ---------- 工具定义（OpenAI function calling 格式） ----------
 
 TOOLS: list[dict] = [
@@ -290,13 +314,39 @@ def is_confirm(text: str) -> bool:
     return text.strip().lower() in _CONFIRM_WORDS
 
 
+def summarize_tool(name: str, args: dict) -> str:
+    """工具调用的简短中文说明（作为界面提示，不含内部函数名和 JSON 括号）"""
+    if name == "run_command":
+        cmd = str(args.get("command", ""))
+        return cmd if len(cmd) <= 120 else cmd[:120] + "…"
+    if name == "web_search":
+        return f"「{args.get('query', '')}」"
+    if name == "get_weather":
+        return f"「{args.get('city', '')}」"
+    if name == "find_game":
+        return f"「{args.get('name', '')}」"
+    if name == "install_game":
+        return f"「{args.get('appid', '')}」"
+    if name in ("read_file", "write_file", "edit_file", "list_dir"):
+        path = str(args.get("path", ""))
+        return path.split("/")[-1] or path
+    # 无需参数的简单操作：不显示多余说明
+    if name in ("screenshot", "list_installed_games", "check_system_updates", "list_emulator_roms"):
+        return ""
+    if not args:
+        return ""
+    s = json.dumps(args, ensure_ascii=False)
+    return s if len(s) <= 120 else s[:120] + "…"
+
+
 def describe(name: str, args: dict) -> str:
     """危险操作的人类可读描述"""
     if name == "install_game":
         return f"下载安装 Steam 游戏（appid: {args.get('appid')}）"
     if name == "run_command":
         return f"执行命令：{args.get('command', '')}\n目的：{args.get('reason', '')}"
-    return f"执行 {name}({json.dumps(args, ensure_ascii=False)})"
+    detail = summarize_tool(name, args)
+    return f"{cn_name(name)}：{detail}" if detail else cn_name(name)
 
 
 # ---------- 工具实现 ----------
