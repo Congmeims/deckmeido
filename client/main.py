@@ -264,6 +264,12 @@ class MainWindow(QMainWindow):
                         f'<pre style="background:#0b0d13; color:#c8d3e0; font-size:12px;'
                         f' padding:8px; border-radius:6px; margin:2px 0 4px 12px;">{out}</pre>'
                     )
+                if ev.get("image"):
+                    url = f"http://127.0.0.1:18765{ev['image']}?token={self.token}"
+                    self.chat.append(
+                        f'<div style="margin:2px 0 4px 12px;">'
+                        f'<a href="{url}" style="color:#1a9fff;">📷 查看截图</a></div>'
+                    )
                 for f in ev.get("files") or []:
                     self.chat.append(
                         f'<div style="font-size:12px; color:#7ddba3; margin:0 0 2px 18px;">'
@@ -271,25 +277,37 @@ class MainWindow(QMainWindow):
                     )
 
     def send(self):
+        # 忙碌中点击 = 终止当前操作
+        if self.worker and self.worker.isRunning():
+            try:
+                api_post("/api/cancel", self.token, {}, timeout=5)
+            except Exception:
+                pass
+            self.send_btn.setText("发送")
+            self.send_btn.setStyleSheet("")
+            return
         text = self.input.text().strip()
-        if not text or (self.worker and self.worker.isRunning()):
+        if not text:
             return
         self.input.clear()
         self.append_msg("user", text)
         self.chat.append('<span style="color:#8b91a3; font-size:13px;">DeckMate 正在输入…</span>')
-        self.send_btn.setEnabled(False)
+        self.send_btn.setText("⏹")
+        self.send_btn.setStyleSheet("background:#e8463a;")
         self.worker = ChatWorker(self.token, text)
         self.worker.done.connect(self.on_reply)
         self.worker.failed.connect(self.on_error)
         self.worker.start()
 
     def on_reply(self, res: dict):
-        self.send_btn.setEnabled(True)
+        self.send_btn.setText("发送")
+        self.send_btn.setStyleSheet("")
         self.append_events(res.get("events"))
         self.append_msg("assistant", res.get("reply", ""))
 
     def on_error(self, err: str):
-        self.send_btn.setEnabled(True)
+        self.send_btn.setText("发送")
+        self.send_btn.setStyleSheet("")
         self.append_msg("assistant", f"出错了：{err}")
 
     def open_settings(self):

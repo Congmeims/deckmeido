@@ -119,7 +119,9 @@
     max-height: 220px; overflow-y: auto;
   }
   .ev.file { background: rgba(46,204,113,.1); color: #7ddba3; font-family: ui-monospace, monospace; font-size: 12px; margin-left: 18px; }
+  .ev .shot { display: block; margin-top: 8px; max-width: 100%; border-radius: 8px; border: 1px solid rgba(255,255,255,.12); }
   .stream-body { white-space: pre-wrap; word-break: break-word; }
+  #send.stop { background: var(--danger); }
 
   /* 正在输入 */
   .typing { display: inline-flex; gap: 4px; padding: 4px 2px; }
@@ -427,6 +429,14 @@
         term.textContent = ev.output;
         t.appendChild(term);
       }
+      if (ev.image) {
+        var img = document.createElement('img');
+        img.className = 'shot';
+        img.src = ev.image + '?token=' + encodeURIComponent(token);
+        img.alt = '屏幕截图';
+        img.addEventListener('click', function () { window.open(img.src, '_blank'); });
+        t.appendChild(img);
+      }
       box.appendChild(t);
       (ev.files || []).forEach(function (f) {
         var fc = document.createElement('div');
@@ -549,6 +559,7 @@
           break;
         case 'assistant_message':
           hideTyping();
+          setBusy(false);
           if (streamEl && streamEl.parentNode) streamEl.parentNode.removeChild(streamEl);
           streamEl = null; streamBody = null;
           if (msg.events && msg.events.length) {
@@ -607,10 +618,27 @@
     }
   }
 
+  var busy = false;
+
+  function setBusy(b) {
+    busy = b;
+    sendBtn.textContent = b ? '⏹' : '发送';
+    sendBtn.classList.toggle('stop', b);
+  }
+
   function send() {
+    if (busy) {
+      // 终止当前操作
+      fetch('/api/cancel?token=' + encodeURIComponent(token), { method: 'POST' })
+        .catch(function () {});
+      setBusy(false);
+      hideTyping();
+      return;
+    }
     var text = input.value.trim();
     if (!text || !ws || ws.readyState !== 1) return;
     ws.send(JSON.stringify({ type: 'chat', text: text }));
+    setBusy(true);
     input.value = '';
     input.style.height = 'auto';
     input.focus();

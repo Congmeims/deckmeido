@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
 import os
 import re
 import shlex
+import shutil
 from pathlib import Path
 
 import httpx
@@ -117,6 +119,14 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "screenshot",
+            "description": "截取当前桌面屏幕画面，直接展示给用户。排查问题、用户要求看屏幕时使用",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 # 危险操作：任何权限模式下都需确认
@@ -161,10 +171,21 @@ def extract_writes(cmd: str) -> list[str]:
     return files[:10]
 
 
+def _fix_display_env(env: dict):
+    """补全桌面会话环境变量：X11/Wayland(Xwayland) 授权文件路径每次开机随机"""
+    env.setdefault("DISPLAY", ":0")
+    if not env.get("XAUTHORITY"):
+        hits = glob.glob("/run/user/1000/xauth_*") or glob.glob("/run/user/1000/.mutter-Xwaylandauth*")
+        if hits:
+            env["XAUTHORITY"] = hits[0]
+        elif (Path.home() / ".Xauthority").exists():
+            env["XAUTHORITY"] = str(Path.home() / ".Xauthority")
+
+
 async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin: str = "") -> str:
     timeout = max(1, min(int(timeout or 60), 300))
     env = dict(os.environ)
-    env.setdefault("DISPLAY", ":0")
+    _fix_display_env(env)
     feed = None
     if stdin:
         # 用 script 包一层伪终端：/dev/tty 读取和交互菜单都能收到 stdin 输入
@@ -187,6 +208,11 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
         return (f"命令超时（{timeout}s），已强制终止。\n"
                 "提示：若命令需要多次交互输入，请在 stdin 里按行准备好全部答案；"
                 "若是长任务，请用 nohup ... > /tmp/日志 2>&1 & 放后台")
+    except asyncio.CancelledError:
+        # 用户点了终止：杀掉进程并向上传递取消
+        proc.kill()
+        await proc.wait()
+        raise
     text = out.decode("utf-8", "replace").strip()
     if stdin:
         # 伪终端会回显输入，把疑似密码的行打码（短输入如菜单选项保留）
@@ -402,6 +428,38 @@ async def _list_emulator_roms(system: str = "") -> str:
     return f"共 {sum(counts.values())} 个游戏文件：\n" + "\n".join(lines)
 
 
+async def _screenshot() -> str:
+    """截取当前桌面画面（Wayland 优先用 KWin spectacle，X11 退回 mss）"""
+    import time
+
+    shots_dir = Path(__file__).resolve().parent / "static" / "shots"
+    shots_dir.mkdir(exist_ok=True)
+    # 只保留最近 20 张截图
+    old = sorted(shots_dir.glob("shot_*.png"), key=lambda p: p.stat().st_mtime)
+    for p in old[:-20]:
+        p.unlink(missing_ok=True)
+    name = f"shot_{int(time.time())}.png"
+    path = shots_dir / name
+
+    env = dict(os.environ)
+    _fix_display_env(env)
+    done = False
+    if shutil.which("spectacle"):
+        proc = await asyncio.create_subprocess_exec(
+            "spectacle", "-bno", str(path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
+        )
+        await proc.wait()
+    if not path.exists() or path.stat().st_size < 10000:
+        # spectacle 不可用或截到黑屏（Xwayland rootless）时退回 mss
+        import mss
+        with mss.mss() as sct:
+            sct.shot(output=str(path))
+    if not path.exists():
+        return "截图失败：spectacle 与 mss 都不可用"
+    return f"截图完成：/shots/{name}（画面已展示给用户；你看不到图，只需告知已截取）"
+
+
 EXECUTORS = {
     "get_weather": _get_weather,
     "web_search": _web_search,
@@ -411,6 +469,7 @@ EXECUTORS = {
     "install_game": _install_game,
     "list_emulator_roms": _list_emulator_roms,
     "run_command": _run_command,
+    "screenshot": _screenshot,
 }
 
 

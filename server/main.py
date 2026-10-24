@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
 import shutil
 import subprocess
@@ -100,6 +101,8 @@ def build_system_prompt() -> str:
         "文件管理、进程控制、xdotool 桌面操作（DISPLAY=:0）、截屏、Steam 控制、软件安装等，"
         "遇到任务先想 Shell 方案。另外还有便捷工具：查天气、搜索网页、查看已安装游戏、"
         "商店搜游戏、扫描模拟器 ROM、检查系统更新、安装游戏。\n"
+        "screenshot 工具可截取当前桌面画面展示给用户：排查问题、确认状态或用户要求看屏幕时主动使用"
+        "（画面会直接显示在聊天里，你自己看不到图，只需确认已截取）。\n"
         "环境：SteamOS holo、桌面模式 X11、家目录 /home/deck、SD 卡在 /run/media 下。\n"
         "规则：\n"
         f"- {mode_desc}\n"
@@ -241,7 +244,31 @@ async def api_chat(req: ChatRequest):
     text = req.message.strip()
     if not text:
         raise HTTPException(status_code=400, detail="empty message")
-    return await handle_chat(text)
+    return await start_chat(text)
+
+
+# 当前正在处理的对话任务（用于终止按钮）
+current_task: asyncio.Task | None = None
+
+
+async def start_chat(text: str):
+    """把一轮对话放到可取消的任务里执行"""
+    global current_task
+    current_task = asyncio.create_task(handle_chat(text))
+    try:
+        return await current_task
+    except asyncio.CancelledError:
+        return {"reply": "⏹ 已终止当前操作", "events": [], "cancelled": True}
+    finally:
+        current_task = None
+
+
+@app.post("/api/cancel", dependencies=[Depends(check_token)])
+async def api_cancel():
+    if current_task and not current_task.done():
+        current_task.cancel()
+        return {"ok": True}
+    return {"ok": False, "detail": "no active task"}
 
 
 class ConfigUpdate(BaseModel):
@@ -291,21 +318,27 @@ async def handle_chat(text: str) -> dict:
     del history[:-HISTORY_LIMIT]
     events: list[dict] = []
 
-    if not llm.configured:
-        reply = "LLM 未配置 API Key。请在设置里填入 api_key。"
-    elif pending_action and tools.is_confirm(text):
-        # 用户确认了挂起的危险操作
-        action, pending_action = pending_action, None
-        events.append({"type": "tool", "name": action["name"],
-                       "summary": action["description"], "files": [], "approved": True})
-        result = await tools.execute(action["name"], action["args"])
-        reply = f"已完成：{action['description']}\n{result}"
-    elif pending_action:
-        # 有新消息但未确认，取消挂起操作
-        action, pending_action = pending_action, None
-        reply = f"已取消：{action['description']}。\n\n" + await run_agent(events)
-    else:
-        reply = await _run_agent_guarded(events)
+    try:
+        if not llm.configured:
+            reply = "LLM 未配置 API Key。请在设置里填入 api_key。"
+        elif pending_action and tools.is_confirm(text):
+            # 用户确认了挂起的危险操作
+            action, pending_action = pending_action, None
+            events.append({"type": "tool", "name": action["name"],
+                           "summary": action["description"], "files": [], "approved": True})
+            result = await tools.execute(action["name"], action["args"])
+            reply = f"已完成：{action['description']}\n{result}"
+        elif pending_action:
+            # 有新消息但未确认，取消挂起操作
+            action, pending_action = pending_action, None
+            reply = f"已取消：{action['description']}。\n\n" + await run_agent(events)
+        else:
+            reply = await _run_agent_guarded(events)
+    except asyncio.CancelledError:
+        # 用户点了终止：广播终止消息并向上传递
+        await manager.broadcast({"type": "assistant_message", "text": "⏹ 已终止当前操作",
+                                 "ts": time.time(), "events": events, "cancelled": True})
+        raise
 
     history.append({"role": "assistant", "content": reply})
     await manager.broadcast({"type": "assistant_message", "text": reply, "ts": time.time(), "events": events})
@@ -411,6 +444,10 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
                 result = await tools.execute(name, args)
                 # 终端输出截断后随事件展示（网页端显示为终端块）
                 event["output"] = result[:1500] + ("\n…（截断）" if len(result) > 1500 else "")
+                if name == "screenshot":
+                    m = re.search(r"/shots/\S+?\.png", result)
+                    if m:
+                        event["image"] = m.group(0)
                 events.append(event)
                 await manager.broadcast({"type": "tool_done", "event": event, "ts": time.time()})
                 msgs.append({"role": "tool", "tool_call_id": call["id"], "content": result})
@@ -432,7 +469,10 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
         while True:
             data = await ws.receive_json()
             if data.get("type") == "chat":
-                await handle_chat(str(data.get("text", "")).strip())
+                try:
+                    await start_chat(str(data.get("text", "")).strip())
+                except asyncio.CancelledError:
+                    pass  # 用户点了终止，保持 ws 连接
     except WebSocketDisconnect:
         manager.disconnect(ws)
     except Exception:
