@@ -82,11 +82,13 @@ class LLMClient:
         """流式调用：正文增量经 on_delta、思维链增量经 on_thought 回调，最终返回聚合后的完整 message"""
         payload = {"model": self.model, "messages": messages,
                    "tools": tools, "tool_choice": "auto", "stream": True,
+                   "stream_options": {"include_usage": True},
                    "max_tokens": self.max_tokens}
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_acc: dict[int, dict] = {}
         finish_reason = None
+        usage = None
         async with self._client.stream(
             "POST", f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -103,6 +105,9 @@ class LLMClient:
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                # 部分服务商在流末尾单独发一个只含 usage 的分片（需 stream_options）
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
                 delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
                 fr = (chunk.get("choices") or [{}])[0].get("finish_reason")
                 if fr:
@@ -135,6 +140,8 @@ class LLMClient:
             msg["reasoning_content"] = "".join(reasoning_parts)
         if tool_acc:
             msg["tool_calls"] = [tool_acc[i] for i in sorted(tool_acc)]
+        if usage:
+            msg["usage"] = usage
         return msg
 
     async def close(self):

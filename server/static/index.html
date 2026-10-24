@@ -53,6 +53,8 @@
     padding: 4px 10px; border-radius: 999px;
     white-space: nowrap;
   }
+  .badge.warn { color: #b8860b; }
+  .badge.danger { color: #d0492b; }
 
   /* 横向菜单栏 */
   #menuBar {
@@ -518,7 +520,6 @@
 
 <nav id="menuBar">
   <button class="menu-btn" id="btnNew">新会话</button>
-  <button class="menu-btn" id="btnCompact">压缩上下文</button>
   <button class="menu-btn" id="btnShot">截屏</button>
   <button class="menu-btn" id="btnRetry">重试</button>
   <button class="menu-btn" id="btnShare">分享</button>
@@ -1040,6 +1041,14 @@
     ws.onerror = function () { try { ws.close(); } catch (e) {} };
   }
 
+  // token 数简写：12345 → 12.3k，1234567 → 1.2M
+  function fmtTokens(n) {
+    if (!n) return '0';
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(n >= 100000 ? 0 : 1) + 'k';
+    return String(n);
+  }
+
   function renderStatus(s) {
     if (s.battery != null) {
       batteryBadge.hidden = false;
@@ -1051,8 +1060,15 @@
     }
     if (s.context) {
       ctxBadge.hidden = false;
-      ctxBadge.textContent = '上下文 ' + s.context.messages + '/' + s.context.limit;
-      ctxBadge.title = '上下文约 ' + s.context.chars + ' 字符 · 工作区 ' + (s.workspace || '');
+      var c = s.context;
+      var pct = c.percent || 0;
+      ctxBadge.textContent = '上下文 ' + pct + '%' + (c.used ? (' · ' + fmtTokens(c.used) + '/' + fmtTokens(c.window)) : '');
+      ctxBadge.title = '模型窗口 ' + (c.window || 0).toLocaleString() + ' tokens'
+        + (c.used ? ('\n当前约 ' + c.used.toLocaleString() + ' tokens') : '')
+        + '\n达到 ' + c.compact_at + '% 时自动压缩';
+      // 用量越接近上限越醒目：85% 起变黄，95% 变红
+      ctxBadge.classList.toggle('warn', pct >= 85 && pct < 95);
+      ctxBadge.classList.toggle('danger', pct >= 95);
     }
     if (s.llm_configured === false) {
       addSystem('提示：LLM API Key 未配置，详见 config.toml');
@@ -1151,13 +1167,6 @@
     fetch('/api/sessions/create?token=' + encodeURIComponent(token), { method: 'POST' })
       .then(function () { refreshStatus(); })
       .catch(function () { addSystem('操作失败'); });
-  });
-  document.getElementById('btnCompact').addEventListener('click', function () {
-    addSystem('正在压缩上下文…');
-    fetch('/api/compact?token=' + encodeURIComponent(token), { method: 'POST' })
-      .then(function (r) { return r.json(); })
-      .then(function (res) { addSystem('压缩完成：' + (res.summary || '').slice(0, 120)); refreshStatus(); })
-      .catch(function () { addSystem('压缩失败'); });
   });
   document.getElementById('btnShot').addEventListener('click', function () {
     if (ws && ws.readyState === 1 && !busy) {
@@ -1729,7 +1738,6 @@
   var COMMANDS = [
     { cmd: 'shot', label: '截屏并展示', run: function () { document.getElementById('pmShot').click(); } },
     { cmd: 'new', label: '新会话', run: function () { document.getElementById('btnNew').click(); } },
-    { cmd: 'compact', label: '压缩上下文', run: function () { document.getElementById('btnCompact').click(); } },
     { cmd: 'retry', label: '重试上一轮', run: function () { document.getElementById('btnRetry').click(); } },
     { cmd: 'weather', label: '查天气（发送询问）', run: function () { input.value = '查一下现在上海的天气'; } }
   ];

@@ -86,8 +86,62 @@ llm = LLMClient(
 )
 
 PERSONA = CFG.get("persona", {})
-HISTORY_LIMIT = int(CFG["agent"].get("history_limit", 20))
 MAX_TOOL_ROUNDS = int(CFG["agent"].get("max_tool_rounds", 12))
+
+# 上下文窗口（真实模型支持的总 token 数）。配 0 表示自动按模型名推断。
+# 用量优先取服务商返回的 usage.prompt_tokens，拿不到再按字符估算。
+CONTEXT_WINDOW = int(CFG["agent"].get("context_window", 0))
+COMPACT_RATIO = float(CFG["agent"].get("compact_ratio", 0.95))
+# 最近一次请求的 token 用量：由服务商 usage 或字符估算更新
+_ctx_used = 0
+
+
+def _guess_context_window(model: str) -> int:
+    """按模型名推断上下文窗口，识别不出时给个保守值"""
+    m = (model or "").lower()
+    table = [
+        ("gemini", 1_000_000),
+        ("claude", 200_000),
+        ("gpt-4.1", 1_000_000),
+        ("gpt-4o", 128_000),
+        ("gpt-4", 128_000),
+        ("o1", 200_000), ("o3", 200_000), ("o4", 200_000),
+        ("qwen-long", 10_000_000),
+        ("qwen", 128_000),
+        ("kimi", 256_000),
+        ("glm-4.6", 200_000), ("glm-4.5", 128_000), ("glm", 128_000),
+        ("deepseek", 128_000),
+        ("llama", 128_000),
+        ("mistral", 128_000),
+    ]
+    for key, size in table:
+        if key in m:
+            return size
+    return 128_000
+
+
+def context_window() -> int:
+    return CONTEXT_WINDOW or _guess_context_window(llm.model)
+
+
+def _estimate_tokens(msgs: list[dict]) -> int:
+    """粗估 token：中文约 1 字 1 token，英文约 4 字符 1 token，另加每条消息的固定开销"""
+    total = 0
+    for m in msgs:
+        text = str(m.get("content") or "") + str(m.get("reasoning_content") or "")
+        cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+        total += cjk + (len(text) - cjk) // 4 + 8
+        for tc in m.get("tool_calls") or []:
+            total += len(str(tc.get("function", {}).get("arguments") or "")) // 4 + 8
+    return total
+
+
+def _split_usage(usage: dict) -> int:
+    """从 usage 里取本次请求真正占用的输入 token"""
+    if not isinstance(usage, dict):
+        return 0
+    return int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+
 
 
 def build_system_prompt() -> str:
@@ -305,6 +359,9 @@ def get_status() -> dict:
     except OSError:
         pass
     gaming = subprocess.run(["pgrep", "-x", "gamescope"], capture_output=True).returncode == 0
+    win = context_window()
+    used = _ctx_used or _estimate_tokens(history)
+    pct = round(min(used / win, 1.0) * 100, 1) if win else 0
     return {
         "battery": int(battery) if battery.isdigit() else None,
         "charging": charging or None,
@@ -314,8 +371,11 @@ def get_status() -> dict:
         "model": llm.model,
         "context": {
             "messages": len(history),
-            "limit": HISTORY_LIMIT,
             "chars": sum(len(str(m.get("content", ""))) for m in history),
+            "used": used,
+            "window": win,
+            "percent": pct,
+            "compact_at": round(COMPACT_RATIO * 100),
         },
         "workspace": str(tools.WORKSPACE),
     }
@@ -555,8 +615,8 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
     save_current_session()
     await manager.broadcast({"type": "session_changed", "current": current_sid})
 
-    # 上下文超长时自动压缩（摘要替换旧对话，不再直接丢弃）
-    if len(history) > HISTORY_LIMIT:
+    # 上下文逼近模型窗口上限时自动压缩（摘要替换旧对话，不再直接丢弃）
+    if _ctx_used / context_window() >= COMPACT_RATIO:
         await compact_history(auto=True)
 
     try:
@@ -597,6 +657,7 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
 
 async def compact_history(auto: bool = False) -> str:
     """把较早的对话压缩成摘要，保留最近几轮原样。返回摘要文本"""
+    global _ctx_used
     if len(history) <= 4:
         return "对话还很短，无需压缩"
     keep = 4
@@ -604,6 +665,7 @@ async def compact_history(auto: bool = False) -> str:
     if not llm.configured:
         # 没配 LLM 就退化为直接截断
         history[:] = history[-keep:]
+        _ctx_used = _estimate_tokens(history)
         return "未配置 LLM，已直接截断旧对话"
     transcript = "\n".join(
         f"{'用户' if m['role'] == 'user' else '助手'}: {m['content'][:500]}" for m in old
@@ -615,10 +677,12 @@ async def compact_history(auto: bool = False) -> str:
         ])
     except Exception as e:
         history[:] = history[-keep:]
+        _ctx_used = _estimate_tokens(history)
         return f"压缩失败，已截断旧对话：{e}"
     history[:] = [{"role": "system", "content": f"【此前对话摘要，供上下文延续】\n{summary}"}] + history[-keep:]
+    _ctx_used = _estimate_tokens(history)
     save_current_session()
-    note = f"{'🗜 已自动压缩上下文' if auto else '🗜 已压缩上下文'}（{len(old)} 条旧消息 → 摘要）"
+    note = f"{'已自动压缩上下文' if auto else '已压缩上下文'}（{len(old)} 条旧消息 → 摘要）"
     await manager.broadcast({"type": "system", "text": note, "ts": time.time()})
     feed_push("system", text=note)
     return summary
@@ -922,7 +986,7 @@ async def _run_agent_guarded(events: list[dict]) -> str:
 
 async def run_agent(events: list[dict], extra_system: str = "") -> str:
     """LLM + 工具调用循环（流式），思考链/工具调用/终端输出写入 events 供 UI 展示"""
-    global pending_action
+    global pending_action, _ctx_used
     sys_prompt = SYSTEM_PROMPT + (f"\n{extra_system}" if extra_system else "")
     msgs = [{"role": "system", "content": sys_prompt}]
     for m in history:
@@ -950,10 +1014,21 @@ async def run_agent(events: list[dict], extra_system: str = "") -> str:
 
     try:
         for _ in range(MAX_TOOL_ROUNDS):
+            # 单轮里工具往返也会堆积上下文，超过阈值就先压缩再继续
+            if len(msgs) > 6 and _estimate_tokens(msgs) / context_window() >= COMPACT_RATIO:
+                await compact_history(auto=True)
+                msgs[:] = [{"role": "system", "content": sys_prompt}] + [
+                    {"role": m["role"], "content": m.get("content", "")} for m in history]
+                streaming = False
+
             msg = await llm.chat_with_tools_stream(msgs, tools.TOOLS, on_delta=on_delta, on_thought=on_thought)
             if thought_open:
                 await manager.broadcast({"type": "thought_end", "ts": time.time()})
                 thought_open = False
+
+            # 记录本轮真实占用：优先服务商的 prompt_tokens，拿不到就按字符估算
+            _ctx_used = _split_usage(msg.get("usage")) or _estimate_tokens(msgs)
+            await manager.broadcast({"type": "status", "data": get_status()})
 
             # 思维链（reasoning_content，DeepSeek/Qwen 等支持）
             reasoning = (msg.get("reasoning_content") or "").strip()
