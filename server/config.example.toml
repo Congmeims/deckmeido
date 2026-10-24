@@ -37,7 +37,8 @@ extra = ""
 
 [tts]
 # 回复语音播报（调用 Deck 内置 TTS，在 Deck 扬声器上播放）
-enable = true
+# 默认关闭，需要时在网页设置页勾选，或把这里改成 true
+enable = false
 # 引擎命令：espeak-ng / espeak / spd-say
 engine = "espeak-ng"
 # espeak-ng 语言：cmn=普通话，en-us=英语

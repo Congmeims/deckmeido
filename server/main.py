@@ -226,7 +226,11 @@ def apply_config(cfg: dict):
     llm.model = c["model"]
     llm.reasoning_effort = str(c.get("reasoning_effort", "high"))
     t = cfg.get("tts", {})
+    was_enabled = tts.enable
     tts.enable = bool(t.get("enable", False))
+    # 关掉播报时立刻掐断正在念的那句，不能等它自己读完
+    if was_enabled and not tts.enable:
+        asyncio.create_task(tts.stop())
     tts.voice = t.get("voice", "cmn")
     tts.speed = int(t.get("speed", 170))
     PERMISSION_MODE = cfg.get("security", {}).get("permission_mode", "auto")

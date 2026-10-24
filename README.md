@@ -163,7 +163,7 @@ bash install.sh uninstall --purge   # 连配置与工作区一起删
 | | `context_window` | 窗口大小，`0` 表示按模型名推断 |
 | | `compact_ratio` | 触发压缩的占用比例，默认 0.95 |
 | `[persona]` | `name` / `traits` / `extra` | 人格名称与性格描述，改这里就换人格 |
-| `[tts]` | `enable` / `engine` / `voice` | 语音播报开关与引擎参数 |
+| `[tts]` | `enable` / `engine` / `voice` | 语音播报开关（默认 `false`）与引擎参数 |
 | `[security]` | `permission_mode` | `manual` / `auto` / `full` |
 | `[workspace]` | `dir` | 编程与文件任务的默认工作区，留空则用 `~/deckmeido_workspace` |
 
