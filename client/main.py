@@ -14,7 +14,7 @@ import urllib.request
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPushButton, QCheckBox, QTextBrowser,
@@ -281,6 +281,9 @@ def main():
         return 1
 
     win = MainWindow(load_token())
+    icon_path = DECKMATE_DIR / "assets" / "logo.jpg"
+    if icon_path.exists():
+        win.setWindowIcon(QIcon(str(icon_path)))
     win.show()
     return app.exec()
 
