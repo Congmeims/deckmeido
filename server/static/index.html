@@ -1416,7 +1416,7 @@
     ws.onclose = function (ev) {
       setConnected(false);
       hideTyping();
-      // 断联时把忙碌态复位：旧逻辑保留 busy=true，发送键一直停在 ⏹，
+      // 断联时把忙碌态复位：旧逻辑保留 busy=true，发送键一直停在终止态，
       // 点了只会发 cancel（完全不发消息），主人看到的就是「按钮卡死」
       setBusy(false);
       streamEl = null; streamBody = null;
@@ -1603,7 +1603,7 @@
   function renderStatus(s) {
     renderControls(s.controls);
     // 重连后的第一次状态回报：对齐「服务端是否还在跑」，
-    // 空闲就把断联期间暂存的队列补发出去，运行中就继续保持 ⏹
+    // 空闲就把断联期间暂存的队列补发出去，运行中就继续保持终止态
     if (awaitingResync) {
       awaitingResync = false;
       if (s.running) {
@@ -1726,9 +1726,9 @@
   }
 
   function updateSendBtn() {
-    // 运行中且输入框为空 → ⏹ 终止；运行中但有文字 → 发送（排队）
+    // 运行中且输入框为空 → 「终止」；运行中但有文字 → 发送（排队）
     if (busy && !input.value.trim()) {
-      sendBtn.textContent = '⏹';
+      sendBtn.textContent = '终止';
       sendBtn.classList.add('stop');
     } else {
       sendBtn.textContent = '发送';
@@ -1798,7 +1798,7 @@
         updateSendBtn();
         input.focus();
       } else {
-        // 输入框为空：⏹ 终止当前操作
+        // 输入框为空：终止当前操作
         fetch('/api/cancel?token=' + encodeURIComponent(token), { method: 'POST' })
           .catch(function () {});
         setBusy(false);
