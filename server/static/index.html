@@ -872,7 +872,11 @@
     </div>
     <div class="field">
       <label>API Key</label>
-      <input id="cfgApiKey" type="password" placeholder="sk-…" autocomplete="off">
+      <div class="token-row">
+        <input id="cfgApiKey" type="password" placeholder="sk-…" autocomplete="off">
+        <button id="clearApiKey" class="mini-btn" type="button">清除</button>
+      </div>
+      <div id="apiKeyHint" class="field-hint"></div>
     </div>
     <div class="field field-row">
       <label style="margin:0">语音播报回复</label>
@@ -1840,6 +1844,10 @@
   var settingsPanel = document.getElementById('settingsPanel');
   var cfgBaseUrl = document.getElementById('cfgBaseUrl');
   var cfgApiKey = document.getElementById('cfgApiKey');
+  var clearApiKey = document.getElementById('clearApiKey');
+  var apiKeyHint = document.getElementById('apiKeyHint');
+  // 覆盖写时要不要显式清空 Key：点「清除」才置 true，其余情况一律按「不改」提交
+  var apiKeyClear = false;
   var cfgTts = document.getElementById('cfgTts');
   var cfgPerm = document.getElementById('cfgPerm');
   var cfgWorkspace = document.getElementById('cfgWorkspace');
@@ -1937,7 +1945,19 @@
       })
       .then(function (c) {
         cfgBaseUrl.value = c.base_url || '';
-        cfgApiKey.value = c.api_key || '';
+        // 服务端不再下发明文 Key，只给「已配置」+ 打码值。
+        // 输入框留空，占位符显示打码值 —— 让主人一眼看到「有 Key」，
+        // 但即使拿到访问令牌也抄不走。不填就等于不改（见后端注释）。
+        apiKeyClear = false;
+        cfgApiKey.value = '';
+        var masked = c.api_key_masked || c.api_key || '';
+        // 兼容旧后端：还没重启升级时它没有 api_key_set 字段，
+        // 那就按「有 api_key 就是已配置」来判断，免得误显示成「还没配置」
+        var keySet = (typeof c.api_key_set === 'boolean') ? c.api_key_set : !!masked;
+        cfgApiKey.placeholder = keySet ? masked + '（已配置，留空则不修改）' : 'sk-…';
+        apiKeyHint.textContent = keySet
+          ? '已配置：' + masked + '　要更换请直接填新的，留空保存不会改动它'
+          : '还没有配置 Key';
         cfgTts.checked = c.tts_enable;
         cfgPerm.value = c.permission_mode || 'auto';
         cfgWorkspace.value = c.workspace || '';
@@ -1983,6 +2003,22 @@
       .catch(function () { tokenHint.textContent = '生成失败'; });
   });
 
+  // 清除 Key：不立即提交，等点「保存」时才带上 clear_api_key，
+  // 免得手滑点一下就把能用的 Key 弄没了
+  clearApiKey.addEventListener('click', function () {
+    apiKeyClear = true;
+    cfgApiKey.value = '';
+    cfgApiKey.placeholder = '保存后将被清空';
+    apiKeyHint.textContent = '已标记清除，点「保存」后生效';
+  });
+  // 一旦重新输入内容，就撤销「清除」意图
+  cfgApiKey.addEventListener('input', function () {
+    if (cfgApiKey.value.trim()) {
+      apiKeyClear = false;
+      apiKeyHint.textContent = '将替换为新的 Key，点「保存」后生效';
+    }
+  });
+
   // 拉取当前配置（已保存的地址和 Key）的模型列表，同步到底部下拉框
   function reloadModels() {
     modelsPromise = null;
@@ -2001,17 +2037,23 @@
     cfgToken.value = newToken;
     var tokenChanged = newToken !== token;
     cfgHint.textContent = '保存中…';
+    // 只有输入框里真有内容才提交 api_key：留空表示「保持原样」。
+    // 旧逻辑无条件回传输入框的值，而新设备打开设置页时输入框是空的，
+    // 于是任何一次保存（哪怕只改了令牌）都会把 Key 抹掉。
+    var keyInput = cfgApiKey.value.trim();
+    var payload = {
+      base_url: cfgBaseUrl.value,
+      tts_enable: cfgTts.checked,
+      permission_mode: cfgPerm.value,
+      workspace: cfgWorkspace.value,
+      token: newToken
+    };
+    if (keyInput) { payload.api_key = keyInput; }
+    if (apiKeyClear) { payload.clear_api_key = true; }
     fetch('/api/config?token=' + encodeURIComponent(token), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        base_url: cfgBaseUrl.value,
-        api_key: cfgApiKey.value,
-        tts_enable: cfgTts.checked,
-        permission_mode: cfgPerm.value,
-        workspace: cfgWorkspace.value,
-        token: newToken
-      })
+      body: JSON.stringify(payload)
     })
       .then(function (r) { return r.json(); })
       .then(function (res) {

@@ -384,6 +384,11 @@ probe_fakeroot() {
 }
 probe_spectacle() {
   need_cmd spectacle || { echo "未安装（KWin 截图，KDE 一般自带）"; return 1; }
+  # 只查得到二进制不够，还要确认它能跑起来。这里必须设 offscreen：
+  # 在无 DISPLAY 的环境（systemd 单元、ssh、cron）下 Qt6 会直接 abort 并写 core dump。
+  # 用 --version 而不是 --help，避开 GUI 初始化路径。
+  QT_QPA_PLATFORM=offscreen DISPLAY= WAYLAND_DISPLAY= \
+    spectacle --version >/dev/null 2>&1 || { echo "调用异常（可能在无图形环境下崩溃）"; return 1; }
   return 0
 }
 

@@ -127,10 +127,24 @@ def _probe_espeak() -> tuple[bool, str]:
 def _probe_spectacle() -> tuple[bool, str]:
     if not shutil.which("spectacle"):
         return False, "未安装（KDE 一般自带）"
-    # 不真的截图（会弹窗口）：只确认二进制可以执行
-    rc, out = _run(["spectacle", "--help"], timeout=5.0)
+    # 不真的截图（会弹窗口），只让 Qt 报个版本号。
+    #
+    # 这里踩过一个坑：原先用 `spectacle --help`，而本服务是 systemd 用户单元，
+    # 环境里没有 DISPLAY/WAYLAND_DISPLAY。Qt6 建不出事件派发器就直接 abort()，
+    # 每次探活都留一个 core dump。60 秒缓存一过期就崩一次，半天堆了 200MB，
+    # 把只剩 800MB 的 rootfs 啃掉一大块。
+    # 修法两层：QT_QPA_PLATFORM=offscreen 让它不需要显示服务；
+    # 并用 --version 代替 --help（--help 会走完整的 GUI 初始化路径）。
+    rc, out = _run(
+        ["spectacle", "--version"],
+        env={"QT_QPA_PLATFORM": "offscreen", "DISPLAY": "", "WAYLAND_DISPLAY": ""},
+        timeout=5.0,
+    )
     if rc in (126, 127):
         return False, f"命令无法执行（{out[:60]}）"
+    if rc != 0:
+        # 崩了就是真有问题（不是环境问题就是二进制坏了），如实报出来
+        return False, f"调用异常（退出码 {rc}）"
     return True, ""
 
 

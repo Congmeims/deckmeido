@@ -580,6 +580,8 @@ async def api_cancel():
 class ConfigUpdate(BaseModel):
     base_url: str | None = None
     api_key: str | None = None
+    # 显式要求清空 Key；不传则空字符串一律按「不改」处理
+    clear_api_key: bool = False
     model: str | None = None
     tts_enable: bool | None = None
     permission_mode: str | None = None
@@ -587,11 +589,29 @@ class ConfigUpdate(BaseModel):
     token: str | None = None
 
 
+def _mask_key(key: str) -> str:
+    """把 Key 打码成 sk-7sw…56D5 这种样子：够认出是哪把，又不可用。
+
+    为什么不直接把明文发给前端：只要拿到访问令牌（默认还是 meido），
+    任何一台设备打开设置页就能把 Key 抄走。打码后前端只用于「展示已配置」，
+    真正用 Key 的请求都在服务端完成。
+    """
+    key = (key or "").strip()
+    if not key:
+        return ""
+    if len(key) <= 10:
+        return key[:2] + "…"
+    return f"{key[:6]}…{key[-4:]}"
+
+
 @app.get("/api/config", dependencies=[Depends(check_token)])
 async def api_get_config():
     return {
         "base_url": llm.base_url,
-        "api_key": llm.api_key,
+        # 明文 Key 不再下发，只给打码值和「有没有配」的布尔量
+        "api_key": _mask_key(llm.api_key),
+        "api_key_set": bool(llm.api_key.strip()),
+        "api_key_masked": _mask_key(llm.api_key),
         "model": llm.model,
         "tts_enable": tts.enable,
         "permission_mode": PERMISSION_MODE,
@@ -610,17 +630,28 @@ async def api_token_gen():
 
 
 async def _pick_model(base_url: str, api_key: str) -> str:
-    """换了服务商后自动挑一个模型：原模型还在就用它，否则取列表里第一个"""
-    probe = LLMClient(base_url=base_url.strip().rstrip("/"), api_key=api_key,
-                      model=llm.model, timeout=30.0)
+    """换了服务商后自动挑一个模型：原模型还在就用它，否则取列表里第一个
+
+    这个函数只负责「猜个更合适的模型名」，猜不到就不该拦着用户保存配置。
+    旧版会把探活异常（Key 写错、服务商抽风、断网 → 401/超时）直接冒到
+    外层，整个 POST /api/config 变成 500：新填的 Key 存不进去，
+    用户看到「保存失败」但输入框又被清空，等于把配置搞坏了。
+    现在一律吞掉异常，退回当前模型名，由「保存后拉模型列表」那步另行提示。
+    """
+    fallback = llm.model
     try:
-        names = await probe.list_models()
-    finally:
-        await probe.close()
-    if llm.model in names:
-        return llm.model
+        probe = LLMClient(base_url=base_url.strip().rstrip("/"), api_key=api_key,
+                          model=fallback, timeout=30.0)
+        try:
+            names = await probe.list_models()
+        finally:
+            await probe.close()
+    except Exception:
+        return fallback
+    if fallback in names:
+        return fallback
     if not names:
-        raise HTTPException(status_code=502, detail="服务商没有返回任何模型")
+        return fallback
     return names[0]
 
 
@@ -630,13 +661,26 @@ async def api_set_config(req: ConfigUpdate):
     llm_updates = {}
     if req.base_url is not None:
         llm_updates["base_url"] = req.base_url.strip()
-    if req.api_key is not None:
-        llm_updates["api_key"] = req.api_key.strip()
+    # Key 的三条「不覆盖」规则，都是为了避免把已配置的 Key 冲掉：
+    #   1) 字段没传（None）           → 本次不改 Key
+    #   2) 传了空字符串               → 前端没拿到值，按「不改」处理
+    #   3) 传的是打码串（含 …）        → 前端回传了展示用的脱敏值，不能当真
+    # 想真清空，用 clear_api_key=true 显式声明。
+    # 旧逻辑是「传了空就写成空」，于是在新设备上打开设置页、只是改了个令牌
+    # 或权限，就会把 Key 一并抹成空串 —— 对话当场失效，且无处可恢复。
+    if req.clear_api_key:
+        llm_updates["api_key"] = ""
+    elif req.api_key is not None:
+        incoming = req.api_key.strip()
+        if incoming and "…" not in incoming and "..." not in incoming:
+            llm_updates["api_key"] = incoming
     if req.model is not None:
         llm_updates["model"] = req.model.strip()
-    elif req.api_key is not None and req.api_key.strip() and req.api_key.strip() != llm.api_key:
+    elif llm_updates.get("api_key") and llm_updates["api_key"] != llm.api_key:
         # 换了 Key 而没指定模型：保持原模型若它仍可用，否则挑列表里第一个正规模型名
-        llm_updates["model"] = await _pick_model(req.base_url or llm.base_url, req.api_key.strip())
+        # 注意用 llm_updates 里的值：直接读 req.api_key 的话，打码串也会进这里，
+        # 拿 "sk-7sw…56D5" 去问服务商只会 401
+        llm_updates["model"] = await _pick_model(req.base_url or llm.base_url, llm_updates["api_key"])
     updates = {}
     if llm_updates:
         updates["llm"] = llm_updates
