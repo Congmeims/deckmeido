@@ -36,7 +36,7 @@ TOKEN = os.environ.get("DECKMEIDO_TOKEN", "")
 POLL_MS = 100          # 向后端询问「是否在操作」的常规间隔
 URGENT_MS = 25         # 穿透期间的快速轮询间隔（后端马上要点，等不起）
 LIFT_MS = 25           # 截图期间抬高遮罩时的轮询间隔
-MIN_SHOW_MS = 700      # 最短显示时长，避免秒级工具闪一下就消失
+MIN_SHOW_MS = 700      # 最短显示时长，避免确认类动作（点一下就完）闪一下就消失
 
 # 遮罩进程不读 KDE 字体配置。优先等宽字体：它的空格宽度明确，
 # 中文之外的字符不会挤在一起；中文由后面的 CJK 字体补上
@@ -348,7 +348,7 @@ class Mask(QWidget):
             return
         self.phase = (self.phase + 1) % 60
         dots = "." * (1 + (self.phase // 20) % 3)
-        self.title.setText(f"DeckMeido 正在操作这台设备{dots}")
+        self.title.setText(f"DeckMeido 正在思考{dots}")
         self.update()
 
     def paintEvent(self, _ev):

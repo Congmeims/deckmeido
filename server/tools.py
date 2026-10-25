@@ -259,14 +259,6 @@ TOOLS: list[dict] = [
 # 危险操作：任何权限模式下都需确认
 DANGEROUS = {"install_game"}
 
-# 会实际控制设备的工具里，只有真正「动光标 / 敲键盘」的调用才弹操作遮罩。
-# 联网搜索、查天气、读写文件、跑普通 shell 命令都只是后台任务，
-# 遮罩白挡一层，还会被误当成「正在操作」，所以一律不弹。
-#
-# focus 刻意不在里面：它只调 kdotool windowactivate/windowraise 激活窗口，
-# 光标不动、键盘不敲。窗口一抬起来就盖一层遮罩，用户会以为 agent 在操作设备。
-DESKTOP_ACTION_TOOLS = {"click", "move", "type"}
-
 # 真正会注入输入的子命令（xdotool / ydotool / dotool 同名）
 _XDOTOOL_INPUT_SUBS = {
     "click", "mousedown", "mouseup",
@@ -426,13 +418,13 @@ def _pointer_click(cmd: str) -> bool:
 
 
 def needs_overlay(name: str, args: dict) -> bool:
-    """这次工具调用会不会动光标/敲键盘。只有会动的才压遮罩。
+    """这次工具调用会不会动光标/敲键盘
 
-    run_command 要按命令内容判断：ls、git status、ps、截图、搜索这类纯后台
-    动作一律不弹；只有真正注入鼠标键盘（xdotool/ydotool/wtype/kdotool）才弹。
+    遮罩本身现在是整轮常显（见 main.handle_chat），不再靠这个函数决定亮不亮；
+    保留它是为了「哪些命令属于操作桌面」这一判断本身仍有单一出处。
     """
     if name == "desktop":
-        return str(args.get("action", "")) in DESKTOP_ACTION_TOOLS
+        return str(args.get("action", "")) in {"click", "move", "type"}
     if name == "run_command":
         return _input_invoked(str(args.get("command", "")))
     return False

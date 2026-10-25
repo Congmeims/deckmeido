@@ -1335,9 +1335,11 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
     turn_epoch = _sess_epoch
     _turn.update({"sid": turn_sid, "epoch": turn_epoch, "active": True})
     # 每轮开头强制复位一次遮罩状态：上一轮若在取消/异常路径里漏了
-    # set_overlay(False)，这里不清就会一直盖着，看起来像「执行普通命令也亮」
+    # set_overlay(False)，这里不清就会一直盖着；passthrough 漏了就反过来，
+    # 遮罩会一直藏着不显示（用户就没了终止入口），所以两个都复位
     if _overlay_state.get("show"):
         set_overlay(False)
+    _overlay_state["passthrough"] = False
     # 本轮使用的历史对象。会话操作已改成「换对象」而不是原地清空，
     # 所以这里拿到的引用在被切走之后依然只属于这一轮
     hist = history
@@ -1362,6 +1364,15 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
         await compact_history(auto=True, hist=hist)
 
     try:
+        # 遮罩从这一轮开始就常显，一直到模型开始写正式回答为止。
+        #
+        # 为什么要常显：遮罩的用途是给用户一个「随时点一下终止」的入口，而 agent
+        # 操作桌面的时候用户的手是没法直接按终止的；反过来，真正在注入鼠标的那几
+        # 百毫秒里遮罩反而要藏起来（见 set_overlay_passthrough），否则点击会打在
+        # 遮罩上被当成「用户终止」。以前只在「点鼠标/打字」的那一下亮，于是整轮
+        # 思考过程（模型推理、翻文件、跑命令、写剪贴板）屏幕都是干净的，
+        # 用户既看不到状态，也没有终止入口。
+        set_overlay(True, "正在思考")
         if not llm.configured:
             reply = "LLM 未配置 API Key。请在设置里填入 api_key。"
         elif pending_action and tools.is_confirm(text):
@@ -1369,16 +1380,7 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
             action, pending_action = pending_action, None
             events.append({"type": "tool", "name": action["name"],
                            "summary": action["description"], "files": [], "approved": True})
-            # 只有动光标/敲键盘的操作才需要遮罩，普通命令执行时让屏幕保持干净
-            raised = tools.needs_overlay(action["name"], action["args"])
-            if raised:
-                set_overlay(True, f"正在执行：{action['description'][:200]}")
-            try:
-                result = await tools.execute(action["name"], action["args"])
-            finally:
-                # 这一步动作做完就收遮罩，别让它一直盖到本轮回答结束
-                if raised:
-                    set_overlay(False)
+            result = await tools.execute(action["name"], action["args"])
             reply = f"已完成：{action['description']}\n{result}"
         elif pending_action:
             # 有新消息但未确认，取消挂起操作
@@ -1985,8 +1987,10 @@ def set_overlay(show: bool, text: str = "") -> None:
     if text:
         _overlay_state["text"] = text
     if not show:
-        _overlay_state["passthrough"] = False
         _overlay_state["since"] = 0.0
+        # 不要在这里顺手把 passthrough 清掉：模型开始写回答（set_overlay(False)）
+        # 时可能正好有一次点击注入在跑，清了之后遮罩会重新冒出来挨这一下点击，
+        # 于是又被当成「用户终止」。passthrough 只由 set_overlay_passthrough 收
         # 遮罩收起：不再需要为它压着电源抑制（命令还在跑的话那条原因仍在，
         # 计数归零才真的释放，见 power.AwakeKeeper）
         power.keeper.release("overlay")
@@ -1996,23 +2000,22 @@ def set_overlay(show: bool, text: str = "") -> None:
         if not _overlay_state.get("since"):
             _overlay_state["since"] = time.time()
         # 遮罩亮着 = 用户可能正盯着看操作过程，别在这时候息屏
-        power.keeper.hold("overlay", text or "正在操作设备")
+        power.keeper.hold("overlay", text or "正在思考")
         ensure_overlay()
 
 
 # 遮罩最多连亮这么久；超过就认为状态没被复位（异常/取消路径逃逸），强制收掉。
-# 真正需要遮罩的动作（点鼠标、打字、切窗口）都是秒级，30 秒足够宽松。
-_OVERLAY_MAX_HOLD = 30.0
+# 一整轮最长思考时间可能有一两分钟（多轮工具 + 模型推理），这里给足余量；
+# 正常结束时 handle_chat 的 finally 会收掉，用不到这个兜底。
+_OVERLAY_MAX_HOLD = 300.0
 
 
 def _overlay_watchdog() -> None:
-    """兜底线程：遮罩亮着但没有动作在跑时，别让它一直挡住屏幕。
+    """兜底线程：遮罩亮着太久就强制收起，别让它一直挡住屏幕。
 
-    踩过的现象：跑普通命令（ls、ps、tail 这类纯后台动作）时遮罩仍然亮着。
-    触发判断本身是对的（tools.needs_overlay 实测这些都返回 False），问题在
-    上一轮操作留下的 show=True 没被复位：取消、异常、工具执行到一半被终止，
-    任一环节漏掉 set_overlay(False)，遮罩就会一直盖在那儿，看起来就像
-    「执行普通命令也会亮」。
+    遮罩在整轮思考期间常显，正常结束时 handle_chat 的 finally 会收掉；
+    取消、异常、工具执行到一半被终止，任一环节漏掉 set_overlay(False)，
+    遮罩就会一直盖在那儿。这里按 _OVERLAY_MAX_HOLD 兜一个上限。
     """
     while True:
         time.sleep(1.0)
@@ -2231,6 +2234,9 @@ async def run_agent(events: list[dict], extra_system: str = "",
         stream_text.append(text)
         if not streaming:
             streaming = True
+            # 模型开始写正式回答 = 不再操作桌面，收起遮罩把屏幕还给用户
+            # （整轮常显的遮罩从这里结束，见 handle_chat 里的 set_overlay(True)）
+            set_overlay(False)
             await manager.broadcast({"type": "stream_start", "ts": time.time(), **_turn_tag()})
         # 增量落盘（此函数是 async 的，前端不会感知到这点磁盘开销）
         try:
@@ -2380,19 +2386,9 @@ async def run_agent(events: list[dict], extra_system: str = "",
                     event["path"] = str(args.get("path", ""))
                 activity = f"正在{label}：{summary}" if summary else f"正在{label}"
                 await manager.broadcast({"type": "tool_activity", "text": activity, "ts": time.time(), **_turn_tag()})
-                # 只有真正动光标、敲键盘（点鼠标、打字、切窗口、注入按键的 shell 命令）
-                # 才压遮罩；跑普通命令、联网搜索这类后台任务不该挡住用户的屏幕
-                raised = tools.needs_overlay(name, args)
-                if raised:
-                    set_overlay(True, activity)
-
-                try:
-                    result = await tools.execute(name, args)
-                finally:
-                    # 动作结束立刻收遮罩：遮罩只该盖住「正在操作设备」那几秒，
-                    # 不该连模型写回答的时间一起盖着
-                    if raised:
-                        set_overlay(False)
+                # 遮罩在整轮里保持常显（见 handle_chat），这里只更新卡片上的说明文字
+                set_overlay(True, activity)
+                result = await tools.execute(name, args)
                 # 终端输出截断后随事件展示（网页端显示为终端块）
                 event["output"] = result[:1500] + ("\n…（截断）" if len(result) > 1500 else "")
                 if name in ("write_file", "edit_file") and tools.LAST_DIFF:
