@@ -154,8 +154,11 @@ TOOLS: list[dict] = [
         "function": {
             "name": "desktop",
             "description": ("操作桌面窗口（Wayland 原生程序也能点）。action=focus 切窗口到前台；"
-                            "click 在屏幕坐标处左键单击；move 移动光标；type 在当前窗口打字；where 查光标和焦点窗口。"
-                            "坐标从 screenshot 画面上读，左上角为 0,0"),
+                            "click 在屏幕坐标处左键单击；move 移动光标；type 在当前窗口打字（中英文都支持）；"
+                            "where 查光标和焦点窗口。"
+                            "坐标从 screenshot 画面上读，左上角为 0,0。"
+                            "找不到窗口时先怀疑程序缩进了系统托盘（托盘项 kdotool 搜不到也激活不了），"
+                            "进程还在就结束进程重新启动，主窗口才会回来"),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -164,7 +167,7 @@ TOOLS: list[dict] = [
                     "target": {"type": "string", "description": "focus 时填窗口标题关键词（如 Kazumi）"},
                     "x": {"type": "integer", "description": "click/move 的屏幕横坐标"},
                     "y": {"type": "integer", "description": "click/move 的屏幕纵坐标"},
-                    "text": {"type": "string", "description": "type 时要输入的文本（只支持英文/数字/符号）"},
+                    "text": {"type": "string", "description": "type 时要输入的文本，中英文均可（走 KDE 剪贴板粘贴）"},
                 },
                 "required": ["action"],
             },
@@ -1113,6 +1116,66 @@ async def _ydotool(*args: str) -> str:
     return text
 
 
+async def _klipper_paste(text: str) -> str | None:
+    """用 KDE 原生剪贴板 + Ctrl+V 输入文本。成功返回 None，失败返回原因
+
+    为什么不用 ydotool type 打中文：ydotool 只能按 keycode 逐个敲物理按键，
+    中文这类多字节字符没有对应的键位，会被整个丢掉（英文数字才正常）。
+    wtype 依赖虚拟键盘协议，KWin 不支持，直接报 Compositor does not support
+    the virtual keyboard protocol。GTK 那条路会自己占住剪贴板，Wayland 下
+    回读是 None。
+
+    能走通的只有 klipper 的 D-Bus 接口：它把文字交给 KDE 自己的剪贴板管理器，
+    再用 Ctrl+V 让目标窗口粘贴，中英混排、长文本都是原样进去的。
+    """
+    if not text:
+        return "文本为空"
+    env = dict(os.environ)
+    _fix_display_env(env)
+    # qdbus 和 qdbus6 在不同 Plasma 版本上装的不一样，哪个能跑用哪个
+    last_err = ""
+    ok = False
+    for tool in ("qdbus6", "qdbus"):
+        if not shutil.which(tool):
+            continue
+        proc = await asyncio.create_subprocess_exec(
+            tool, "org.kde.klipper", "/klipper",
+            "org.kde.klipper.klipper.setClipboardContents", text,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
+        )
+        out, err = await proc.communicate()
+        last_err = (out + err).decode(errors="replace").strip()
+        if proc.returncode == 0:
+            ok = True
+            break
+    if not ok:
+        return f"调用 klipper 失败：{last_err or '找不到 qdbus6/qdbus'}"
+    # 让 klipper 拿到内容再发粘贴键，否则目标窗口粘出来还是上一次的内容
+    await asyncio.sleep(0.15)
+    try:
+        await _ydotool("key", "29:1", "47:1", "47:0", "29:0")
+    except Exception as e:
+        return f"已写入剪贴板，但 Ctrl+V 失败：{e}"
+    return None
+
+
+async def _type_text(text: str) -> str:
+    """在当前焦点窗口输入文本，中英文都支持
+
+    优先走 klipper 剪贴板粘贴（唯一能正确处理中文的方式），
+    它不可用时再退回 ydotool type（只适合英文/数字/符号）。
+    """
+    err = await _klipper_paste(text)
+    if err is None:
+        return f"已输入 {len(text)} 个字符（经 KDE 剪贴板粘贴）"
+    # 退路：纯 ASCII 时 ydotool 逐个敲键是可靠的
+    if text.isascii():
+        await _ydotool("type", "--", text)
+        return f"已输入 {len(text)} 个字符（ydotool 逐键输入）"
+    return (f"输入失败：{err}。含中文的内容只能靠 KDE 剪贴板粘贴，"
+            f"请确认 KDE 剪贴板服务 klipper 正在运行")
+
+
 async def _cursor() -> tuple[int, int]:
     code, text = await _kdotool("getmouselocation")
     if code != 0:
@@ -1131,6 +1194,19 @@ async def _move_to(x: int, y: int) -> None:
         await _ydotool("mousemove", "--", str(dx), str(dy))
 
 
+async def _app_running(keyword: str) -> bool:
+    """按名字粗略判断进程是否还活着（用于区分「没启动」和「藏在托盘里」）"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "pgrep", "-fi", keyword,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        return proc.returncode == 0 and bool(out.strip())
+    except Exception:
+        return False
+
+
 async def _desktop(action: str, target: str = "", x: int = 0, y: int = 0, text: str = "") -> str:
     """桌面窗口操作：切焦点 / 点击 / 移动 / 打字。命中点击时自动打开遮罩穿透"""
     if action == "focus":
@@ -1138,7 +1214,17 @@ async def _desktop(action: str, target: str = "", x: int = 0, y: int = 0, text: 
             return "focus 需要提供 target（窗口标题关键词）"
         code, out = await _kdotool("search", "--name", target)
         if code != 0 or not out:
-            return f"没找到标题匹配「{target}」的窗口"
+            # 进程活着却搜不到窗口，绝大多数是程序被最小化到了系统托盘：
+            # 托盘里的项不是普通窗口，kdotool search / windowactivate 都碰不到，
+            # 面板的 D-Bus 也没有通用的 Activate 方法。这种情况只能让程序
+            # 重新把主窗口建出来 —— 杀掉再启动是最稳的。
+            alive = await _app_running(target)
+            hint = (f"\n进程「{target}」还在运行，但没有任何窗口。"
+                    f"它很可能缩在系统托盘里，托盘项不能被 kdotool 激活。"
+                    f"可靠做法：先结束进程再重新启动，主窗口就会回来"
+                    f"（例如 pkill -f {target} 后用原来的启动命令再打开）。"
+                    if alive else "")
+            return f"没找到标题匹配「{target}」的窗口{hint}"
         wid = out.splitlines()[0].strip()
         await _kdotool("windowactivate", wid)
         await _kdotool("windowraise", wid)
@@ -1166,9 +1252,8 @@ async def _desktop(action: str, target: str = "", x: int = 0, y: int = 0, text: 
     if action == "type":
         if not text:
             return "type 需要提供 text"
-        # ydotool type 不支持中文；输入前若焦点不在目标窗口，调用方应先 focus
-        await _ydotool("type", "--", text)
-        return f"已输入 {len(text)} 个字符"
+        # 输入前若焦点不在目标窗口，调用方应先 focus
+        return await _type_text(text)
 
     if action == "where":
         cx, cy = await _cursor()
