@@ -113,7 +113,9 @@
   .msg {
     position: relative;
     max-width: 85%;
-    padding: 10px 14px;
+    /* 下方多留 20px 给悬停时浮出的操作行。这段空隙必须常驻，不能靠 :hover 撑高，
+       否则鼠标停在气泡下沿会触发「撑高→指针移出→回缩→指针落回」的每帧循环抖动 */
+    padding: 10px 14px 20px;
     border-radius: 16px;
     line-height: 1.55;
     font-size: 15.5px;
@@ -162,12 +164,9 @@
   .msg:hover .msg-foot, .msg-foot:focus-within {
     opacity: 1; visibility: visible; pointer-events: auto;
   }
-  /* 操作行浮在气泡下方，悬停时给这条消息让出一行高度，免得盖住下一条 */
-  .msg:hover { margin-bottom: 20px; }
   /* 触屏（SteamOS 游戏模式没有 hover）拿不到鼠标悬停，就常显，否则按钮等于不存在 */
   @media (hover: none) {
     .msg-foot { opacity: 1; visibility: visible; pointer-events: auto; }
-    .msg { margin-bottom: 20px; }
   }
   .msg-foot .time { margin-top: 0; }
   .msg-acts { display: flex; gap: 2px; }

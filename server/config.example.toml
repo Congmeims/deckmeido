@@ -31,6 +31,9 @@ max_tool_rounds = 0
 context_window = 0
 # 上下文占用达到该比例时自动压缩（0.95 = 95%）
 compact_ratio = 0.95
+# 压缩后最近内容保留的比例（0.3 = 只留最近 30%，其余压成摘要）。
+# 调小 = 单次压得多、压缩更少；调大 = 保留更多原文、压缩更频繁
+compact_target_left = 0.3
 
 [power]
 # 桌面模式下 DeckMeido 正在执行命令或显示操作遮罩时，阻止息屏与休眠

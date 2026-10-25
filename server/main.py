@@ -120,6 +120,9 @@ MAX_TOOL_ROUNDS = int(CFG["agent"].get("max_tool_rounds", 0))
 # 用量优先取服务商返回的 usage.prompt_tokens，拿不到再按字符估算。
 CONTEXT_WINDOW = int(CFG["agent"].get("context_window", 0))
 COMPACT_RATIO = float(CFG["agent"].get("compact_ratio", 0.95))
+# 压缩完后，最近保留的内容大约占窗口的这个比例。0.3 ≈ 压缩掉七成，
+# 保证压一次能撑很久，不会「刚压完又满」——这是压缩频率过高的根源。
+COMPACT_TARGET_LEFT = float(CFG["agent"].get("compact_target_left", 0.3))
 # 单次输出上限（0 / 留空 = 用满上下文剩余空间）。默认跟随上下文窗口，
 # 这样长答复不会再被 4096 这种固定值硬截断。
 MAX_OUTPUT_TOKENS = int(CFG["llm"].get("max_output_tokens", 0) or 0) or CONTEXT_WINDOW
@@ -1359,8 +1362,10 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
     save_session_snapshot(turn_sid, hist)
     await manager.broadcast({"type": "session_changed", "current": current_sid})
 
-    # 上下文逼近模型窗口上限时自动压缩（摘要替换旧对话，不再直接丢弃）
-    if _ctx_used / context_window() >= COMPACT_RATIO:
+    # 上下文逼近模型窗口上限时自动压缩（摘要替换旧对话，不再直接丢弃）。
+    # _ctx_used 在切换会话等路径上会归零，这时按当前历史重新估算一次，
+    # 否则会以为「才用了 0 token」而漏掉该压的情况
+    if _need_compact(_ctx_used or _estimate_tokens(_build_llm_msgs(hist, SYSTEM_PROMPT, turn_sid))):
         await compact_history(auto=True, hist=hist)
 
     try:
@@ -1451,6 +1456,39 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
     return {"reply": reply, "events": events}
 
 
+def _need_compact(used: int) -> bool:
+    """用量是否已经该压缩了。
+
+    两处触发（每轮开始前、单轮工具循环中间）共用这一个判断，避免阈值语义分叉。
+    """
+    win = context_window()
+    return bool(win) and used / win >= COMPACT_RATIO
+
+
+def _compact_end(hist: list[dict], start: int) -> int:
+    """算出这次压缩要把游标推进到第几条（即 end：history[start:end] 会被摘要）
+
+    从末尾往前累积 token，一直收到「剩下的最近内容约占窗口的
+    COMPACT_TARGET_LEFT」为止。这样压缩完上下文会明显低于触发阈值，
+    而不是像以前那样只压掉几条、下一轮工具调用又顶回去。
+    最近 2 条（用户那句 + 上一条）永远保留，避免新一轮刚开始就没有前文。
+    """
+    total = len(hist)
+    if total - start <= 2:
+        return total
+    budget = int(context_window() * COMPACT_TARGET_LEFT)
+    acc = 0
+    end = total
+    # 从最新一条往前累，直到快超出剩余额度为止。
+    # 60 条的位置上限只是兜底：避免极短消息堆积时留下几十条造成「该压却不压」
+    for i in range(total - 1, max(start, total - 60), -1):
+        acc += _estimate_tokens([hist[i]])
+        if acc > budget:
+            break
+        end = i
+    return max(end, start + 1)
+
+
 async def compact_history(auto: bool = False, hist: list[dict] | None = None,
                           sid: str = "") -> str:
     """把较早的对话压缩成摘要，**只影响发给模型的上下文，不动界面历史**
@@ -1463,10 +1501,15 @@ async def compact_history(auto: bool = False, hist: list[dict] | None = None,
     hist = history if hist is None else hist
     sid = sid or _turn.get("sid") or current_sid
     comp = _compact_for(sid)
-    # 已经压缩过的部分不再重复参与摘要；最近 4 条永远原样保留
-    keep = 4
+    # 已经压缩过的部分不再重复参与摘要。
+    #
+    # keep 以前写死 4 条，后果是「刚压缩完马上又要压缩」：一次工具往返就占
+    # assistant(tool_calls) + tool 两条，压缩后只剩 4 条的余量，下一轮工具链
+    # 立刻把上下文顶回阈值，于是用户每几条消息就看到一次「已自动压缩上下文」。
+    # 现在按 token 算：从末尾往前留出约 COMPACT_KEEP_RATIO 的窗口，
+    # 压缩要真的腾出空间，压缩频率自然就降下来了。
     start = min(comp["upto"], len(hist))
-    end = max(start, len(hist) - keep)
+    end = _compact_end(hist, start)
     old = hist[start:end]
     if len(old) < 2:
         return "对话还很短，无需压缩"
@@ -2277,7 +2320,7 @@ async def run_agent(events: list[dict], extra_system: str = "",
             # 单轮里工具往返也会堆积上下文，超过阈值就先压缩再继续。
             # 压缩只推进游标、不删 history，所以这里重建 msgs 时要保留
             # 本轮新加的工具往返消息（hist_msgs 之后的部分），否则工具链断掉。
-            if len(msgs) > 6 and _estimate_tokens(msgs) / context_window() >= COMPACT_RATIO:
+            if _need_compact(_estimate_tokens(msgs)):
                 await compact_history(auto=True, hist=hist, sid=turn_sid)
                 rebuilt = _build_llm_msgs(hist, sys_prompt, turn_sid)
                 extra = [m for m in msgs[hist_msgs:]
