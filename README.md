@@ -42,13 +42,13 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 | 能力 | 说明 |
 | --- | --- |
 | 打开与操作桌面 | 聚焦窗口、按屏幕坐标点击、移动光标、输入文本 |
-| 截图 | KWin spectacle 优先，失败退回 mss；截图时自动收起遮罩 |
+| 截图 | 游戏模式（gamescope）走 PipeWire 抓帧；桌面模式 spectacle 优先，失败退回 mss；截图时自动收起遮罩 |
 | 执行命令 | bash 命令，超时保护、危险命令识别；启动浏览器等常驻程序会自动判定并立即返回，不阻塞 |
 | Steam 库 | 列出已安装游戏、商店搜索、通过客户端下载安装（危险操作，强制确认） |
 | 模拟器 | 扫描 EmuDeck 标准目录 `~/Emulation/roms`，按机型统计 |
 | 系统 | SteamOS 更新检查、系统信息 |
 | 文件 | 目录浏览、按行读取、整体写入、精确替换（改代码优先用 `edit_file`） |
-| 网络 | 联网搜索、天气查询 |
+| 网络 | 联网搜索、天气查询（联网搜索需 `pip install ddgs`） |
 
 ### 交互细节
 
@@ -79,7 +79,7 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
                                                            │
                                         ┌──────────────────┼─────────────────┐
                                         ▼                  ▼                 ▼
-                                   xdotool / mss      Steam / flatpak    bash / 文件系统
+                                   ydotool / kdotool  Steam / flatpak    bash / 文件系统
 ```
 
 ### 一次对话是怎么跑起来的
@@ -94,7 +94,7 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 
 ### 几个关键设计
 
-**遮罩只在必要时出现。** 早先所有工具调用都会弹遮罩，联网搜索时也糊一层，纯属干扰。现在定义了白名单 `DEVICE_TOOLS = {"desktop", "run_command"}`，只有真正会动键鼠、动系统的操作才显示；截图是只读采集，而且遮罩会被拍进截图里，所以不弹。
+**遮罩只在必要时出现。** 早先所有工具调用都会弹遮罩，联网搜索时也糊一层，纯属干扰。现在只有真正会改动屏幕内容的操作才显示：`desktop` 的 `click` / `move` / `type`（`focus` 只切换窗口，不弹），以及 `run_command` 中被识别为输入类的命令；截图是只读采集，而且遮罩会被拍进截图里，所以不弹。
 
 **截图和遮罩的协同。** 遮罩会盖住整个桌面。截图前，后端把 `lift` 状态置为 `true`，遮罩进程以 25ms 间隔快速轮询，看到后立刻隐藏并回报 ack；后端最多等 200ms 确认它真的收起了，然后才按快门，拍完马上恢复。同时工具描述里写明"截图会自动收起遮罩，不需要等待"，避免模型自己加 `sleep`。
 
@@ -120,7 +120,7 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 > bash install.sh install --deps
 > ```
 >
-> 用 `pacman` 装 `espeak-ng` / `ydotool`，用 `paru` 或 `yay` 装 AUR 里的 `kdotool`；装完会自动拉起 `ydotoold`（重启后需重新启动，否则点击报 socket 错误）。缺这些不影响对话、截图、执行命令，只是「模拟鼠标点击 / 键盘输入」和语音播报用不了。
+> 用 `pacman` 装 `espeak-ng` / `ydotool`，用 `paru` 或 `yay` 装 AUR 里的 `kdotool`；装完会写入并启用 `ydotoold` 的 `systemd --user` 服务，开机自动运行（点击报 socket 错误时执行 `systemctl --user restart ydotool`）。缺这些不影响对话、截图、执行命令，只是「模拟鼠标点击 / 键盘输入」和语音播报用不了。
 
 ### 一键安装
 
@@ -128,9 +128,9 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 git clone https://github.com/Congmeims/deckmeido.git && cd deckmeido && bash install.sh
 ```
 
-脚本会：建虚拟环境 → 装依赖（含 PySide6）→ 生成配置 → 注册 `deckmeido.service` 用户服务并开机自启 → 装好应用菜单快捷方式，最后打印带令牌的访问地址。
+脚本会：建虚拟环境 → 装依赖（含 PySide6）→ 生成配置 → 清理旧的 `deckmeido.service` 与占用端口的残留后端 → 装好应用菜单与桌面快捷方式 → 自动启动客户端（后端由客户端拉起），最后打印带令牌的访问地址。
 
-**不要用 `sudo` / root 执行。** 程序装到当前用户家目录（默认 `~/deckmeido`）、服务注册在用户级别，用 root 装会落到 `/root` 下，桌面会话里起不来。脚本检测到 root 会直接退出。
+**不要用 `sudo` / root 执行。** 程序装到当前用户家目录（默认 `~/deckmeido`），用 root 装会落到 `/root` 下，桌面会话里起不来。脚本检测到 root 会直接退出。
 
 不想用 git 的话，直接下载 Release 里的包：
 
@@ -140,6 +140,7 @@ wget https://github.com/Congmeims/deckmeido/releases/latest/download/deckmeido-0
 
 ```bash
 bash install.sh upgrade      # 升级：同步代码 + 依赖，保留配置与会话
+bash install.sh check        # 自检：逐个实测控制类控件是否真的能用
 bash ~/deckmeido/uninstall.sh        # 卸载：停服务、删快捷方式，保留配置与工作区
 bash ~/deckmeido/uninstall.sh --purge   # 连配置与工作区一起删
 ```
@@ -151,17 +152,22 @@ bash ~/deckmeido/uninstall.sh --purge   # 连配置与工作区一起删
 设置页底部显示当前版本号（安装时由 `install.sh` 写入安装目录的 `VERSION`），旁边有「检查更新」：
 
 - **检查更新**：向 GitHub 查询最新 release，比当前版本新就提示，并出现「立即升级」
-- **立即升级**：先在安装目录 `git pull --ff-only`，再后台执行 `install.sh upgrade`（同步代码、装依赖、重启服务）。配置、会话、工作区都会保留；日志写在安装目录的 `update.log`
+- **立即升级**：先在安装目录 `git pull --ff-only`，再后台执行 `install.sh upgrade`（同步代码、装依赖、重启后端）。配置、会话、工作区都会保留；日志写在安装目录的 `update.log`
 
-非 git 安装（例如用 tar.gz 解压装的）不支持一键升级，重新下载并运行 `install.sh` 即可。
-
-也可以在终端里手动升级：
+通过 release tar 包安装的目录没有 `.git`，`git pull` 用不了，升级按钮会提示不适用：重新下载新包覆盖，或改用 `git clone` 方式安装。也可以在终端里手动升级：
 
 ```bash
 cd ~/deckmeido && git pull && bash install.sh upgrade
 ```
 
 自定义位置与端口：`DECKMEIDO_DIR=~/apps/deckmeido DECKMEIDO_PORT=18765 bash install.sh`
+
+默认不安装 systemd 开机自启：后端由客户端（桌面快捷方式）拉起，退出时一并收走，避免两份后端抢同一端口导致历史不一致。需要后端常驻时再手动生成单元：
+
+```bash
+bash install.sh service
+systemctl --user daemon-reload && systemctl --user enable --now deckmeido.service
+```
 
 ### 第一次使用
 
@@ -185,11 +191,15 @@ cd ~/deckmeido && git pull && bash install.sh upgrade
 | `[server]` | `port` / `token` | 监听端口；访问令牌，默认 `meido`，留空则自动生成 |
 | `[llm]` | `base_url` / `api_key` / `model` | OpenAI 兼容接口 |
 | | `reasoning_effort` | `low` / `medium` / `high`，留空则不发送 |
-| `[agent]` | `max_tool_rounds` | 单轮最多连续调用工具次数，默认 12 |
+| | `timeout` / `max_output_tokens` | 请求超时秒数；单次输出上限，`0` 表示用满上下文剩余空间 |
+| | `max_continuations` | 撞到输出上限时自动续写轮数，默认 3 |
+| `[agent]` | `max_tool_rounds` | 单轮最多连续调用工具次数，默认 `0` = 不限 |
 | | `context_window` | 窗口大小，`0` 表示按模型名推断 |
 | | `compact_ratio` | 触发压缩的占用比例，默认 0.95 |
+| `[power]` | `keep_awake` | 执行命令或显示遮罩时阻止息屏与休眠，默认 `true`（游戏模式不干预） |
 | `[persona]` | `name` / `traits` / `extra` | 人格名称与性格描述，改这里就换人格 |
-| `[tts]` | `enable` / `engine` / `voice` | 语音播报开关（默认 `false`）与引擎参数 |
+| `[tts]` | `enable` / `engine` / `voice` | 语音播报开关（默认 `false`）与引擎、语言 |
+| | `speed` / `max_chars` | 语速（词/分钟，默认 170）；单次播报最长字符数（默认 300） |
 | `[security]` | `permission_mode` | `manual` / `auto` / `full` |
 | `[workspace]` | `dir` | 编程与文件任务的默认工作区，留空则用 `~/deckmeido_workspace` |
 
@@ -202,10 +212,13 @@ deckmeido/
 ├── install.sh                 一键安装 / 升级 / 卸载
 ├── VERSION                    安装时写入的版本号（设置页与升级检查读它）
 ├── uninstall.sh               安装时生成的卸载入口
-├── assets/logo.png            应用图标（桌面快捷方式、托盘、网页 favicon）
-├── client/main.py             PySide6 原生客户端（含托盘）
+├── requirements.txt           Python 依赖
+├── assets/
+│   ├── logo.png               应用图标（桌面快捷方式、托盘、遮罩、网页 favicon）
+│   └── icon-src/              图标 SVG 源文件
+├── client/main.py             PySide6 原生客户端（含托盘、单实例）
 ├── deploy/
-│   ├── deckmeido.service      systemd 用户服务（后端）
+│   ├── deckmeido.service      旧版 systemd 单元（现在默认不安装，仅供手动启用）
 │   └── DeckMeido.desktop      桌面快捷方式模板
 ├── server/
 │   ├── main.py                FastAPI 服务、会话、approval、遮罩调度
@@ -213,18 +226,29 @@ deckmeido/
 │   ├── tools.py               工具定义与执行实现
 │   ├── overlay.py             半透明操作遮罩（PySide6）
 │   ├── tts.py                 espeak-ng 语音播报
+│   ├── power.py               任务期间抑制息屏与休眠
+│   ├── depcheck.py            系统控件自检（ydotool / kdotool / espeak-ng 等）
+│   ├── singleton.py           单实例锁
+│   ├── updater.py             查最新 release、git pull 与后台升级
 │   ├── config.example.toml    配置模板
-│   └── static/index.html      单文件 Web 控制台
+│   └── static/
+│       ├── index.html         单文件 Web 控制台
+│       ├── logo.png           鉴权页大图标
+│       ├── logo-mark.png      侧栏品牌图
+│       └── favicon.png        浏览器标签页图标
 └── tools/
     ├── make_icon.py           由 SVG 渲染 PNG 图标
     ├── make_icon_png.py       由成品 PNG 生成各尺寸图标
     └── make_release.sh        打 Release 用的 tar.gz
 ```
 
+`VERSION` 与 `uninstall.sh` 由 `install.sh` 在安装时生成，不在仓库里。
+
 ## 已知限制
 
-- `desktop` 工具的文字输入依赖 `xdotool`，只能输入英文、数字与符号，中文请改用命令或文件
-- 部分 Wayland 原生窗口无法直接截取，需依赖 `spectacle`
+- `desktop` 工具的文字输入依赖 `ydotool type`，只支持英文、数字与符号，中文请改用命令或文件；窗口聚焦依赖 `kdotool`
+- 部分 Wayland 原生窗口无法直接截取，桌面模式需依赖 `spectacle`
+- 联网搜索依赖 `ddgs`，`requirements.txt` 里默认注释掉了，需要时手动 `.venv/bin/pip install ddgs`
 - 会话历史保存在本机 `server/sessions/`，不含云端同步
 
 ---

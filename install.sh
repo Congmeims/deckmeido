@@ -9,6 +9,7 @@
 #   bash install.sh check          自检：逐个实测控制类控件是否真的能用
 #   bash install.sh uninstall     卸载（默认保留 ~/.config/deckmeido 配置与工作区）
 #   bash install.sh uninstall --purge   连配置一起删
+#   bash install.sh service       生成 systemd 用户单元（默认不装，后端由客户端拉起）
 #
 # 控制类插件（ydotool / kdotool / wtype / espeak-ng / fakeroot）是系统包，
 # 装它们需要 root：默认只在结尾提示并询问一次（y/N），回答 y 才走 sudo。
@@ -569,6 +570,12 @@ stop_service() {
   systemctl --user stop "$UNIT" >/dev/null 2>&1 || true
 }
 
+# 手动安装 systemd 单元（默认不装：后端由客户端拉起，见 install_service 注释）
+render_service() {
+  sed "s|__INSTALL_DIR__|$INSTALL_DIR|g; s|__PORT__|$PORT|g" \
+    "$INSTALL_DIR/deploy/$UNIT" > "$UNIT_DIR/$UNIT"
+}
+
 install_desktop() {
   mkdir -p "$DESKTOP_DIR"
   sed "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
@@ -806,7 +813,10 @@ case "${1:-install}" in
   upgrade|update) do_upgrade "${2:-}" ;;
   check)        do_check "${2:-}" ;;
   uninstall)    do_uninstall "${2:-}" ;;
+  service)      check_user; mkdir -p "$UNIT_DIR"; render_service
+                info "已写入 $UNIT_DIR/$UNIT"
+                dim "启用并启动：systemctl --user daemon-reload && systemctl --user enable --now $UNIT" ;;
   -h|--help|help)
     grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -n 22 ;;
-  *) die "未知命令：$1（可用：install / upgrade / check / uninstall）" ;;
+  *) die "未知命令：$1（可用：install / upgrade / check / uninstall / service）" ;;
 esac
