@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import signal
 import sys
@@ -18,7 +19,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QPointF
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
@@ -29,6 +30,10 @@ ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 LOGO_PX = 152     # 卡片上方 logo 的显示边长
 LOGO_GAP = 14     # logo 图形与卡片之间的实际间距（按可见图形算，不含透明留白）
 LOGO_DY = 10      # logo+卡片的整体在垂直居中基础上额外下移的像素
+SWAY_DEG = 9.0    # logo 绕中心左右各摆多少度
+SWAY_RISE = 4.0   # 摆动同时上下浮动的像素幅度
+# 摆动时图形会转出去一点，画布按对角线留余量，否则两侧边缘会被切掉
+LOGO_BOX = int(LOGO_PX * math.sqrt(2)) + 8
 
 API = os.environ.get("DECKMEIDO_API", "http://127.0.0.1:18765")
 TOKEN = os.environ.get("DECKMEIDO_TOKEN", "")
@@ -51,6 +56,61 @@ def ui_font(px: int, bold: bool = False) -> QFont:
     f.setPixelSize(px)
     f.setBold(bold)
     return f
+
+
+class SwayLogo(QWidget):
+    """会摆动的 logo。
+
+    QLabel 只会原样贴图，转不了；这里自己画 pixmap：
+    以可见图形的中心为轴心旋转 ang 度，再整体上下偏移 dy 像素。
+    窗口尺寸固定为 LOGO_PX，旋转后四角稍微溢出，所以绘制时按对角线
+    长度缩放一次，保证任何角度都不会被裁掉。
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pm = QPixmap()
+        self._ang = 0.0
+        self._dy = 0.0
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+    def set_pixmap(self, pm: QPixmap):
+        self._pm = pm
+        self.update()
+
+    def pixmap(self) -> QPixmap:
+        return self._pm
+
+    def isNull(self) -> bool:
+        return self._pm.isNull()
+
+    def set_sway(self, ang: float, dy: float):
+        self._ang = ang
+        self._dy = dy
+        self.update()
+
+    def reset_sway(self):
+        self._ang = 0.0
+        self._dy = 0.0
+        self.update()
+
+    def paintEvent(self, _ev):
+        if self._pm.isNull():
+            return
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            # 窗口留了旋转/浮动余量（见 LOGO_BOX），这里按可见边长原尺寸画，
+            # 以实际图形中心为轴心转，摆到任何角度都不会出界
+            w = self._pm.width()
+            h = self._pm.height()
+            cx = self.width() / 2.0
+            cy = self.height() / 2.0 + self._dy
+            p.translate(cx, cy)
+            p.rotate(self._ang)
+            p.translate(-cx, -cy)
+            p.drawPixmap(QPointF(cx - w / 2.0, cy - h / 2.0), self._pm)
+        finally:
+            p.end()
 
 
 class Mask(QWidget):
@@ -82,6 +142,8 @@ class Mask(QWidget):
         self.title.setFont(ui_font(19, bold=True))
         self.title.setStyleSheet("color: #e8eaf0;")
         self.title.setAlignment(Qt.AlignCenter)
+        # 固定文案：不再跟着计时器变「…」，动态感交给下方 logo 的摆动
+        self.title.setText("DeckMeido 正在思考")
 
         self.action = QLabel()
         self.action.setFont(ui_font(13))
@@ -100,14 +162,13 @@ class Mask(QWidget):
         self.hint.setFixedHeight(34)
 
         # logo 独立于卡片，浮在卡片正上方（进卡片会撑高卡片、挤乱排版）
-        self.logo = QLabel(self)
+        # 用自绘的 SwayLogo 而不是 QLabel：思考时要让它绕中心摆动
+        self.logo = SwayLogo(self)
         self._logo_inset_top = 0
         self._logo_inset_bottom = 0
-        self.logo.setPixmap(self._load_logo())
-        self.logo.setFixedSize(LOGO_PX, LOGO_PX)
-        self.logo.setAlignment(Qt.AlignCenter)
-        self.logo.setStyleSheet("background: transparent;")
-        self.logo.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.logo.set_pixmap(self._load_logo())
+        self.logo.setFixedSize(LOGO_BOX, LOGO_BOX)
+        self._sway_t = 0.0
 
         lay.addWidget(self.title)
         lay.addWidget(self.action, 0, Qt.AlignHCenter)
@@ -123,7 +184,9 @@ class Mask(QWidget):
 
         self.anim = QTimer(self)
         self.anim.timeout.connect(self._tick)
-        self.anim.start(140)
+        # 摆动动画要流畅，140ms 一步会明显一顿一顿；33ms ≈ 30fps，
+        # 只重画一个小小的 logo 控件，开销可以忽略
+        self.anim.start(33)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._poll)
@@ -168,15 +231,21 @@ class Mask(QWidget):
 
     def _set_text(self, text: str):
         self._text = text
-        self.action.setText(text or "准备中")
+        new = text or "准备中"
+        # 轮询每 100ms 一次，文字多数时候没变。不判重的话每轮都 setText + 重新排
+        # 版，文字区会一直轻微跳动（行数一变整块卡片高度也跟着变）
+        if self.action.text() == new:
+            return
+        self.action.setText(new)
         self._relayout()
 
     def _load_logo(self) -> QPixmap:
         """加载 assets/logo.png；缺失时留空 pixmap，遮罩照常工作。
 
-        logo 图四周带透明留白（原图 512 里图形只占 y≈90~381，下方约 1/4 是空的），
-        排版若按整张 pixmap 算间距，眼睛看到的空档会比参数值大得多。
-        这里顺便量出可见图形的上下留白，_relayout 只按可见部分占位。"""
+        logo 图四周带透明留白（原图 512 里图形只占 y≈90~381，下方约 1/4 是空的）。
+        这里直接按可见范围裁掉留白：摆动是绕「图形中心」转的，留着大片透明边
+        会让它绕着一个看不见的点画圈；裁掉后 _relayout 的间距计算也更直观。
+        """
         self._logo_inset_top = 0
         self._logo_inset_bottom = 0
         path = ASSETS_DIR / "logo.png"
@@ -185,7 +254,9 @@ class Mask(QWidget):
             return pm
         pm = pm.scaled(
             LOGO_PX, LOGO_PX, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self._logo_inset_top, self._logo_inset_bottom = self._visual_insets(pm)
+        top, bottom = self._visual_insets(pm)
+        if bottom > top:
+            pm = pm.copy(0, top, pm.width(), bottom - top + 1)
         return pm
 
     @staticmethod
@@ -314,17 +385,20 @@ class Mask(QWidget):
         h = self.card.layout().sizeHint().height()
         self.card.setFixedHeight(h)
 
-        has_logo = not self.logo.pixmap().isNull()
-        # 可见图形在 pixmap 内的高度：整图减去透明留白
-        vis_h = LOGO_PX - self._logo_inset_top - self._logo_inset_bottom
+        has_logo = not self.logo.isNull()
+        # 可见图形高度 = 裁掉留白后的 pixmap 高度（SwayLogo 里按原尺寸居中绘制）
+        pm = self.logo.pixmap()
+        vis_h = pm.height() if has_logo else 0
         gap = LOGO_GAP if has_logo else 0
         total = (vis_h + gap if has_logo else 0) + h
         top = (self.height() - total) // 2 + LOGO_DY
 
         if has_logo:
             self.logo.show()
-            # 让 pixmap 内的可见图形顶端正好落在 top，透明留白往上溢出即可
-            self.logo.move((self.width() - LOGO_PX) // 2, top - self._logo_inset_top)
+            # 画布比图形大（旋转余量），让图形的可见顶端正好落在 top：
+            # 画布里的图形是水平/垂直居中的，所以用 (画布高 - 图形高)/2 反推
+            self.logo.move((self.width() - LOGO_BOX) // 2,
+                           top - (LOGO_BOX - vis_h) // 2)
             top += vis_h + gap
         else:
             self.logo.hide()
@@ -347,9 +421,26 @@ class Mask(QWidget):
         if not self.isVisible():
             return
         self.phase = (self.phase + 1) % 60
-        dots = "." * (1 + (self.phase // 20) % 3)
-        self.title.setText(f"DeckMeido 正在思考{dots}")
+        # 文字保持静态，不跟着走点；动画交给 logo（见 _sway）
+        self._sway()
         self.update()
+
+    def _sway(self):
+        """logo 绕自身可见中心左右摆动，并轻微上下浮动
+
+        做法是「旋转 + 平移」而不是改文字/贴图，代价极低：
+        - 绕中心左右各摆 SWAY_DEG 度，用正弦做缓入缓出，端点不突兀
+        - 摆到两侧时略微下沉浮起，看起来像悬浮着荡动
+        动画只在遮罩可见时跑；隐藏/让开时计时器照常走但不动窗口，省开销。
+        """
+        if self.logo.pixmap().isNull():
+            return
+        # 30fps 下一帧 0.09 rad，左右一个完整来回约 2.3 秒，接近轻微的呼吸节奏；
+        # 太快会显得焦躁，太慢像没动
+        self._sway_t += 0.09
+        ang = SWAY_DEG * math.sin(self._sway_t)
+        dy = SWAY_RISE * math.sin(self._sway_t * 2.0)
+        self.logo.set_sway(ang, dy)
 
     def paintEvent(self, _ev):
         p = QPainter(self)
