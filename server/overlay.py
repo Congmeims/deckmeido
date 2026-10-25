@@ -136,15 +136,35 @@ class Mask(QWidget):
         self.urgent_timer.start(URGENT_MS)
 
     # ---------- 后端状态 ----------
-    def _fetch(self) -> dict:
-        # ack=1 告诉后端「本次返回的状态我已经照做了」，后端据此判断可以安全点击
+    def _fetch(self, ack: bool = True) -> dict:
+        # ack=1 告诉后端「本次返回的状态我已经照做了」，后端据此判断可以安全点击。
+        # hidden 自报当前是否真的已经藏好：后端要求让开时只认这个，不看它自己的意图
+        q = f"ack=1&hidden={0 if self.isVisible() else 1}&" if ack else ""
         req = urllib.request.Request(
-            f"{API}/api/overlay_state?ack=1&token={TOKEN}")
+            f"{API}/api/overlay_state?{q}token={TOKEN}")
         try:
             with urllib.request.urlopen(req, timeout=3) as r:
                 return json.loads(r.read())
         except Exception:
             return {}
+
+    def _ack_state(self):
+        """把「窗口真的藏好了没有」回报给后端，让它放心点下去
+
+        这一次请求纯粹是回报，不取状态（ack 不带 hidden 参数时后端不认）。
+        QWidget.isVisible() 在 hide() 后立刻为 False；X11 那边取消映射是异步的，
+        所以再等两帧（约 30ms）让合成器把这一层撤下去，避免点击抢在隐藏生效前。
+        """
+        def report():
+            try:
+                req = urllib.request.Request(
+                    f"{API}/api/overlay_state?ack=1&hidden="
+                    f"{0 if self.isVisible() else 1}&token={TOKEN}")
+                urllib.request.urlopen(req, timeout=2).read()
+            except Exception:
+                pass
+        QTimer.singleShot(30, lambda: threading.Thread(
+            target=report, daemon=True).start())
 
     def _set_text(self, text: str):
         self._text = text
@@ -188,7 +208,7 @@ class Mask(QWidget):
         return top, h - 1 - bottom
 
     def _poll_urgent(self):
-        """穿透期间每 25ms 问一次后端，保证 agent 点击前遮罩已经让开"""
+        """穿透期间每 25ms 问一次后端，保证 agent 点击前遮罩已经藏好"""
         if self._urgent:
             self._poll()
 
@@ -204,53 +224,42 @@ class Mask(QWidget):
         self._set_lifted(bool(state.get("lift")))
         # 正在显示、刚要求穿透、或刚要求抬高遮罩时，切到快速轮询
         self._urgent = bool(show or self._passthrough or self._lifted)
-        # 显示条件里不能再排除 passthrough：穿透只是不接鼠标，画面仍要留在屏幕上
+        # 显示条件里不能再排除 passthrough：那只是「暂时藏起来」，
+        # 注入结束、show 还没变 false 时要能把遮罩放回去
         if show:
-            if not self.isVisible() and not self._lifted:
+            if not self.isVisible() and not self._lifted and not self._passthrough:
                 self._show_mask()
                 self._shown_at = now
                 self._cancelled = False
         elif self.isVisible() and (now - self._shown_at) * 1000 >= MIN_SHOW_MS:
             self.hide()
+        # 处理好之后再回报「是否真的藏好了」，后端等的是这个确认
+        if self._passthrough:
+            self._ack_state()
 
     def _set_passthrough(self, on: bool):
         if on == self._passthrough:
             return
         self._passthrough = on
-        # 穿透期间让整个窗口不接输入（WindowTransparentForInput）：不只是「自己忽略
-        # 事件」，而是让系统把这层从命中测试里摘掉，点击直接落到下面的窗口。
-        # 以前只用 WA_TransparentForMouseEvents，遮罩窗口本身仍参与命中测试，
-        # agent 那一下点击的坐标只要落在遮罩上，就会被当成「用户终止」。
-        # 注意窗口不能藏：画面仍要显示「正在操作」，用户也还能看到进度
+        # agent 注入鼠标期间，遮罩必须整块藏起来，不能只靠窗口标志让开。
+        #
+        # 踩过的坑：这里原本用 WA_TransparentForMouseEvents 再用
+        # WindowTransparentForInput 让 X 把窗口从命中测试里摘掉。但遮罩跑在
+        # XWayland 里（QT_QPA_PLATFORM=xcb，上层是 KDE Wayland），点击是
+        # Wayland 合成器做命中测试后再投给 XWayland 窗口的，X11 那层的
+        # "input shape" 对合成器不可见。于是 agent 自己的 uinput/xdotool 点击
+        # 照样打在遮罩上 → /api/cancel → 任务被自己的操作终止（日志里
+        # 「正在操作桌面」后紧跟着一条 POST /api/cancel 就是这个）。
+        # 隐藏窗口是唯一不依赖平台细节的解法：没有窗口，就没有能被打中的目标。
+        # 注入只持续几十毫秒到一两秒，用户看到的是遮罩短暂消失再回来。
+        # 另外 WA_TransparentForMouseEvents 仍然保留：即使 hide 与合成器撤层之间
+        # 有几毫秒窗口还在，Qt 也会把这层收到的点击丢掉，不会走到 _cancel
         self.setAttribute(Qt.WA_TransparentForMouseEvents, on)
-        self._apply_input_transparency(on)
-        if not on and self._show_wanted and not self._lifted and not self.isVisible():
+        if on:
+            self.hide()
+        elif self._show_wanted and not self._lifted:
             self._show_mask()
-        self.repaint()
-
-    def _apply_input_transparency(self, on: bool):
-        """按需切换「整个窗口不接输入」的原生标志
-
-        只在遮罩已显示时动标志：X11 下改窗口标志会重建原生窗口，
-        没显示时改了没意义，等 _show_mask 显示出来再套用。
-        """
-        want = on and self.isVisible()
-        if want == self._input_transparent:
-            return
-        self._input_transparent = want
-        flags = self.windowFlags()
-        if want:
-            flags |= Qt.WindowTransparentForInput
-        else:
-            flags &= ~Qt.WindowTransparentForInput
-        self.setWindowFlags(flags)
-        # setWindowFlags 会把窗口藏起来，必须立刻重新显示并复位几何，否则遮罩会消失
-        if self.isVisible():
-            scr = self.screen() or QApplication.primaryScreen()
-            if scr:
-                self.setGeometry(scr.geometry())
-            self.show()
-            self.raise_()
+            self._shown_at = time.monotonic()
 
 
     def _set_lifted(self, on: bool):

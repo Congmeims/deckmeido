@@ -1154,8 +1154,9 @@ async def _desktop(action: str, target: str = "", x: int = 0, y: int = 0, text: 
         return f"已切到前台：{name}"
 
     if action in ("move", "click"):
-        # 遮罩盖在桌面最上层：不打开穿透，光标会被挡在遮罩下面（移动也看不见落点），
-        # 点击更会被当成「用户终止」，所以 move 也要先让开
+        # 遮罩盖在桌面最上层，而且它是 XWayland 窗口：Wayland 合成器做命中测试时
+        # 看不到 X11 的 input shape，所以只能让遮罩整块藏起来（后端会等遮罩确认
+        # 藏好再放行）。不这么做，点击会被当成「用户终止」
         await _set_overlay_passthrough(True)
         try:
             await _move_to(x, y)

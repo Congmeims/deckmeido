@@ -2031,17 +2031,20 @@ threading.Thread(target=_overlay_watchdog, name="overlay-watchdog", daemon=True)
 
 
 async def set_overlay_passthrough(on: bool) -> None:
-    """让遮罩暂时不接收鼠标点击，使 agent 的点击能落到下面的窗口。
+    """让遮罩暂时让开，使 agent 的点击能落到下面的窗口。
 
-    打开时要等遮罩进程真正让开（它每 25ms 轮询，回报 ack）；
-    否则点击会打在还没隐藏的遮罩上，被当成「用户终止」。
+    遮罩窗口跑在 XWayland 里，Wayland 合成器做命中测试时看不见 X11 的
+    input shape，所以「窗口标志让开」是不成立的；遮罩进程收到这个标志后
+    会把窗口整块 hide()，并回报「确实藏好了」。这里必须等那个回报再放行，
+    否则点击会打在还没撤下去的遮罩上，被当成「用户终止」。
     """
     _overlay_state["passthrough"] = on
+    _overlay_ack["passthrough"] = False
     if not on:
         return
     if _overlay_proc is None or _overlay_proc.poll() is not None:
         return  # 遮罩没跑，不用等
-    for _ in range(40):  # 最多等 400ms
+    for _ in range(80):  # 最多等 800ms（hide + 合成器撤层需要几帧）
         if _overlay_ack["passthrough"]:
             return
         await asyncio.sleep(0.01)
@@ -2116,10 +2119,15 @@ async def api_controls_fix(full: int = Query(default=0)):
 
 
 @app.get("/api/overlay_state", dependencies=[Depends(check_token)])
-async def api_overlay_state(ack: int = 0):
-    # 遮罩进程带 ack=1 轮询时，表示它已经按本次返回的状态生效过了
+async def api_overlay_state(ack: int = 0, hidden: int = 1):
+    # 遮罩进程带 ack=1 轮询时，表示它已经按本次返回的状态生效过了。
+    # hidden 是它自报的「当前窗口是否已隐藏」：要求让开时只有真的藏了才算确认，
+    # 否则 agent 那一下点击仍可能打在还显示着的遮罩上，被当成用户终止
     if ack:
-        _overlay_ack["passthrough"] = _overlay_state["passthrough"]
+        if _overlay_state["passthrough"] and not _overlay_state["lift"]:
+            _overlay_ack["passthrough"] = bool(hidden)
+        else:
+            _overlay_ack["passthrough"] = _overlay_state["passthrough"]
         _overlay_ack["lift"] = _overlay_state["lift"]
     return _overlay_state
 
