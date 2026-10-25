@@ -8,14 +8,18 @@ agent 操作这台设备期间，在桌面上叠加一层半透明全屏遮罩�
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import signal
+import sys
 import threading
 import time
 import urllib.request
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFrame, QGraphicsDropShadowEffect, QLabel, QVBoxLayout, QWidget,
@@ -320,13 +324,231 @@ class Mask(QWidget):
             p.end()
 
 
+_ROOT = str(Path(__file__).resolve().parent.parent)
+
+
+def server_name() -> str:
+    """单实例套接字名，带上安装目录指纹：不同安装位置互不影响"""
+    return "DeckMeidoOverlay-" + hashlib.sha1(
+        _ROOT.encode("utf-8")
+    ).hexdigest()[:12]
+
+
+def _alive(pid: int) -> bool:
+    """进程是否真的还活着（僵尸进程算死）"""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            st = f.read().rsplit(b")", 1)[-1].split()
+        if st and st[0] == b"Z":
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _overlay_pids() -> list[int]:
+    """扫出本安装目录下所有 overlay.py 进程（不含自己）
+
+    套接字只能问到一个实例，被抢走套接字的「聋子孤儿」只能靠扫 /proc 找出来，
+    否则它会一直留在桌面上画遮罩。
+    """
+    me = os.getpid()
+    found: list[int] = []
+    try:
+        entries = os.listdir("/proc")
+    except Exception:
+        return found
+    for e in entries:
+        if not e.isdigit():
+            continue
+        pid = int(e)
+        if pid == me:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = [a.decode("utf-8", "replace")
+                        for a in f.read().split(b"\0") if a]
+        except Exception:
+            continue
+        if not any(a.endswith("overlay.py") for a in args):
+            continue
+        # 只认本安装目录的遮罩：命令行或工作目录里得有自己的路径
+        ok = _ROOT in " ".join(args)
+        if not ok:
+            try:
+                ok = os.readlink(f"/proc/{pid}/cwd") in (_ROOT, _ROOT + "/server")
+            except Exception:
+                ok = False
+        if ok:
+            found.append(pid)
+    return found
+
+
+def _wait_dead(pids, timeout: float) -> list[int]:
+    """等这批进程真正消失，返回超时后仍活着的"""
+    alive = [p for p in pids if _alive(p)]
+    end = time.time() + timeout
+    while alive and time.time() < end:
+        time.sleep(0.05)
+        alive = [p for p in alive if _alive(p)]
+    return alive
+
+
+def acquire_single_instance(force: bool = False) -> QLocalServer | None:
+    """单实例锁：桌面上只允许一层遮罩。
+
+    遮罩由后端按需拉起，后端重启后旧的遮罩会变成孤儿继续挂着，
+    多来几次就叠成好几层。这里做本地套接字查重：
+      - 已有实例活着：非 force 时直接退出；force 时先让它自己关掉，再接管
+      - 连不上（进程已崩）：清掉残留套接字文件，重新监听
+
+    force 接管必须「确认对方死透」才能 listen。旧实现只盲等 2 秒就抢套接字，
+    对方超过 2 秒才退出时套接字已被抢走，它就变成一个收不到 quit、
+    却仍在画遮罩的聋子孤儿——正是重复遮罩的根源。
+
+    名字带上安装目录指纹，不同安装位置互不影响。
+    """
+    name = server_name()
+
+    def request(cmd: bytes) -> bytes:
+        """向已有实例发一条命令，返回对方的回应；连不上返回 b""。
+
+        对端可能在收完命令后立刻断开，此时 state 已不是 Connected，
+        再调 waitForBytesWritten 会刷 "not allowed in UnconnectedState" 警告。
+        """
+        sock = QLocalSocket()
+        sock.connectToServer(name)
+        if not sock.waitForConnected(300):
+            return b""
+        reply = b""
+        try:
+            sock.write(cmd)
+            # 只 flush 不等 bytesWritten：本地套接字上这几字节会立刻进内核缓冲，
+            # 而对端收完就断开时再调 waitForBytesWritten 会刷
+            # "not allowed in UnconnectedState" 警告（连 try/except 也拦不住，它是 Qt 内部打印）
+            sock.flush()
+            if sock.waitForReadyRead(500):
+                reply = bytes(sock.readAll())
+        except Exception:
+            pass
+        finally:
+            try:
+                sock.disconnectFromServer()
+            except Exception:
+                pass
+        return reply
+
+    def parse_pid(reply: bytes) -> int | None:
+        # 回应格式 b"pid:1234"
+        if not reply.startswith(b"pid:"):
+            return None
+        try:
+            return int(reply[4:].strip())
+        except ValueError:
+            return None
+
+    replied = bool(request(b"ping"))
+    others = _overlay_pids()          # 含拿不到套接字的聋子孤儿
+    if (replied or others) and not force:
+        return None
+
+    if force and (replied or others):
+        # 先礼：请它自己退位（新版会回自己的 pid）
+        targets = set(others)
+        pid = parse_pid(request(b"quit"))
+        if pid:
+            targets.add(pid)
+        leftover = _wait_dead(targets, 3.0)
+        if leftover:
+            # 后兵：真死了不退出就强杀，绝不允许留给接任者一个聋子孤儿
+            for p in leftover:
+                try:
+                    os.kill(p, signal.SIGKILL)
+                except Exception:
+                    pass
+            _wait_dead(leftover, 2.0)
+
+    QLocalServer.removeServer(name)
+    server = QLocalServer()
+    server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+    if not server.listen(name):
+        # 撞车：另一种可能是另一个实例刚好抢先，让它去
+        if request(b"ping"):
+            return None
+        print(f"[DeckMeidoOverlay] 单实例监听失败：{server.errorString()}",
+              file=sys.stderr)
+    return server
+
+
 def main() -> int:
+    force = "--force" in sys.argv[1:]
     app = QApplication([])
     app.setApplicationName("DeckMeidoOverlay")
     app.setFont(ui_font(13))
+
+    single = acquire_single_instance(force=force)
+    if single is None:
+        return 0
+
     mask = Mask()
     mask.hide()
-    app.exec()
+
+    def shutdown() -> None:
+        """退出前主动让出套接字。
+
+        不这么做的话，接任者只能盲等一段时间后强删套接字文件；
+        万一我还没退干净，套接字已被它接管，我就成了一个收不到 quit、
+        却仍在桌面上画遮罩的聋子孤儿——正是重复遮罩的根源。
+        """
+        try:
+            single.close()
+            QLocalServer.removeServer(server_name())
+        except Exception:
+            pass
+        app.quit()
+
+    def on_connection() -> None:
+        while single.hasPendingConnections():
+            conn = single.nextPendingConnection()
+            if conn is None:
+                break
+            conn.disconnected.connect(conn.deleteLater)
+            if conn.bytesAvailable() == 0:
+                conn.waitForReadyRead(200)
+            payload = bytes(conn.readAll()).strip()
+            if payload == b"quit":
+                # 后端拉起了新版：先把 pid 报出去，让它确认我死透了再接管
+                try:
+                    conn.write(b"pid:" + str(os.getpid()).encode())
+                    conn.flush()
+                except Exception:
+                    pass
+                # 交回事件循环再退，别在槽函数里直接 quit
+                QTimer.singleShot(0, shutdown)
+                return
+            # ping：回一句证明我还活着（force 接管方据此判断要不要接管）
+            if payload == b"ping":
+                try:
+                    conn.write(b"pong")
+                    conn.flush()
+                except Exception:
+                    pass
+            conn.disconnectFromServer()
+
+    single.newConnection.connect(on_connection)
+
+    try:
+        app.exec()
+    finally:
+        shutdown()
     return 0
 
 

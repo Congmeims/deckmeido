@@ -26,3 +26,6 @@ dist/
 # 安装时生成的产物（由 install.sh 写入，不入库）
 VERSION
 uninstall.sh
+
+# 上传的图片（运行时产物）
+server/static/uploads/

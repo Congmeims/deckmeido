@@ -257,10 +257,179 @@ TOOLS: list[dict] = [
 # 危险操作：任何权限模式下都需确认
 DANGEROUS = {"install_game"}
 
-# 会实际控制设备的工具：只有这些才弹出操作遮罩。
-# 联网搜索、查天气、读写文件等都只是后台任务，遮罩会白挡一层，还会被误当成「正在操作」；
-# 截屏是只读采集，且遮罩本身会被拍进截图里，所以也不弹
-DEVICE_TOOLS = {"desktop", "run_command"}
+# 会实际控制设备的工具里，只有真正「动光标 / 敲键盘」的调用才弹操作遮罩。
+# 联网搜索、查天气、读写文件、跑普通 shell 命令都只是后台任务，
+# 遮罩白挡一层，还会被误当成「正在操作」，所以一律不弹。
+#
+# focus 刻意不在里面：它只调 kdotool windowactivate/windowraise 激活窗口，
+# 光标不动、键盘不敲。窗口一抬起来就盖一层遮罩，用户会以为 agent 在操作设备。
+DESKTOP_ACTION_TOOLS = {"click", "move", "type"}
+
+# 真正会注入输入的子命令（xdotool / ydotool / dotool 同名）
+_XDOTOOL_INPUT_SUBS = {
+    "click", "mousedown", "mouseup",
+    "mousemove", "mousemove_relative", "move",
+    "type", "key", "keydown", "keyup",
+    "drag", "scroll", "wheel", "text",
+}
+# kdotool 的输入类子命令；window* 系列属于窗口管理，不动光标不敲键盘
+_KDOTOOL_INPUT_SUBS = {
+    "type", "key", "keydown", "keyup",
+    "mousemove", "mousemove_relative", "move",
+    "click", "mousedown", "mouseup", "scroll", "wheel", "text",
+}
+# 会让光标按下去的子命令：这些必须打开遮罩穿透，否则点会落在遮罩上变成「用户终止」
+_POINTER_CLICK_SUBS = {"click", "mousedown", "mouseup"}
+
+# 输入注入工具的调用点。只取到本段命令结束（;&| 或换行），
+# 避免把后续无关命令里的同名单词也当成子命令
+_INPUT_TOOLS_RE = re.compile(
+    r"(?:^|[\s|;&(`'\"/])(xdotool|ydotool|dotool|wtype|kdotool)\b([^\n;&|]*)")
+# 这些选项后面跟一个值，解析子命令时要连值一起跳掉。
+# 少了 --name/--class 这类，「找标题里带 type 的窗口」会被当成要打字
+_OPTS_WITH_VALUE = {
+    "--delay", "--repeat", "--window", "--terminator", "--args",
+    "--name", "--class", "--classname", "--role",
+    "--screen", "--desktop", "--limit", "--maxdepth", "--pid", "--windowid",
+}
+
+_INPUT_TOOLS = {"xdotool", "ydotool", "dotool", "wtype", "kdotool"}
+# 站在命令真正执行位置前面的包装词，剥掉之后才看得到真实程序
+_CMD_PREFIXES = {"sudo", "env", "nohup", "time", "command", "exec", "nice", "stdbuf"}
+# 按 shell 的分段符切开：只有段首才是「真正被执行的程序」，
+# 这样 echo 'xdotool click 1' 只是打印一段字符串，不会被当成点击
+_SEGMENT_SPLIT_RE = re.compile(r"(\$\(|\)|;|&&|\|\||\||`|\n)")
+
+# 已知子命令（三个工具取并集，具体哪些算「注入输入」由各工具的集合决定）。
+# 只有认得出子命令列表，才能把 `xdotool sleep 1 mousemove 3 3` 这种链式写法里
+# 真正的 mousemove 认出来，同时不把 `search --name type` 里的 type 当子命令
+_KNOWN_SUBS = {
+    "xdotool": {
+        "click", "mousedown", "mouseup", "mousemove", "mousemove_relative", "move",
+        "type", "key", "keydown", "keyup", "drag", "scroll", "wheel", "text",
+        "search", "getactivewindow", "getwindowname", "getwindowgeometry",
+        "getwindowpid", "getmouselocation", "getdisplaygeometry", "get_num_desktops",
+        "get_desktop", "set_desktop", "set_num_desktops", "windowactivate",
+        "windowraise", "windowfocus", "windowmove", "windowsize", "windowkill",
+        "windowclose", "windowminimize", "windowunmap", "windowmap", "windowreparent",
+        "set_window", "behave", "exec", "sleep", "version", "help",
+    },
+    "kdotool": {
+        "click", "mousedown", "mouseup", "mousemove", "mousemove_relative", "move",
+        "type", "key", "keydown", "keyup", "drag", "scroll", "wheel", "text",
+        "search", "getactivewindow", "getwindowname", "getmouselocation",
+        "windowactivate", "windowraise", "windowclose", "windowminimize",
+        "windowmove", "windowresize", "windowkill", "windowlist",
+    },
+}
+_KNOWN_SUBS["ydotool"] = _KNOWN_SUBS["xdotool"] | {"debug", "mousemove_absolute"}
+_KNOWN_SUBS["dotool"] = _KNOWN_SUBS["xdotool"] | {"input"}
+
+
+def _segments(cmd: str) -> list[str]:
+    """把命令行按 ; && || | $() 反引号换行切成若干「执行段」"""
+    return [s for s in _SEGMENT_SPLIT_RE.split(cmd or "")
+            if s and not _SEGMENT_SPLIT_RE.fullmatch(s)]
+
+
+def _tokens(seg: str) -> list[str]:
+    """切词。引号不配对时退回朴素切分，绝不因为解析失败就漏判"""
+    try:
+        return shlex.split(seg, comments=False, posix=True)
+    except Exception:
+        return seg.split()
+
+
+def _strip_prefixes(toks: list[str]) -> list[str]:
+    """剥掉 sudo / env / VAR=VALUE 这类前缀，返回从真实程序开始的参数"""
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t in _CMD_PREFIXES or re.fullmatch(r"[A-Za-z_]\w*=\S*", t) or t.startswith("-"):
+            i += 1
+            continue
+        break
+    return toks[i:]
+
+
+def _parse_subs(tool: str, args: list[str]) -> list[str]:
+    """按真实语法顺序解析出一段里出现的全部子命令
+
+    逐个走参数：选项跳过（带值的连值一起跳），认得出的字当子命令，
+    认不出的当上一个子命令的参数。这样：
+    - `sleep 1 mousemove 3 3`  → ['sleep', 'mousemove']   链式写法不掉
+    - `search --name type`     → ['search']               窗口标题不当子命令
+    """
+    known = _KNOWN_SUBS.get(tool, set())
+    subs: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("-"):
+            opt = a.split("=", 1)[0]
+            i += 2 if ("=" not in a and opt in _OPTS_WITH_VALUE) else 1
+            continue
+        low = a.lower()
+        if low in known:
+            subs.append(low)
+        elif not subs:
+            # 认不出的首个裸参数：仍当成子命令（未知子命令不可能是输入类）
+            subs.append(low)
+        i += 1
+    return subs
+
+
+def _invocations(cmd: str) -> list[tuple[str, list[str], list[str]]]:
+    """解析命令里真正会执行的输入注入调用，返回 [(工具名, 子命令列表, 原始参数), ...]
+
+    只认「段首」的注入工具：`echo 'xdotool click 1'` 只是打印一段字符串，
+    不点屏幕也不敲键盘，不该为它压遮罩。
+    """
+    found: list[tuple[str, list[str], list[str]]] = []
+    for seg in _segments(cmd):
+        toks = _strip_prefixes(_tokens(seg))
+        if not toks:
+            continue
+        tool = os.path.basename(toks[0])
+        if tool not in _INPUT_TOOLS:
+            continue
+        args = toks[1:]
+        if tool == "wtype":
+            # wtype 没有子命令，用法就是 wtype 后直接跟要打的字
+            found.append((tool, ["type"], args))
+            continue
+        found.append((tool, _parse_subs(tool, args), args))
+    return found
+
+
+def _input_invoked(cmd: str) -> bool:
+    """这条命令会不会真的动光标或敲键盘"""
+    for tool, subs, _args in _invocations(cmd):
+        allowed = _KDOTOOL_INPUT_SUBS if tool == "kdotool" else _XDOTOOL_INPUT_SUBS
+        if any(s in allowed for s in subs):
+            return True
+    return False
+
+
+def _pointer_click(cmd: str) -> bool:
+    """这条命令会不会按下鼠标左/中/右键"""
+    for _tool, subs, _args in _invocations(cmd):
+        if any(s in _POINTER_CLICK_SUBS for s in subs):
+            return True
+    return False
+
+
+def needs_overlay(name: str, args: dict) -> bool:
+    """这次工具调用会不会动光标/敲键盘。只有会动的才压遮罩。
+
+    run_command 要按命令内容判断：ls、git status、ps、截图、搜索这类纯后台
+    动作一律不弹；只有真正注入鼠标键盘（xdotool/ydotool/wtype/kdotool）才弹。
+    """
+    if name == "desktop":
+        return str(args.get("action", "")) in DESKTOP_ACTION_TOOLS
+    if name == "run_command":
+        return _input_invoked(str(args.get("command", "")))
+    return False
 
 # 智能审批（auto）模式下的危险命令特征：命中则需要用户确认
 DANGER_PATTERNS = [
@@ -301,9 +470,8 @@ def extract_writes(cmd: str) -> list[str]:
     return files[:10]
 
 
-# 命令里出现这些说明 agent 要真的点屏幕：ydotool/xdotool 的 click、mousedown、mouseup
-_MOUSE_CLICK_RE = re.compile(
-    r"\b(?:ydotool|xdotool)\b[^\n;&|]*\b(?:click|mousedown|mouseup)\b")
+# 判断「这条命令会不会注入鼠标键盘」的逻辑见上方 _invocations / _input_invoked /
+# _pointer_click：解析真实子命令，而不是拿关键词在整串命令里模糊匹配
 
 # 由 main 注入：切换遮罩的鼠标穿透状态 / 截图时收起遮罩
 ON_OVERLAY_PASSTHROUGH = None
@@ -421,7 +589,7 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
     _fix_display_env(env)
     # 命令里有鼠标点击时，遮罩必须暂时不接事件，否则这点会点在遮罩上变成「用户终止」；
     # 打开后要等遮罩真正让开，否则点击仍会打在还没隐藏的遮罩上
-    await _set_overlay_passthrough(bool(_MOUSE_CLICK_RE.search(command)))
+    await _set_overlay_passthrough(_pointer_click(command))
     feed = None
     if stdin:
         # 用 script 包一层伪终端：/dev/tty 读取和交互菜单都能收到 stdin 输入

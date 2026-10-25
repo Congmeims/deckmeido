@@ -545,16 +545,22 @@ prepare_config() {
 }
 
 install_service() {
+  # 不再安装 systemd 开机自启服务。
+  #
+  # 历史原因：以前 install.sh 装一个 deckmeido.service，客户端启动时又自己拉一份后端，
+  # 两份抢同一个端口——谁先绑定谁对外服务，而它们各有一份内存历史，
+  # 重启时被另一半抢到，用户看到的就是「聊天记录丢了」。
+  # 现在后端只由客户端（桌面快捷方式）拉起，退出时一并收走。
+  # 这里仅做清理：把老版本装过的单元停掉删掉，避免升级后还有残留一起抢端口。
   need_cmd systemctl || return 0
-  mkdir -p "$UNIT_DIR"
-  sed "s|%h/deckmeido|$INSTALL_DIR|g; s|--port 18765|--port $PORT|g" \
-    "$INSTALL_DIR/deploy/$UNIT" > "$UNIT_DIR/$UNIT"
-  systemctl --user daemon-reload
-  # 必须先 enable 再 restart：服务已在跑时 `enable --now` 不会重新拉起进程，
-  # 升级后还在跑旧代码
-  systemctl --user enable "$UNIT" >/dev/null 2>&1 || true
-  systemctl --user restart "$UNIT"
-  dim "用户服务已启用：systemctl --user status $UNIT"
+  systemctl --user disable --now "$UNIT" >/dev/null 2>&1 || true
+  rm -f "$UNIT_DIR/$UNIT"
+  systemctl --user daemon-reload || true
+  # 兜底：万一还有裸跑的后端占着端口，停掉它，把入口让回客户端
+  if need_cmd fuser; then
+    fuser -k -TERM "$PORT/tcp" >/dev/null 2>&1 || true
+    sleep 1
+  fi
 }
 
 # 用 --purge 卸载前先停服务，否则进程会边跑边重建目录；从外部脚本升级时同样先停
@@ -633,10 +639,22 @@ read_token() {
 
 wait_ready() {
   local url="http://127.0.0.1:$PORT/"
-  for _ in $(seq 1 40); do
+  for _ in $(seq 1 3); do
     if curl -fsS -o /dev/null "$url" 2>/dev/null; then return 0; fi
-    sleep 0.5
+    sleep 0.3
   done
+  return 1
+}
+
+launch_client() {
+  # 服务由客户端拉起，所以装完直接帮用户开一次客户端，服务就齐了
+  local exe="$INSTALL_DIR/.venv/bin/python"
+  local cli="$INSTALL_DIR/client/main.py"
+  [ -x "$exe" ] && [ -f "$cli" ] || return 1
+  if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    setsid "$exe" "$cli" >/dev/null 2>&1 &
+    return 0
+  fi
   return 1
 }
 
@@ -723,10 +741,11 @@ do_install() {
       dim "已跳过。之后想装：bash install.sh install --deps"
     fi
   fi
-  if need_cmd curl && wait_ready; then
+  # 服务由客户端拉起：装完顺手开一次客户端，后台服务就一并起来了
+  if launch_client && wait_ready; then
     print_done
   else
-    warn "服务还没就绪，查看日志：journalctl --user -u $UNIT -n 50"
+    warn "客户端未能自动启动，请双击桌面上的 DeckMeido 图标（服务会随之拉起）"
   fi
 }
 
@@ -748,10 +767,12 @@ do_upgrade() {
   else
     system_notes
   fi
+  # 服务由客户端拉起：升级后关掉旧客户端再开新的，新代码才会生效
+  launch_client && wait_ready || true
   if need_cmd curl && wait_ready; then
     print_done
   else
-    warn "升级完成但服务未就绪，查看日志：journalctl --user -u $UNIT -n 50"
+    warn "升级完成。若界面还是旧版本，请关掉托盘里的 DeckMeido 再从桌面图标重开"
   fi
 }
 

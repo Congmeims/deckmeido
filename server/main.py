@@ -8,8 +8,10 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -20,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .llm import LLMClient
-from . import depcheck, tools, updater
+from . import depcheck, singleton, tools, updater
 from .tts import TTS
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -90,6 +92,16 @@ def update_config(updates: dict):
 CFG = load_config()
 TOKEN = CFG["server"]["token"].strip().lower()
 
+# 单实例守卫：必须在 init_sessions() 之前跑。init_sessions 在导入期就会
+# 读/写会话文件，如果本进程注定绑定端口失败却先把内存里的空历史写了盘，
+# 正在服务的那一份就会「丢记录」。
+# 端口来源优先级：环境变量 > 配置，和 uvicorn 命令行保持一致。
+_PORT_EARLY = os.environ.get("DECKMEIDO_PORT") or CFG["server"].get("port", 18765)
+singleton.guard(
+    int(_PORT_EARLY),
+    allow_second=bool(os.environ.get(singleton.ENV_BYPASS)),
+)
+
 llm = LLMClient(
     base_url=CFG["llm"]["base_url"],
     api_key=CFG["llm"]["api_key"],
@@ -142,6 +154,51 @@ def _guess_context_window(model: str) -> int:
 
 def context_window() -> int:
     return CONTEXT_WINDOW or _guess_context_window(llm.model)
+
+
+# ---------- 上下文压缩游标（关键：只压缩「发给模型的上下文」，绝不删界面历史） ----------
+# 旧实现把 history 原地替换成「摘要 + 最近 4 条」，compress 完还立刻落盘，
+# 于是用户屏幕上已有的几十轮对话被一起抹掉——表现就是「内容不见了」。
+# 现在改成游标模型：
+#   history        永远只追加，完整记录 = 界面显示 + 磁盘存档
+#   _compact_map   每个会话一份 {"summary": 旧对话摘要, "upto": 摘要覆盖到第几条}
+# 发给模型时 = 摘要(system) + history[upto:]，History 本身一条都不动。
+_compact_map: dict[str, dict] = {}
+
+
+def _compact_for(sid: str) -> dict:
+    """取某个会话的压缩游标（没有就返回空游标）"""
+    cur = _compact_map.get(sid or "")
+    if not isinstance(cur, dict):
+        return {"summary": "", "upto": 0}
+    return {"summary": cur.get("summary") or "", "upto": max(0, int(cur.get("upto") or 0))}
+
+
+def _set_compact(sid: str, summary: str, upto: int) -> None:
+    _compact_map[sid or current_sid] = {"summary": summary or "",
+                                        "upto": max(0, int(upto or 0))}
+
+
+def _build_llm_msgs(hist: list[dict], sys_prompt: str, sid: str = "") -> list[dict]:
+    """构造发给模型的 messages：摘要 + 压缩游标之后的原文
+
+    返回的列表长度就是「来自历史的条数」，调用方据此区分本轮新增的临时消息
+    （assistant tool_calls / tool 结果），压缩后重建时可以接回去。
+    """
+    sid = sid or _turn.get("sid") or current_sid
+    comp = _compact_for(sid)
+    upto = min(comp["upto"], len(hist))
+    msgs: list[dict] = [{"role": "system", "content": sys_prompt}]
+    if upto > 0 and comp["summary"].strip():
+        msgs.append({"role": "system",
+                     "content": f"【此前对话摘要，供上下文延续】\n{comp['summary']}"})
+    for m in hist[upto:]:
+        content = m.get("llm") or m.get("content", "")
+        if m["role"] == "user":
+            content = _to_vision_content(content) if isinstance(content, str) else content
+        # 历史里还存了 ts / events 供界面回放，发给模型时只保留 role 和 content
+        msgs.append({"role": m["role"], "content": content})
+    return msgs
 
 
 def _estimate_tokens(msgs: list[dict]) -> int:
@@ -312,33 +369,185 @@ def save_session_snapshot(sid: str, hist: list[dict]):
 
 def _write_session(sid: str, hist: list[dict]):
     """原子写入一个会话文件"""
-    title = "新会话"
-    for m in hist:
-        if m.get("role") == "user":
-            title = (str(m.get("content") or "")).strip()[:24] or "新会话"
-            break
-    p = _sess_path(sid)
-    created = None
-    if p.exists():
+    with _SESS_WRITE_LOCK:
+        title = "新会话"
+        for m in hist:
+            if m.get("role") == "user":
+                title = (str(m.get("content") or "")).strip()[:24] or "新会话"
+                break
+        p = _sess_path(sid)
+        created = None
+        old_n = 0
+        if p.exists():
+            try:
+                old = json.loads(p.read_text(encoding="utf-8"))
+                created = old.get("created")
+                old_n = len(old.get("history") or [])
+            except Exception:
+                pass
+
+        # 防覆盖：磁盘里有大段历史，这次却要写进少得多的内容时，先把原文件留一份。
+        # 后端被重复拉起、会话在切换瞬间落盘等异常路径都可能导致这种「缩水写」，
+        # 用户视角就是「聊天记录丢了」——留个 .bak 至少还能救回来。
+        new_n = len(hist)
+        if old_n >= 6 and new_n < old_n / 2:
+            bak = p.with_name(p.name + ".bak")
+            try:
+                shutil.copy2(p, bak)
+                print(
+                    f"[DeckMeido] 会话 {sid} 历史从 {old_n} 条缩到 {new_n} 条，"
+                    f"已备份到 {bak.name}",
+                    file=sys.stderr,
+                )
+            except Exception:
+                pass
+
+        data = {"id": sid, "title": title,
+                "created": created or time.time(), "updated": time.time(),
+                "history": hist}
+        # 压缩游标必须一起落盘：否则重启后模型重新吃到全量历史，
+        # 白白撑爆上下文窗口，又要再压缩一遍
+        comp = _compact_for(sid)
+        if comp["upto"] or comp["summary"]:
+            data["compact"] = comp
+        # 原子写：先写临时文件再 replace。直接 write_text 覆盖时如果进程被杀/连接中断，
+        # 会留下半个 JSON，下次启动解析失败就等于整轮对话丢了
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
         try:
-            created = json.loads(p.read_text(encoding="utf-8")).get("created")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, p)
         except Exception:
-            pass
-    data = {"id": sid, "title": title,
-            "created": created or time.time(), "updated": time.time(),
-            "history": hist}
-    # 原子写：先写临时文件再 replace。直接 write_text 覆盖时如果进程被杀/连接中断，
-    # 会留下半个 JSON，下次启动解析失败就等于整轮对话丢了
-    tmp = p.with_name(p.name + ".tmp")
-    try:
-        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, p)
-    except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+
+
+# ---------- 流式正文的增量落盘 ----------
+# 正文原本是「整轮生成完才落盘」的，而一轮回答可能长达几分钟；这期间进程被杀
+# （客户端退出、升级、OOM）就整段消失，用户看到的就是「我的回复不见了」。
+# 下面在流式回调里按节流频率把半截正文写进会话文件的 _streaming 字段，
+# 进程被杀最多丢 1 秒；下次启动 init_sessions 会把它恢复成「回答中断」的消息。
+
+_STREAM_FLUSH_INTERVAL = 0.6   # 秒（越短丢得越少；写的是小文件，代价可接受）
+_STREAM_FLUSH_CHARS = 200      # 或自上次落盘以来又累积这么多字
+_RESTORE_MIN_CHARS = 0         # 恢复门槛已取消：一个字也救回来，见 init_sessions
+# events 槽：本轮到目前为止「屏幕上已经出现过」的有序内容块。
+# 只存最后那段正文的话，一轮里先说话、再调工具、再说一段的，中途被杀就只剩最后一段
+_stream_buf: dict = {"sid": "", "text": "", "last": 0.0, "written": 0, "parts": []}
+
+# 会话文件的全部落盘操作都在这一把锁里串行执行。
+# 流式回调（每 1 秒一次）、正式写入、_streaming 清理可能是并发的：
+#   1. 共用同一个 "<sid>.json.tmp" 临时文件 —— 两个线程同时写它，A 刚写完
+#      B 又覆盖，A 再 os.replace 就是把 B 的半截内容换上去，文件损坏；
+#   2. 更常见的是「读到旧数据再整体写回」：A 读到 54 条，B 在同一时刻写入
+#      55 条，A 随后把自己手里的 54 条写回去 —— 刚生成的回复凭空消失。
+#      _write_streaming 正是「读-改-写 _streaming 字段」，最容易踩第 2 条。
+# 加锁后这些读-改-写变成原子序列，最多是内容旧一点，绝不会互相抹掉。
+_SESS_WRITE_LOCK = threading.RLock()
+
+
+def _write_streaming(sid: str, text: str, parts: list[dict] | None = None) -> None:
+    """把半截正文写进会话文件的 _streaming 字段（不动 history）
+
+    parts 是「屏幕上已经出现过的全部内容」的有序块列表：
+      {"type":"text","content":...}  ← 助手正文段
+      {"type":"event","event":{...}} ← 思维链 / 工具时间线
+    只存 text 的话，一轮里先说话、再调工具、再说一段的，中途被杀就只剩最后一段。
+    """
+    with _SESS_WRITE_LOCK:
+        p = _sess_path(sid)
+        data: dict = {}
+        if p.exists():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+        data.setdefault("id", sid)
+        data.setdefault("title", "新会话")
+        data.setdefault("created", time.time())
+        data.setdefault("history", [])
+        data["updated"] = time.time()
+        data["_streaming"] = {"text": text, "ts": time.time(),
+                              "parts": list(parts or [])}
+        # 临时文件名带 pid：万一还有别的进程（旧的孤儿后端）在写同一份会话，
+        # 至少不会互相踩坏对方正在写的临时文件
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
         try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, p)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def persist_stream(text: str, force: bool = False, parts: list[dict] | None = None) -> None:
+    """流式正文的节流落盘；force=True 立即写（终止 / checkpoint / 收尾时用）
+
+    parts 传入时同时更新缓冲区里「屏幕上出现过的内容」有序块列表，
+    这样即便只存了最后一段正文，恢复时也能按原顺序把所有段落和事件拼回来。
+    """
+    sid = _turn.get("sid") or current_sid
+    buf = _stream_buf
+    if buf["sid"] != sid:
+        # 换了会话或开了新一轮：重新开始累积
+        buf.update({"sid": sid, "text": "", "last": 0.0, "written": 0, "parts": []})
+    buf["text"] = text
+    if parts is not None:
+        buf["parts"] = parts
+    now = time.time()
+    if not force:
+        grew = len(text) - buf["written"]
+        if (now - buf["last"]) < _STREAM_FLUSH_INTERVAL and grew < _STREAM_FLUSH_CHARS:
+            return
+    buf["last"] = now
+    buf["written"] = len(text)
+    _write_streaming(sid, text, buf.get("parts") or [])
+
+
+def _snapshot_parts(events: list[dict], tail_text: str = "") -> list[dict]:
+    """把本轮事件与当前正文拼成「屏幕上出现过的内容」有序块列表
+
+    事件的 text 段（工具调用前的过渡正文）按顺序穿插在思维链/工具块之间，
+    尾部的 tail_text 是最后一个事件之后正在进行的那段正文。
+    """
+    parts: list[dict] = []
+    for ev in events or []:
+        if ev.get("type") == "text":
+            parts.append({"type": "text", "content": ev.get("text") or ""})
+        else:
+            parts.append({"type": "event", "event": ev})
+    if tail_text:
+        parts.append({"type": "text", "content": tail_text})
+    return parts
+
+
+def clear_stream(sid: str = "") -> None:
+    """正文已正式落盘，把残留的 _streaming 字段清掉"""
+    sid = sid or _turn.get("sid") or current_sid
+    _stream_buf.update({"sid": "", "text": "", "last": 0.0, "written": 0, "events": []})
+    with _SESS_WRITE_LOCK:
+        p = _sess_path(sid)
+        if not p.exists():
+            return
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not data.pop("_streaming", None):
+            return
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, p)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def init_sessions():
@@ -352,7 +561,51 @@ def init_sessions():
         data = json.loads(files[0].read_text(encoding="utf-8"))
         current_sid = data.get("id", "default")
         history = data.get("history", [])
-        _ctx_used = _estimate_tokens(history)
+        # 恢复压缩游标：摘要 + 已压缩到的位置，配合完整 history 使用，
+        # 界面上仍能看到全部记录，模型只吃「摘要 + 后面的原文」
+        comp = data.get("compact")
+        if isinstance(comp, dict) and (comp.get("summary") or comp.get("upto")):
+            _set_compact(current_sid, comp.get("summary") or "",
+                         min(int(comp.get("upto") or 0), len(history)))
+        # 上一轮回答被打断：把当时流式落盘的半截正文恢复成一条「回答中断」的消息，
+        # 否则用户只看到自己的提问，像是回答凭空消失了
+        partial = data.pop("_streaming", None)
+        partial_text = (partial.get("text") or "").strip() if isinstance(partial, dict) else ""
+        partial_parts = (partial.get("parts") or []) if isinstance(partial, dict) else []
+        # 恢复门槛已取消：只要落盘过半个字，就恢复成一条「回答中断」的消息。
+        # 之前设了 30 字门槛（想避免「好的」这种两个字占一条消息），代价是
+        # 用户看到的现象变成「内容凭空消失」——而被吃掉的往往正是开头那段
+        # 最有信息量的结论。宁可多一条带「已中断」标记的短消息，也不能丢内容。
+        if partial_parts:
+            # 分块恢复：屏幕上出现过的每一段正文都按原顺序保留，事件（思维链/工具）挂到
+            # 同一条消息的 events 上。旧版只存最后一段正文，前几句过渡话会丢，这里已修
+            segs = [(p.get("content") or "") for p in partial_parts if p.get("type") == "text"]
+            evs = [p.get("event") for p in partial_parts if p.get("type") == "event"]
+            partial_text = "\n\n".join(s.strip() for s in segs if s.strip()).strip()
+        else:
+            evs = []
+        # 本轮最后的正文若比 parts 里更全（流式尾部还没进 parts），补在末尾
+        tail_text = (partial.get("text") or "").strip() if isinstance(partial, dict) else ""
+        if tail_text and tail_text not in partial_text:
+            partial_text = (partial_text + "\n\n" + tail_text).strip() if partial_text else tail_text
+        if partial_text or evs:
+            note = "\n\n（以上回答被中断，已保留屏幕上出现过的全部内容）"
+            history.append({"role": "assistant",
+                            "content": (partial_text.rstrip() + note) if partial_text else note.strip(),
+                            "events": evs, "interrupted": True,
+                            "ts": (partial.get("ts") if isinstance(partial, dict) else None) or time.time()})
+            print(f"[DeckMeido] 已恢复被中断的回答（{len(partial_text)} 字，{len(evs)} 个事件）",
+                  file=sys.stderr)
+        _ctx_used = _estimate_tokens(_build_llm_msgs(history, SYSTEM_PROMPT, current_sid))
+        if partial is not None:
+            # 无论是「恢复成消息」还是「判定太短丢弃」，都要把临时字段抹掉后落盘：
+            #   - 不落盘：恢复出来的内容后端再死一次又没了
+            #   - 不抹字段：文件上的 _streaming 还在，下次启动再恢复一遍，
+            #     同一条回答会越重启越多
+            try:
+                _write_session(current_sid, history)
+            except Exception as e:
+                print(f"[DeckMeido] 恢复中断回答后落盘失败：{e}", file=sys.stderr)
     except Exception:
         # 文件损坏：先留个备份再重开会话，别让一个坏文件把关掉的历史彻底毁掉
         try:
@@ -463,7 +716,7 @@ def get_status() -> dict:
         pass
     gaming = subprocess.run(["pgrep", "-x", "gamescope"], capture_output=True).returncode == 0
     win = context_window()
-    used = _ctx_used or _estimate_tokens(history)
+    used = _ctx_used or _estimate_tokens(_build_llm_msgs(history, SYSTEM_PROMPT, current_sid))
     pct = round(min(used / win, 1.0) * 100, 1) if win else 0
     return {
         "battery": int(battery) if battery.isdigit() else None,
@@ -878,6 +1131,10 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
     turn_sid = current_sid
     turn_epoch = _sess_epoch
     _turn.update({"sid": turn_sid, "epoch": turn_epoch, "active": True})
+    # 每轮开头强制复位一次遮罩状态：上一轮若在取消/异常路径里漏了
+    # set_overlay(False)，这里不清就会一直盖着，看起来像「执行普通命令也亮」
+    if _overlay_state.get("show"):
+        set_overlay(False)
     # 本轮使用的历史对象。会话操作已改成「换对象」而不是原地清空，
     # 所以这里拿到的引用在被切走之后依然只属于这一轮
     hist = history
@@ -905,8 +1162,16 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
             action, pending_action = pending_action, None
             events.append({"type": "tool", "name": action["name"],
                            "summary": action["description"], "files": [], "approved": True})
-            set_overlay(True, f"正在执行：{action['description'][:200]}")
-            result = await tools.execute(action["name"], action["args"])
+            # 只有动光标/敲键盘的操作才需要遮罩，普通命令执行时让屏幕保持干净
+            raised = tools.needs_overlay(action["name"], action["args"])
+            if raised:
+                set_overlay(True, f"正在执行：{action['description'][:200]}")
+            try:
+                result = await tools.execute(action["name"], action["args"])
+            finally:
+                # 这一步动作做完就收遮罩，别让它一直盖到本轮回答结束
+                if raised:
+                    set_overlay(False)
             reply = f"已完成：{action['description']}\n{result}"
         elif pending_action:
             # 有新消息但未确认，取消挂起操作
@@ -920,7 +1185,19 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
                                  "ts": time.time(), "events": events, "cancelled": True,
                                  **sid_tag})
         feed_push("assistant_message", text="已终止当前操作", events=events)
+        # 终止时把已经生成的部分保住：屏幕上出现过的每一段正文都留下，
+        # 不能只用最后那段（工具调用前的过渡话也在屏幕上显示过）
+        partial = "".join(_stream_buf.get("text") or "") if _stream_buf.get("sid") == turn_sid else ""
+        parts = _stream_buf.get("parts") or []
+        killed_segs = [p.get("content") or "" for p in parts if p.get("type") == "text"]
+        killed_text = "\n\n".join(s.strip() for s in killed_segs if s.strip()).strip()
+        if partial.strip() and partial.strip() not in killed_text:
+            killed_text = (killed_text + "\n\n" + partial.strip()).strip() if killed_text else partial.strip()
+        if killed_text:
+            hist.append({"role": "assistant", "content": killed_text,
+                         "events": events, "interrupted": True, "ts": time.time()})
         save_session_snapshot(turn_sid, hist)
+        clear_stream(turn_sid)
         _turn["active"] = False
         raise
     finally:
@@ -931,8 +1208,15 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
     # 关键：写回「本轮所属」的会话文件。中途被切走时 current_sid 已经指向别处，
     # 用 save_current_session 会把这一轮错写进新会话（串回复的根源）
     save_session_snapshot(turn_sid, hist)
+    # 正文已正式进 history，清掉流式残留（否则下次启动会多恢复出一条重复的「中断回答」）
+    clear_stream(turn_sid)
     detached = _turn_detached(turn_epoch)
     _turn["active"] = False
+    if not detached and reply.strip():
+        # 给前端一次「最终正文」：带 final=True，前端据此把那句界面上的气泡存进
+        # localStorage 崩溃缓冲。中途被截断的工具过渡话不带这个标记，回滚时不会残留
+        await manager.broadcast({"type": "delta", "text": "", "final": True,
+                                 "reply": reply, "ts": time.time(), **sid_tag})
     if detached:
         # 本轮结束时用户已经切到别的会话：结果留在原会话文件里，不往当前屏幕推
         # （否则新会话里会冒出一段不属于它的回答），只提示一句
@@ -948,37 +1232,49 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
     return {"reply": reply, "events": events}
 
 
-async def compact_history(auto: bool = False, hist: list[dict] | None = None) -> str:
-    """把较早的对话压缩成摘要，保留最近几轮原样。返回摘要文本"""
+async def compact_history(auto: bool = False, hist: list[dict] | None = None,
+                          sid: str = "") -> str:
+    """把较早的对话压缩成摘要，**只影响发给模型的上下文，不动界面历史**
+
+    旧实现 hist[:] = [摘要] + hist[-4:] + 立刻落盘 —— 界面和磁盘上的几十轮
+    对话被一起抹掉，用户看到的就是「内容凭空消失」。现在只推进压缩游标：
+    摘要与 upto 存进文件，history 保持完整，重启后界面能一条不少地回放。
+    """
     global _ctx_used
     hist = history if hist is None else hist
-    if len(hist) <= 4:
-        return "对话还很短，无需压缩"
+    sid = sid or _turn.get("sid") or current_sid
+    comp = _compact_for(sid)
+    # 已经压缩过的部分不再重复参与摘要；最近 4 条永远原样保留
     keep = 4
-    old = hist[:-keep]
+    start = min(comp["upto"], len(hist))
+    end = max(start, len(hist) - keep)
+    old = hist[start:end]
+    if len(old) < 2:
+        return "对话还很短，无需压缩"
     if not llm.configured:
-        # 没配 LLM 就退化为直接截断
-        hist[:] = hist[-keep:]
-        _ctx_used = _estimate_tokens(hist)
-        return "未配置 LLM，已直接截断旧对话"
-    transcript = "\n".join(
-        f"{'用户' if m['role'] == 'user' else '助手'}: {m['content'][:500]}" for m in old
-    )
+        return "未配置 LLM，跳过上下文压缩（历史原样保留）"
+    # 老摘要一起喂进去，让新摘要接着往下写，否则前情会丢
+    parts = []
+    if comp["summary"].strip():
+        parts.append("【前情摘要】\n" + comp["summary"])
+    parts.append("【新增对话】\n" + "\n".join(
+        f"{'用户' if m['role'] == 'user' else '助手'}: {str(m.get('content'))[:500]}" for m in old))
     try:
         summary = await llm.chat([
             {"role": "system", "content": "把下面的对话压缩成一份简洁摘要（中文），保留：用户的目标/偏好、已完成的操作及结果、待办事项、关键文件路径。直接输出摘要正文。"},
-            {"role": "user", "content": transcript},
+            {"role": "user", "content": "\n\n".join(parts)},
         ])
     except Exception as e:
-        hist[:] = hist[-keep:]
-        _ctx_used = _estimate_tokens(hist)
-        return f"压缩失败，已截断旧对话：{e}"
-    hist[:] = [{"role": "system", "content": f"【此前对话摘要，供上下文延续】\n{summary}"}] + hist[-keep:]
-    _ctx_used = _estimate_tokens(hist)
-    # 只有压缩的就是当前会话时才落盘当前会话；否则写回自己所属的那份
-    if hist is history:
+        return f"压缩失败，历史原样保留：{e}"
+    _set_compact(sid, summary, end)
+    _ctx_used = _estimate_tokens(_build_llm_msgs(hist, SYSTEM_PROMPT, sid))
+    # 游标要和会话文件一起持久化，否则重启后模型会重新吃到全量历史
+    if sid == current_sid:
         save_current_session()
-    note = f"{'已自动压缩上下文' if auto else '已压缩上下文'}（{len(old)} 条旧消息 → 摘要）"
+    else:
+        save_session_snapshot(sid, hist)
+    note = (f"{'已自动压缩上下文' if auto else '已压缩上下文'}"
+            f"（{len(old)} 条旧消息 → 摘要，聊天记录完整保留）")
     await manager.broadcast({"type": "system", "text": note, "ts": time.time()})
     feed_push("system", text=note)
     return summary
@@ -1075,7 +1371,13 @@ async def api_session_switch(req: SwitchReq):
     current_sid = data.get("id", req.id)
     # 同样换对象：在跑的那一轮仍持有旧列表，不受切换影响
     history = data.get("history", [])
-    _ctx_used = _estimate_tokens(history)
+    comp = data.get("compact")
+    if isinstance(comp, dict) and (comp.get("summary") or comp.get("upto")):
+        _set_compact(current_sid, comp.get("summary") or "",
+                     min(int(comp.get("upto") or 0), len(history)))
+    else:
+        _compact_map.pop(current_sid, None)
+    _ctx_used = _estimate_tokens(_build_llm_msgs(history, SYSTEM_PROMPT, current_sid))
     _sess_epoch += 1
     _turn["active"] = False
     await manager.broadcast({"type": "history", "messages": history, "sid": current_sid})
@@ -1106,6 +1408,27 @@ async def api_session_delete(sid: str):
 @app.post("/api/session/new", dependencies=[Depends(check_token)])
 async def api_new_session():
     return await api_session_create()
+
+
+@app.post("/api/checkpoint", dependencies=[Depends(check_token)])
+async def api_checkpoint():
+    """客户端退出前先来这儿「打个招呼」：把还没落盘的东西全部刷下去。
+
+    以前客户端退出直接 SIGTERM，后端跑着的这一轮回答就整段消失。
+    现在客户端先调这里（拿到 ok 后再发 SIGTERM），正在生成中的正文至少保住到此刻。
+    """
+    flushed = False
+    try:
+        text = _stream_buf.get("text") or ""
+        if _turn.get("active") and text.strip():
+            persist_stream(text, force=True, parts=_stream_buf.get("parts") or [])
+            flushed = True
+    except Exception:
+        pass
+    # 只刷「还没落盘的流式正文」，不要拿内存 history 覆盖文件：
+    # 用户消息在 handle_chat 开头就落盘了，正文在收尾时落盘，内存里的东西不比文件新。
+    # 反过来覆盖一次就可能把文件里的历史冲掉（内存为空/偏旧时会直接清空会话）。
+    return {"ok": True, "flushed": flushed, "sid": current_sid, "turns": len(history)}
 
 
 def _lan_ip() -> str:
@@ -1184,19 +1507,121 @@ def _overlay_env() -> dict:
 
 
 def ensure_overlay() -> None:
-    """遮罩进程常驻，按需显示；崩溃后自动重启"""
+    """遮罩进程常驻，按需显示；崩溃后自动重启
+
+    用 --force 启动：先让可能残留的旧遮罩自己退位，再起新的一层。
+    否则后端重启留下的孤儿遮罩会越积越多，操作时叠出好几层。
+
+    起完之后要核对「这一层真的拿到套接字了」：overlay 的 force 接管
+    先 ping 旧实例、再等它死透，接口正常时这一步不该失败；但万一旧实例
+    卡在 X11 调用里没退，新进程会自己退出，此时 _overlay_proc 是个
+    已死的句柄，遮罩层等于没起。核对一遍并补拉一次，避免「点了停止
+    没反应」这种更难受的故障。
+    """
     global _overlay_proc
     if _overlay_proc is not None and _overlay_proc.poll() is None:
         return
-    log = open(BASE_DIR / "overlay.log", "ab")
+
+    def spawn() -> bool:
+        """拉起一层遮罩并确认它活着且有套接字"""
+        log = open(BASE_DIR / "overlay.log", "ab")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(BASE_DIR / "overlay.py"), "--force"],
+                cwd=str(BASE_DIR), env=_overlay_env(),
+                stdout=log, stderr=log, start_new_session=True,
+            )
+        except Exception:
+            return False
+        finally:
+            try:
+                log.close()
+            except Exception:
+                pass
+        # 接管要等旧实例退位，给足时间；退出码非 0 说明没抢到
+        for _ in range(40):          # 最多 6 秒
+            if proc.poll() is not None:
+                _ = proc.poll()      # 非 0 = 没接管成功
+                return proc.returncode == 0
+            time.sleep(0.15)
+        globals()["_overlay_proc"] = proc
+        return True
+
+    for _ in range(2):               # 失败一次再补一次
+        if spawn():
+            return
+
+
+
+def stop_overlay() -> None:
+    """服务退出时收掉自己拉起的遮罩，避免留下孤儿进程
+
+    两处兜底，都是踩过的坑：
+    1. 只 terminate 不 kill：遮罩若卡在 X11 调用里不响应 SIGTERM，
+       这个同步 wait 就会一直占着 AnyIO worker 线程，把整个后端的
+       shutdown 拖死——uvicorn 收不到中断，端口释放不掉，下次启动
+       要么被单实例守卫挡回，要么去抢 socket。所以超时后必须 kill。
+    2. 兜底按 pid 清理：进程句柄可能已经丢了（后端重启过），此时靠
+       _overlay_proc 一个都收不到，孤儿就留在桌面上继续画遮罩。
+    """
+    global _overlay_proc
+    proc, _overlay_proc = _overlay_proc, None
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+    # 句柄之外的残留（含拿不到套接字的聋子孤儿）统一清掉
+    for pid in _overlay_pids():
+        try:
+            if proc is not None and pid == proc.pid:
+                continue
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+    # 关键：僵尸子进程必须回收（waitpid）。
+    # overlay.py 被 --force 接管时会被别人 SIGKILL，它成了僵尸挂在 CMD_START 的
+    # 事件循环里没被 wait 过；若不 reap，主进程被 SIGTERM 后 uvicorn 的 shutdown
+    # 会一直卡在「Waiting for background tasks to complete」，端口不释放，
+    # 表现为一个既不服务也不退出的幽灵后端（还会被单实例守卫挡着不让重启）。
+    _reap_children()
+
+
+def _reap_children() -> None:
+    """回收所有已退出但还没 wait 的子进程（僵尸），一步到位的 waitpid(-1)。"""
+    for _ in range(64):
+        try:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        except Exception:
+            return
+        if pid == 0:
+            return
+
+
+def _overlay_pids() -> list[int]:
+    """找出本机所有 overlay.py 进程（含孤儿）"""
+    pids: list[int] = []
     try:
-        _overlay_proc = subprocess.Popen(
-            [sys.executable, str(BASE_DIR / "overlay.py")],
-            cwd=str(BASE_DIR), env=_overlay_env(),
-            stdout=log, stderr=log, start_new_session=True,
-        )
+        out = subprocess.run(
+            ["pgrep", "-f", str(BASE_DIR / "overlay.py")],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+        for line in out.split():
+            if line.strip().isdigit():
+                pid = int(line)
+                if pid != os.getpid():
+                    pids.append(pid)
     except Exception:
-        _overlay_proc = None
+        pass
+    return pids
+
 
 
 def set_overlay(show: bool, text: str = "") -> None:
@@ -1205,8 +1630,43 @@ def set_overlay(show: bool, text: str = "") -> None:
         _overlay_state["text"] = text
     if not show:
         _overlay_state["passthrough"] = False
-    if show:
+        _overlay_state["since"] = 0.0
+    else:
+        # 记下「从什么时候开始要它亮」。看门狗据此判断是不是有哪条异常路径
+        # 漏了 set_overlay(False)，把遮罩永远留在屏幕上。
+        if not _overlay_state.get("since"):
+            _overlay_state["since"] = time.time()
         ensure_overlay()
+
+
+# 遮罩最多连亮这么久；超过就认为状态没被复位（异常/取消路径逃逸），强制收掉。
+# 真正需要遮罩的动作（点鼠标、打字、切窗口）都是秒级，30 秒足够宽松。
+_OVERLAY_MAX_HOLD = 30.0
+
+
+def _overlay_watchdog() -> None:
+    """兜底线程：遮罩亮着但没有动作在跑时，别让它一直挡住屏幕。
+
+    踩过的现象：跑普通命令（ls、ps、tail 这类纯后台动作）时遮罩仍然亮着。
+    触发判断本身是对的（tools.needs_overlay 实测这些都返回 False），问题在
+    上一轮操作留下的 show=True 没被复位：取消、异常、工具执行到一半被终止，
+    任一环节漏掉 set_overlay(False)，遮罩就会一直盖在那儿，看起来就像
+    「执行普通命令也会亮」。
+    """
+    while True:
+        time.sleep(1.0)
+        try:
+            if not _overlay_state.get("show"):
+                continue
+            since = _overlay_state.get("since") or 0.0
+            if since and (time.time() - since) > _OVERLAY_MAX_HOLD:
+                print("[DeckMeido] 遮罩超时未复位，已强制收起", file=sys.stderr)
+                set_overlay(False)
+        except Exception:
+            pass
+
+
+threading.Thread(target=_overlay_watchdog, name="overlay-watchdog", daemon=True).start()
 
 
 async def set_overlay_passthrough(on: bool) -> None:
@@ -1308,6 +1768,25 @@ async def _boot_overlay():
     ensure_overlay()
 
 
+@app.on_event("shutdown")
+async def _shutdown_overlay():
+    # 服务被重启/停止时把自己拉起的遮罩一起收掉，别留孤儿
+    stop_overlay()
+    # 退出前抢救一次：正在生成的正文与内存历史立刻落盘。
+    # 客户端退出、systemctl restart、升级重启都走这条路径，
+    # 少了这一步，被打断的那一轮回答就会整段消失（用户视角就是「记录丢了」）
+    try:
+        text = _stream_buf.get("text") or ""
+        if _turn.get("active") and text.strip():
+            persist_stream(text, force=True, parts=_stream_buf.get("parts") or [])
+            print(f"[DeckMeido] 退出前已保存未完成的回答（{len(text)} 字）", file=sys.stderr)
+        # 这里刻意不写内存 history：正文在 handle_chat 收尾时已落盘，用户消息开头就落盘了，
+        # 内存不比文件新。而「拿内存覆盖文件」在内存为空/偏旧时会直接把历史冲掉——
+        # 那才是真正的「聊天记录丢了」。只补流式残留，别碰已落盘的历史。
+    except Exception as e:
+        print(f"[DeckMeido] 退出前落盘失败：{e}", file=sys.stderr)
+
+
 _REFUSAL_MARKS = ["我不会", "我不能", "无法执行", "无法直接执行", "恕我不能", "不执行", "拒绝执行",
                   "我不会执行", "我没办法", "不允许", "不建议执行"]
 
@@ -1346,22 +1825,48 @@ async def run_agent(events: list[dict], extra_system: str = "",
     """LLM + 工具调用循环（流式），思考链/工具调用/终端输出写入 events 供 UI 展示"""
     global pending_action, _ctx_used
     hist = history if hist is None else hist
+    # 本轮归属（中途切会话也不改这份 sid）
+    turn_sid = _turn.get("sid") or current_sid
     sys_prompt = SYSTEM_PROMPT + (f"\n{extra_system}" if extra_system else "")
-    msgs = [{"role": "system", "content": sys_prompt}]
-    for m in hist:
-        content = m.get("llm") or m.get("content", "")
-        if m["role"] == "user":
-            content = _to_vision_content(content) if isinstance(content, str) else content
-        # 历史里还存了 ts / events 供界面回放，发给模型时只保留 role 和 content
-        msgs.append({"role": m["role"], "content": content})
+    # 只把「摘要 + 游标之后的原文」发给模型；界面历史一条不删
+    msgs = _build_llm_msgs(hist, sys_prompt, turn_sid)
+    hist_msgs = len(msgs)
     streaming = False  # 是否已开始向用户流式输出正文
+    # 本轮正文累积：流式回调里按节流频率落盘，进程被杀最多丢一小段
+    stream_text: list[str] = []
+
+    def _stamp_parts(tail: str = "") -> list[dict]:
+        """当前「屏幕上出现过的内容」快照，按原顺序
+
+        events 本身就是有序流（思维链 / 工具块，以及工具调用前已经显示过的
+        过渡正文段——那些以 {"type":"text"} 的形式插在 events 里）。
+        尾部再补上当刻正在生成的那段正文，就是完整的屏幕内容。
+        """
+        parts: list[dict] = []
+        for ev in events:
+            if ev.get("type") == "text":
+                parts.append({"type": "text", "content": ev.get("text") or ""})
+            else:
+                parts.append({"type": "event", "event": ev})
+        if tail:
+            parts.append({"type": "text", "content": tail})
+        return parts
 
     async def on_delta(text: str):
         nonlocal streaming
+        stream_text.append(text)
         if not streaming:
             streaming = True
             await manager.broadcast({"type": "stream_start", "ts": time.time(), **_turn_tag()})
-        await manager.broadcast({"type": "delta", "text": text, **_turn_tag()})
+        # 增量落盘（此函数是 async 的，前端不会感知到这点磁盘开销）
+        try:
+            persist_stream("".join(stream_text),
+                           parts=_stamp_parts("".join(stream_text)))
+        except Exception:
+            pass
+        # final=False：这段正文可能只是工具调用前的过渡话，前端不写进 crash 缓冲；
+        # 本轮结束时会有一次带 final=True 的完整正文推送（内容相同）
+        await manager.broadcast({"type": "delta", "text": text, "final": False, **_turn_tag()})
 
     thought_open = False
 
@@ -1389,12 +1894,21 @@ async def run_agent(events: list[dict], extra_system: str = "",
         round_no = 0
         while MAX_TOOL_ROUNDS <= 0 or round_no < MAX_TOOL_ROUNDS:
             round_no += 1
-            # 单轮里工具往返也会堆积上下文，超过阈值就先压缩再继续
+            # 单轮里工具往返也会堆积上下文，超过阈值就先压缩再继续。
+            # 压缩只推进游标、不删 history，所以这里重建 msgs 时要保留
+            # 本轮新加的工具往返消息（hist_msgs 之后的部分），否则工具链断掉。
             if len(msgs) > 6 and _estimate_tokens(msgs) / context_window() >= COMPACT_RATIO:
-                await compact_history(auto=True, hist=hist)
-                msgs[:] = [{"role": "system", "content": sys_prompt}] + [
-                    {"role": m["role"], "content": m.get("content", "")} for m in hist]
+                await compact_history(auto=True, hist=hist, sid=turn_sid)
+                rebuilt = _build_llm_msgs(hist, sys_prompt, turn_sid)
+                extra = [m for m in msgs[hist_msgs:]
+                         if m.get("role") in ("tool", "assistant")]
+                msgs[:] = rebuilt + extra
+                hist_msgs = len(rebuilt)
                 streaming = False
+                # 压缩前已经显示的过渡正文：作为 text 事件留在 events 里继续保存
+                if "".join(stream_text).strip():
+                    events.append({"type": "text", "text": "".join(stream_text)})
+                stream_text.clear()
 
             msg = await llm.chat_with_tools_stream(msgs, tools.TOOLS, on_delta=on_delta,
                                                    on_thought=on_thought,
@@ -1450,8 +1964,13 @@ async def run_agent(events: list[dict], extra_system: str = "",
                     return (body + note) if body else note.strip()
                 return msg.get("content") or "（没有回复内容）"
 
-            # 有工具调用：本轮流式输出的内容是中间话，作废（最终答复会重新流式）
+            # 有工具调用：本轮流式输出的内容是中间话，最终答复会重新流式。
+            # 但用户屏幕上已经看到了，必须以 text 事件留在 events 里，
+            # 否则中途进程被杀，快照里只剩最后一段 → 「只看到一点点内容」
+            if "".join(stream_text).strip():
+                events.append({"type": "text", "text": "".join(stream_text)})
             streaming = False
+            stream_text.clear()
             msgs.append(msg)
             for call in tool_calls:
                 name = call["function"]["name"]
@@ -1487,12 +2006,19 @@ async def run_agent(events: list[dict], extra_system: str = "",
                     event["path"] = str(args.get("path", ""))
                 activity = f"正在{label}：{summary}" if summary else f"正在{label}"
                 await manager.broadcast({"type": "tool_activity", "text": activity, "ts": time.time(), **_turn_tag()})
-                # 只有真正动设备（点鼠标、打字、截屏、跑命令）才压遮罩，
-                # 联网搜索这类后台工具不该挡住用户的屏幕
-                if name in tools.DEVICE_TOOLS:
+                # 只有真正动光标、敲键盘（点鼠标、打字、切窗口、注入按键的 shell 命令）
+                # 才压遮罩；跑普通命令、联网搜索这类后台任务不该挡住用户的屏幕
+                raised = tools.needs_overlay(name, args)
+                if raised:
                     set_overlay(True, activity)
 
-                result = await tools.execute(name, args)
+                try:
+                    result = await tools.execute(name, args)
+                finally:
+                    # 动作结束立刻收遮罩：遮罩只该盖住「正在操作设备」那几秒，
+                    # 不该连模型写回答的时间一起盖着
+                    if raised:
+                        set_overlay(False)
                 # 终端输出截断后随事件展示（网页端显示为终端块）
                 event["output"] = result[:1500] + ("\n…（截断）" if len(result) > 1500 else "")
                 if name in ("write_file", "edit_file") and tools.LAST_DIFF:

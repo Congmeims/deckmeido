@@ -1268,6 +1268,48 @@
   var streamEl = null;     // 流式输出气泡
   var streamBody = null;
 
+  // 本轮「屏幕上已经出现过的内容」本地缓存。
+  // 后端进程被杀时，服务端只能保住最后一次落盘的内容，而浏览器这边是完整的
+  // （过渡正文 + 工具过程 + 正在生成的那段都还在页面上）。刷新连回来后如果
+  // 服务端历史缺了尾巴，就用这份补上，做到「屏幕上出现过的内容一定留得住」。
+  var turnCache = { sid: null, segs: [], cur: '' };
+  var turnCacheTimer = null;
+
+  function turnCacheText() {
+    var all = turnCache.segs.slice();
+    if (turnCache.cur) all.push(turnCache.cur);
+    return all.filter(function (s) { return String(s || '').trim(); }).join('\n\n');
+  }
+
+  function turnCacheFlush() {
+    turnCacheTimer = null;
+    try {
+      var t = turnCacheText();
+      if (!t || !turnCache.sid) return;
+      localStorage.setItem('deckmeido_turn_cache', JSON.stringify({
+        sid: turnCache.sid, text: t, ts: Date.now() / 1000
+      }));
+    } catch (e) { /* 配额满/隐私模式：忽略，别影响界面 */ }
+  }
+
+  function turnCacheSchedule() {
+    if (turnCacheTimer) return;
+    turnCacheTimer = setTimeout(turnCacheFlush, 600);
+  }
+
+  function turnCacheReset() {
+    turnCache = { sid: currentSid, segs: [], cur: '' };
+    try { localStorage.removeItem('deckmeido_turn_cache'); } catch (e) {}
+  }
+
+  // 一段正文说完了（后面跟工具调用或已给出最终答复）：翻篇存起来
+  function turnCacheNextSeg() {
+    if (turnCache.cur && turnCache.cur.trim()) {
+      turnCache.segs.push(turnCache.cur);
+    }
+    turnCache.cur = '';
+  }
+
   function connect() {
     if (!token) { showAuth(''); return; }
     // 防重入：已有连接正在建/已建立时不要再开一条，
@@ -1312,6 +1354,42 @@
             addMsg(m.role === 'user' ? 'user' : 'assistant', m.content, m.ts,
                    m.role === 'assistant' ? m.events : null);
           });
+          // 崩溃补丁：后端被杀时最后一条正文可能只发到浏览器、没来得及写盘。
+          // 本地缓存里若有一条服务端历史里没有的回复，补在末尾，避免「我的回复凭空消失」
+          try {
+            var cached = JSON.parse(localStorage.getItem('deckmeido_last_reply') || 'null');
+            if (cached && cached.sid && cached.sid === currentSid && cached.text) {
+              var lastAsst = null;
+              (msg.messages || []).slice().reverse().some(function (m) {
+                if (m.role === 'assistant') { lastAsst = m.content; return true; }
+                return false;
+              });
+              var norm = function (s) { return String(s || '').replace(/\s+/g, ''); };
+              if (!lastAsst || norm(lastAsst) !== norm(cached.text)) {
+                addMsg('assistant', cached.text, cached.ts);
+                addMsg('system', '（这条回复在后端退出前发出，本地缓存补回）');
+              }
+              localStorage.removeItem('deckmeido_last_reply');
+            }
+          } catch (e) { /* 缓存损坏：忽略 */ }
+          // 更强的崩溃补丁：本轮屏幕上出现过的全部内容（含过渡正文与工具过程）。
+          // 只在「服务端最后一条是用户消息」时启用——那说明这一轮的答复一个字都没写盘
+          // （进程在第一次节流落盘前就被杀）。此时浏览器手里是唯一的一份完整内容。
+          // 服务端只是残缺而非全无的情况由后端 _streaming.parts 负责，不在这里补，
+          // 否则会和已经恢复出来的内容重复一遍
+          try {
+            var tc = JSON.parse(localStorage.getItem('deckmeido_turn_cache') || 'null');
+            if (tc && tc.sid && tc.sid === currentSid && tc.text) {
+              var ms = msg.messages || [];
+              var lastIsUser = ms.length && ms[ms.length - 1].role === 'user';
+              if (lastIsUser) {
+                addMsg('assistant', tc.text + '\n\n（以上回答在原进程退出前已显示在屏幕上，已由本机缓存补回）', tc.ts);
+                addMsg('system', '（这段内容来自本机缓存，屏幕上出现过的内容已全部保留）');
+              }
+              localStorage.removeItem('deckmeido_turn_cache');
+              turnCache = { sid: currentSid, segs: [], cur: '' };
+            }
+          } catch (e) { /* 缓存损坏：忽略 */ }
           // 重连后重建现场：残留的流式气泡/事件容器都指向已经不存在的这一轮
           streamEl = null; streamBody = null;
           liveBox = null; liveToolCount = 0; liveThoughtShown = 0; liveThought = null;
@@ -1325,6 +1403,8 @@
           hideTyping();
           cancelGuardUntil = 0;   // 新的一轮真的开始了，取消静默窗口失效
           setBusy(true);          // 别的端发起的任务，这边也要能一键叫停
+          turnCacheReset();       // 新一轮开始，本地屏幕缓存清零
+          if (msg.sid) turnCache.sid = msg.sid;
           addMsg('user', msg.text, msg.ts);
           liveBox = document.createElement('div');
           liveBox.className = 'events';
@@ -1336,6 +1416,8 @@
           break;
         case 'stream_start':
           hideTyping();
+          // 上一段正文已经说完（工具调用后会另起一段），翻篇进缓存
+          turnCacheNextSeg();
           streamEl = document.createElement('div');
           streamEl.className = 'msg assistant';
           streamBody = document.createElement('div');
@@ -1346,8 +1428,22 @@
           scrollBottomSafe();
           break;
         case 'delta':
+          if (msg.final) {
+            // 本轮最终正文：服务端已正式落盘，这里存一份到本地崩溃缓冲。
+            // 后端若在「已发送正文、尚未写盘」的瞬间被杀，刷新后本地这份还能补回来
+            if (msg.reply && msg.sid && msg.sid === currentSid) {
+              try {
+                localStorage.setItem('deckmeido_last_reply', JSON.stringify({
+                  sid: msg.sid, text: msg.reply, ts: Date.now() / 1000
+                }));
+              } catch (e) { /* 隐私模式/配额满：忽略，别影响界面 */ }
+            }
+            break;
+          }
           if (streamBody) {
             streamBody.textContent += msg.text;
+            turnCache.cur += msg.text;      // 屏幕上出现的每个字都记进本地缓存
+            turnCacheSchedule();
             scrollBottomSafe();
           }
           break;
@@ -1394,6 +1490,17 @@
             streamEl.parentNode.removeChild(streamEl);
           }
           streamEl = null; streamBody = null;
+          // 最终正文就是本轮屏幕上出现过的内容：整段订正后立刻落一份到本地，
+          // 作为「后端已落盘但页面还没来得及刷新」这一瞬间的兜底
+          if (msg.sid) turnCache.sid = msg.sid;
+          if (msg.text) turnCache.cur = msg.text;
+          if (turnCacheTimer) { clearTimeout(turnCacheTimer); turnCacheTimer = null; }
+          turnCacheFlush();
+          // 这一轮正常收尾：服务端确实把这轮的正文写进历史了，本地缓存随即作废。
+          // 留着不删会在下次刷新时被误判成「服务端缺了尾巴」，重复补一条
+          if (!msg.cancelled) {
+            turnCacheReset();
+          }
           if (msg.events && msg.events.length) {
             if (liveBox) {
               // 补渲染未实时显示的事件，跳过已显示的工具块与思维链
