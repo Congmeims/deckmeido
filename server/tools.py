@@ -280,8 +280,12 @@ _KDOTOOL_INPUT_SUBS = {
     "mousemove", "mousemove_relative", "move",
     "click", "mousedown", "mouseup", "scroll", "wheel", "text",
 }
-# 会让光标按下去的子命令：这些必须打开遮罩穿透，否则点会落在遮罩上变成「用户终止」
-_POINTER_CLICK_SUBS = {"click", "mousedown", "mouseup"}
+# 会让光标按下去的子命令：这些必须打开遮罩穿透，否则点会落在遮罩上变成「用户终止」。
+# mousemove/move 刻意不在里面：只挪光标不会产生按下事件，遮罩放着不动也点不到它，
+# 反而能给用户留一个「随时点一下终止」的入口。以前把 move 也算进来，于是
+# 「移动光标 → 点某个按钮」这类操作在移动阶段就让位，遮罩整个变成不接点击，
+# 用户以为点了没反应。
+_POINTER_CLICK_SUBS = {"click", "mousedown", "mouseup", "drag", "scroll", "wheel"}
 
 # 输入注入工具的调用点。只取到本段命令结束（;&| 或换行），
 # 避免把后续无关命令里的同名单词也当成子命令
@@ -585,7 +589,41 @@ async def _kill_tree(proc: asyncio.subprocess.Process, grace: float = 2.0) -> No
         pass
 
 
-async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin: str = "") -> str:
+async def _spawn_detached(command: str, env: dict) -> str:
+    """把命令整个甩到后台跑，立刻返回；用于「要挂遮罩」的启动类命令
+
+    用 setsid 脱离当前会话：后端退出时不会把用户刚打开的程序一起带走。
+    启动后等 1.5s 看它是否立刻失败（命令写错、flatpak 名字不对之类），
+    失败时把输出原样交回去，不让用户以为「打开了」。
+    """
+    out_path = Path(tempfile.mkstemp(prefix="deckmeido_launch_", suffix=".log")[1])
+    wrapped = (
+        f"setsid bash -c {shlex.quote(command)} > {shlex.quote(str(out_path))} 2>&1 &"
+        " echo $!"
+    )
+    proc = await asyncio.create_subprocess_shell(
+        wrapped, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        cwd=str(Path.home()), env=env, executable="/bin/bash",
+        start_new_session=True,
+    )
+    out, _ = await proc.communicate()
+    pid = (out or b"").decode("utf-8", "replace").strip()
+    await asyncio.sleep(1.5)
+    text = ""
+    try:
+        text = out_path.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
+        pass
+    if pid and not Path(f"/proc/{pid}").exists():
+        # 进程已经没了：把它的输出当成失败原因交回去
+        return (f"启动后立即退出（pid {pid}）。\n{text}" if text
+                else f"启动后立即退出（pid {pid}），没有任何输出。")
+    msg = f"已在后台启动（pid {pid or '?'}），日志：{out_path}"
+    return f"{msg}\n{text}" if text else msg
+
+
+async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin: str = "",
+                       detach: bool = False) -> str:
     timeout = max(1, min(int(timeout or 60), 300))
     env = dict(os.environ)
     _fix_display_env(env)
@@ -604,6 +642,11 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
         tmp.close()
         group_file = Path(tmp.name)
         command = f"echo $$ > {shlex.quote(str(group_file))}; {command}"
+    if detach:
+        # 这次调用要挂遮罩让用户能随时点停，后端就不能堵在这里等程序退出
+        # （QQ 这种会一直开着）。改成 setsid 放后台，输出重定向到文件，
+        # 立刻把控制权还给 agent，遮罩只亮这一小会儿。
+        return await _spawn_detached(command, env)
     proc = await asyncio.create_subprocess_shell(
         command,
         stdin=asyncio.subprocess.PIPE if feed else None,
@@ -1248,6 +1291,7 @@ async def execute(name: str, args: dict) -> str:
     fn = EXECUTORS.get(name)
     if not fn:
         return f"未知工具：{name}"
+    args = dict(args)
     # 执行期间别让屏幕黑掉/机器睡着：run_command 可能跑几分钟，
     # 用户回来看到的应该是进度，而不是一个锁屏界面。
     # 桌面模式判断和非空原因计数都在 power 里，游戏模式/纯查询工具会自动跳过。
@@ -1255,6 +1299,11 @@ async def execute(name: str, args: dict) -> str:
     if keep:
         power.keeper.hold("command", f"正在{cn_name(name)}")
     try:
+        # 启动类命令（打开应用）会挂遮罩让用户能随时点停，就不能堵在这里等它退出：
+        # 打开 QQ 之后后台会一直卡在 communicate()，遮罩一直亮着空转
+        if name == "run_command" and _is_launcher(str(args.get("command", ""))) \
+                and not args.get("stdin"):
+            args["detach"] = True
         return await fn(**args)
     except Exception as e:
         return f"工具 {name} 执行失败：{e}"

@@ -117,6 +117,7 @@ class Mask(QWidget):
         self._shown_at = 0.0
         self._cancelled = False
         self._passthrough = False
+        self._input_transparent = False
         self._lifted = False
         self._show_wanted = False
 
@@ -216,13 +217,41 @@ class Mask(QWidget):
         if on == self._passthrough:
             return
         self._passthrough = on
-        # 穿透期间只让鼠标事件透过，窗口本身不能藏掉：遮罩要一直显示「正在操作」，
-        # 用户也还能看到进度。用属性而不是 hide()，重绘时保留半透明底
+        # 穿透期间让整个窗口不接输入（WindowTransparentForInput）：不只是「自己忽略
+        # 事件」，而是让系统把这层从命中测试里摘掉，点击直接落到下面的窗口。
+        # 以前只用 WA_TransparentForMouseEvents，遮罩窗口本身仍参与命中测试，
+        # agent 那一下点击的坐标只要落在遮罩上，就会被当成「用户终止」。
+        # 注意窗口不能藏：画面仍要显示「正在操作」，用户也还能看到进度
         self.setAttribute(Qt.WA_TransparentForMouseEvents, on)
+        self._apply_input_transparency(on)
         if not on and self._show_wanted and not self._lifted and not self.isVisible():
             self._show_mask()
-            self._shown_at = time.monotonic()
         self.repaint()
+
+    def _apply_input_transparency(self, on: bool):
+        """按需切换「整个窗口不接输入」的原生标志
+
+        只在遮罩已显示时动标志：X11 下改窗口标志会重建原生窗口，
+        没显示时改了没意义，等 _show_mask 显示出来再套用。
+        """
+        want = on and self.isVisible()
+        if want == self._input_transparent:
+            return
+        self._input_transparent = want
+        flags = self.windowFlags()
+        if want:
+            flags |= Qt.WindowTransparentForInput
+        else:
+            flags &= ~Qt.WindowTransparentForInput
+        self.setWindowFlags(flags)
+        # setWindowFlags 会把窗口藏起来，必须立刻重新显示并复位几何，否则遮罩会消失
+        if self.isVisible():
+            scr = self.screen() or QApplication.primaryScreen()
+            if scr:
+                self.setGeometry(scr.geometry())
+            self.show()
+            self.raise_()
+
 
     def _set_lifted(self, on: bool):
         """截图期间把遮罩藏起来，拍完立刻恢复，不影响「点一下终止」"""
@@ -299,6 +328,9 @@ class Mask(QWidget):
         scr = self.screen() or QApplication.primaryScreen()
         if scr:
             self.setGeometry(scr.geometry())
+        # 显示之后才真正套用「不接输入」：窗口标志要在原生窗口存在时才生效
+        if self._passthrough:
+            self._apply_input_transparency(True)
         self.show()
         self.raise_()
 
