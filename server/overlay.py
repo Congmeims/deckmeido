@@ -75,7 +75,18 @@ class SwayLogo(QWidget):
 
     def set_pixmap(self, pm: QPixmap):
         self._pm = pm
+        # 画布只留旋转/浮动需要的余量：旋转会往外探出，按对角线算；
+        # 但只在图形那一侧留，不要留成一个大正方形（否则会把间距撑得很大）
+        if pm.isNull():
+            self.setFixedSize(LOGO_BOX, LOGO_BOX)
+        else:
+            self.setFixedSize(
+                int(pm.width() * math.sqrt(2)) + 8,
+                int(pm.height() + 2 * SWAY_RISE) + 8)
         self.update()
+
+    def box_height(self) -> int:
+        return self.height() if not self._pm.isNull() else 0
 
     def pixmap(self) -> QPixmap:
         return self._pm
@@ -164,10 +175,7 @@ class Mask(QWidget):
         # logo 独立于卡片，浮在卡片正上方（进卡片会撑高卡片、挤乱排版）
         # 用自绘的 SwayLogo 而不是 QLabel：思考时要让它绕中心摆动
         self.logo = SwayLogo(self)
-        self._logo_inset_top = 0
-        self._logo_inset_bottom = 0
         self.logo.set_pixmap(self._load_logo())
-        self.logo.setFixedSize(LOGO_BOX, LOGO_BOX)
         self._sway_t = 0.0
 
         lay.addWidget(self.title)
@@ -254,9 +262,11 @@ class Mask(QWidget):
             return pm
         pm = pm.scaled(
             LOGO_PX, LOGO_PX, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        top, bottom = self._visual_insets(pm)
-        if bottom > top:
-            pm = pm.copy(0, top, pm.width(), bottom - top + 1)
+        # 注意 _visual_insets 返回的是「上留白、下留白」，不是边界坐标
+        inset_top, inset_bottom = self._visual_insets(pm)
+        vis_h = pm.height() - inset_top - inset_bottom
+        if vis_h > 0 and (inset_top or inset_bottom):
+            pm = pm.copy(0, inset_top, pm.width(), vis_h)
         return pm
 
     @staticmethod
@@ -389,17 +399,17 @@ class Mask(QWidget):
         # 可见图形高度 = 裁掉留白后的 pixmap 高度（SwayLogo 里按原尺寸居中绘制）
         pm = self.logo.pixmap()
         vis_h = pm.height() if has_logo else 0
+        # 画布高度可选：按图形高度 + 旋转/浮动余量，避免留一大块透明底把
+        # 眼睛看到的间距撑大
+        box_h = self.logo.box_height()
         gap = LOGO_GAP if has_logo else 0
-        total = (vis_h + gap if has_logo else 0) + h
+        total = (box_h + gap if has_logo else 0) + h
         top = (self.height() - total) // 2 + LOGO_DY
 
         if has_logo:
             self.logo.show()
-            # 画布比图形大（旋转余量），让图形的可见顶端正好落在 top：
-            # 画布里的图形是水平/垂直居中的，所以用 (画布高 - 图形高)/2 反推
-            self.logo.move((self.width() - LOGO_BOX) // 2,
-                           top - (LOGO_BOX - vis_h) // 2)
-            top += vis_h + gap
+            self.logo.move((self.width() - self.logo.width()) // 2, top)
+            top += box_h + gap
         else:
             self.logo.hide()
 
