@@ -487,14 +487,31 @@ _LAUNCHER_RE = re.compile(
     r"firefox|mpv|vlc|gedit|kate|dolphin|konsole|steam-rom-manager|retroarch|"
     r"xdg-open|gio|kdesu|prime-run|gamemoderun"
     r")\b")
-# 出现这些说明用户/agent 需要命令的真实结果，不能提前返回
-_LAUNCHER_HOLD_RE = re.compile(r"[|;&><]|`|\$\(")
+# 前面允许挂 cd / 环境变量赋值这类不改变「这是在启动程序」实质的前缀：
+# 「cd ~/x && flatpak run ...」是最常见的写法，以前因为含 && 被判成普通命令，
+# 于是傻等 60 秒超时，还把用户要的程序一起杀掉
+_LAUNCHER_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:export\s+\w+=[^\s;]*|cd\s+[^;&|]+|[A-Za-z_]\w*=[^\s;]*)\s*(?:&&|;)\s*)*")
+# env/setsid/nohup 这类包装器不改变实质，一并剥掉（含内联的 FOO=1 env 形式）
+_LAUNCHER_WRAP_RE = re.compile(r"^(?:(?:env|setsid|nohup|[A-Za-z_]\w*=\S*)\s+)+")
+# 出现这些说明命令里还串着别的步骤，需要真实结果，不能提前返回。
+# 前缀（cd/赋值 + &&）已经在 _is_launcher 里剥掉了，这里剩下的分隔符
+# 都是「同一条命令里还塞了别的事」
+_LAUNCHER_HOLD_RE = re.compile(r"[|;<>`]|\$\(|&&")
 
 
 def _is_launcher(cmd: str) -> bool:
-    if _LAUNCHER_HOLD_RE.search(cmd.replace("2>&1", "")):
+    # 先剥掉 cd / 赋值这类前缀，再看剩下的命令是不是单纯启动一个程序
+    body = _LAUNCHER_PREFIX_RE.sub("", cmd, count=1)
+    # 末尾的 & 只是「放后台」，不影响判据
+    body = body.rstrip().rstrip("&").rstrip()
+    # 输出重定向不改变「这是在启动程序」的事实，先摘掉（含 2>&1 这种 fd 复制）；
+    # 用 <（读输入）或管道/分号串了新命令的则保留，交给下面的判断
+    body = re.sub(r"\d*>>?\s*(?:&\s*\d+|[^\s;&|]+)", "", body).strip()
+    body = _LAUNCHER_WRAP_RE.sub("", body, count=1)
+    if _LAUNCHER_HOLD_RE.search(body):
         return False
-    return bool(_LAUNCHER_RE.match(cmd))
+    return bool(_LAUNCHER_RE.match(body))
 
 
 async def _set_overlay_passthrough(on: bool):
@@ -528,6 +545,8 @@ def _fix_display_env(env: dict):
 # 但只要有一处 await 被卡住，那一条取消链就断了；这里留一份登记表，
 # 让「终止」还能沿着它把进程树直接砍掉（不依赖任务本身是否响应取消）
 _LIVE_PROCS: set[asyncio.subprocess.Process] = set()
+# 命令超时转后台后，负责把它的输出抄进日志的任务；留着引用防止被 GC 回收
+_BG_DRAINERS: set[asyncio.Task] = set()
 
 
 async def abort_all_procs(grace: float = 2.0) -> int:
@@ -654,7 +673,9 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
     )
     _LIVE_PROCS.add(proc)
     launcher = group_file is not None
-    launch_wait = 3.0
+    # 启动类命令只等这么久：正常程序 1~2 秒内就出窗口或报错，
+    # 等太久只会让用户盯着遮罩干等（以前是 3 秒，加上每条命令都要挂遮罩，体感很长）
+    launch_wait = 2.0
     # 真·超时（命令卡死）要杀掉；启动器等满 launch_wait 只是「它在常驻运行」，不能杀
     try:
         if launcher:
@@ -669,6 +690,44 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
             launcher_done = True
             out, _ = await asyncio.wait_for(proc.communicate(feed), timeout)
     except asyncio.TimeoutError:
+        # 超时不等于命令出错。很常见的情况是：这条命令其实在启动一个常驻程序，
+        # 只是写法没被 _is_launcher 认出来（比如前面带了 cd、后面接了 & 或重定向），
+        # 于是傻等到超时。这时候进程活得好好的、也没有报错输出，杀掉它等于把
+        # 用户要的程序一起带走（日志里「flatpak run 被卡了 60 秒后终止」就是这样）。
+        # 判据：进程仍然活着。真卡死的命令通常早就退出了（非零退出码），
+        # 还活着且撑满整个超时的，基本都是常驻程序。
+        alive = proc.returncode is None
+        if alive:
+            # 转后台继续跑。注意进程的 stdout 还挂在我们创建的管道上：
+            # 一旦没人读，输出写满管道缓冲区（64KB）程序就会卡住，
+            # 所以开个线程把它持续抄进日志文件，而不是把管道丢在那里不管。
+            log_path = Path(tempfile.mkstemp(prefix="deckmeido_bg_", suffix=".log")[1])
+            fd = os.open(str(log_path), os.O_WRONLY | os.O_APPEND)
+
+            async def _drain():
+                try:
+                    while True:
+                        chunk = await proc.stdout.read(8192)
+                        if not chunk:
+                            break
+                        os.write(fd, chunk)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        os.close(fd)
+                    except Exception:
+                        pass
+
+            task = asyncio.create_task(_drain())
+            # 保住引用：asyncio 只持弱引用，不存一份会被 GC 连带取消
+            _BG_DRAINERS.add(task)
+            task.add_done_callback(_BG_DRAINERS.discard)
+            _LIVE_PROCS.discard(proc)
+            return (f"命令运行超过 {timeout}s 仍未退出，判断是常驻程序，已转入后台继续运行"
+                    f"（进程号 {proc.pid}）。\n"
+                    f"如需确认它是否正常，用 pgrep / 看窗口 检查，不要重复启动。\n"
+                    f"日志：{log_path}")
         await _kill_tree(proc)
         return (f"命令超时（{timeout}s），已强制终止。\n"
                 "提示：若命令需要多次交互输入，请在 stdin 里按行准备好全部答案；"
