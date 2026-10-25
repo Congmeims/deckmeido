@@ -44,11 +44,15 @@
     background: var(--surface);
     border-bottom: 1px solid var(--line);
   }
-  .logo { font-weight: 600; font-size: 17px; flex: 0 0 auto; }
+  .logo { font-weight: 600; font-size: 17px; flex: 0 1 auto; min-width: 0;
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 230px; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--danger); flex: 0 0 auto; }
   .dot.on { background: #2ecc71; }
   .status-text {
+    /* 与右侧「桌面模式」等徽章同一套圆角底色，视觉上对齐 */
     color: var(--muted); font-size: 12px;
+    background: var(--surface-2);
+    padding: 4px 10px; border-radius: 999px;
     flex: 0 1 auto; min-width: 0;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
@@ -137,8 +141,34 @@
     padding: 2px 8px;
   }
   .msg .time { display: block; margin-top: 4px; font-size: 11px; opacity: .55; }
-  /* 回复气泡底部：操作按钮在左，时间在右 */
-  .msg-foot { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+  /* 气泡底部：操作按钮在左，时间在右。
+     默认隐藏，鼠标移到这条消息上才出现——一排「重试 分享 删除 时间」
+     常驻显示太抢眼，压过了对话本身。
+     注意：必须用绝对定位脱离文档流。它一旦参与布局，即使高度为 0、
+     透明度为 0，那排按钮的宽度仍会被算进气泡的收缩宽度，
+     导致「继续」这种两个字的短句也被撑到近 200px 宽。 */
+  .msg-foot {
+    position: absolute;
+    left: 0; right: auto;
+    top: 100%; margin-top: 1px;
+    display: flex; align-items: center; gap: 10px;
+    white-space: nowrap;
+    opacity: 0; visibility: hidden; pointer-events: none;
+    transition: opacity .16s ease, visibility .16s ease;
+    z-index: 6;
+  }
+  /* 用户气泡贴着右边缘，操作行从右往左展开，避免短句时溢出到面板外 */
+  .msg.user .msg-foot { left: auto; right: 0; }
+  .msg:hover .msg-foot, .msg-foot:focus-within {
+    opacity: 1; visibility: visible; pointer-events: auto;
+  }
+  /* 操作行浮在气泡下方，悬停时给这条消息让出一行高度，免得盖住下一条 */
+  .msg:hover { margin-bottom: 20px; }
+  /* 触屏（SteamOS 游戏模式没有 hover）拿不到鼠标悬停，就常显，否则按钮等于不存在 */
+  @media (hover: none) {
+    .msg-foot { opacity: 1; visibility: visible; pointer-events: auto; }
+    .msg { margin-bottom: 20px; }
+  }
   .msg-foot .time { margin-top: 0; }
   .msg-acts { display: flex; gap: 2px; }
   .msg-act {
@@ -146,6 +176,10 @@
     font-size: 12px; padding: 2px 6px; border-radius: 6px; cursor: pointer;
   }
   .msg-act:hover { background: var(--hover); color: var(--text); }
+  /* 用户气泡是蓝底，灰色按钮在上面几乎看不见，换成半透明白 */
+  .msg.user .msg-act { color: rgba(255, 255, 255, .78); }
+  .msg.user .msg-act:hover { background: rgba(255, 255, 255, .2); color: #fff; }
+  .msg.user .msg-foot .time { color: rgba(255, 255, 255, .7); }
 
   /* 分享选择模式：每条回合左侧出现对勾，选中后高亮 */
   #messages.share-pick .msg { padding-left: 30px; cursor: pointer; }
@@ -196,6 +230,20 @@
     width: 1.5px; border-radius: 1px;
     background: rgba(255,255,255,.09);
   }
+  /* 时间线里的过渡正文：跟事件同一套缩进，读起来是「思考→说话→执行」一条线 */
+  .events .msg.in-turn {
+    max-width: 100%;
+    align-self: stretch;
+    margin: 4px 0;
+    font-size: 15px;
+    padding: 8px 12px;
+    border-radius: 12px;
+    border-bottom-left-radius: 4px;
+    background: var(--surface-2);
+  }
+  .events .msg.in-turn .stream-body { white-space: pre-wrap; word-break: break-word; }
+  /* 时间线里的正文不要再叠一层时间线节点圆点 */
+  .events .msg.in-turn { position: relative; }
   .tl { position: relative; }
   .tl-head {
     display: flex; align-items: center; gap: 7px;
@@ -221,7 +269,21 @@
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     flex: 0 1 auto; min-width: 0;
   }
-  .tl-arrow { font-size: 10px; opacity: .6; }
+  /* 折叠箭头：几何居中的纯 CSS 三角（不用 ▸ 字形）。
+     字形墨迹在字框里偏下、又贴着基线对齐，旋转轴落不到视觉中心，
+     转起来就像绕左下角甩；换成固定尺寸的三角，轴就是盒子正中心。 */
+  .tl-arrow {
+    flex: 0 0 auto;
+    width: 9px; height: 9px;
+    background: currentColor;
+    clip-path: polygon(0 0, 100% 50%, 0 100%);
+    transform-origin: 50% 50%;
+    color: var(--muted); opacity: .85;
+    transition: transform .15s ease, color .15s ease, opacity .15s ease;
+  }
+  .tl-head.clickable:hover .tl-arrow { opacity: 1; color: var(--brand); }
+  /* 展开时箭头转 90°（朝右变朝下），绕盒子中心转，不偏不甩 */
+  .tl.open .tl-arrow { transform: rotate(90deg); opacity: 1; color: var(--brand); }
   .tl-body {
     display: none;
     margin: 3px 0 7px 4px;
@@ -440,6 +502,36 @@
   .auth-tip { font-size: 12px; color: var(--muted); text-align: center; line-height: 1.6; }
 
   /* 设置按钮与面板 */
+  /* 侧栏底部品牌区：logo + DeckMeido 字标 */
+  .sb-brand {
+    display: flex; flex-direction: column; align-items: center;
+    /* 左右内边距与下方「浅色模式/设置」按钮区完全一致（8px），logo 铺满这整块宽度 */
+    gap: 8px; padding: 12px 8px 10px;
+  }
+  .sb-brand .brand-mark {
+    /* 112px 的 1.5 倍 = 168px，仍居中，左右各留 8px 与按钮区对齐 */
+    width: 75%; height: auto; max-height: 24dvh; object-fit: contain;
+    display: block;
+    /* 深色下 logo 偏暗，轻微提亮让蕾丝细节看得见 */
+    filter: brightness(1.06);
+    user-select: none; -webkit-user-drag: none;
+  }
+  [data-theme=light] .sb-brand .brand-mark { filter: none; }
+  /* 字标：与侧栏会话标题同样的字号字形（13px / 400），后面跟版本号 */
+  .sb-brand .brand-name {
+    display: flex; align-items: center; gap: 6px;
+    line-height: 1; user-select: none;
+  }
+  .sb-brand .bn-text {
+    font-size: 13px; font-weight: 400; letter-spacing: 0;
+    color: var(--text);
+  }
+  .sb-brand .bn-ver {
+    flex: 0 0 auto; align-self: center;
+    font-size: 11px; font-weight: 400;
+    color: var(--muted);
+    white-space: nowrap;
+  }
   /* 主题与设置放在侧栏「会话」区域底部 */
   .sb-foot {
     display: flex; gap: 8px; padding: 8px 8px 10px;
@@ -581,9 +673,10 @@
     color-scheme: dark;
   }
   [data-theme=light] {
-    --bg: #f2f4f8;
+    /* 对话区底色用纯白，助手气泡的浅灰才拉得开层次（原来是 #f2f4f8，灰得几乎同色） */
+    --bg: #ffffff;
     --surface: #ffffff;
-    --surface-2: #eaeef5;
+    --surface-2: #eceff5;
     --text: #1c2333;
     --muted: #67707f;
     --brand: #0b7fd4;
@@ -624,18 +717,36 @@
   .sys-card { padding: 14px 14px 12px; border-bottom: 1px solid var(--line); }
   .sys-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 14px; font-weight: 600; margin-bottom: 10px; }
   .sys-ip { font-size: 11.5px; color: var(--muted); font-family: ui-monospace, monospace; font-weight: 400; }
-  .sys-row { display: flex; align-items: center; gap: 8px; margin: 7px 0; font-size: 12px; color: var(--muted); }
-  .sys-name { flex: 0 0 30px; }
-  .bar { flex: 1; height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
+  /* 三列网格：标签列与数值列等宽（34px），进度槽就自动在卡片里水平居中；
+     四条条的左右端点也严格落在同一垂直线上，不再参差 */
+  .sys-row {
+    display: grid; grid-template-columns: 34px 1fr 34px;
+    align-items: center; gap: 8px; margin: 7px 0;
+    font-size: 12px; color: var(--muted);
+  }
+  .sys-name { white-space: nowrap; }
+  .bar { height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
   .fill { height: 100%; width: 0%; border-radius: 3px; background: var(--brand); transition: width .4s; }
   .fill.hot { background: var(--danger); }
-  .sys-val { flex: 0 0 auto; font-size: 11px; font-family: ui-monospace, monospace; min-width: 36px; text-align: right; }
-  .sys-sub { margin-top: 9px; font-size: 11px; color: var(--muted); line-height: 1.5; }
+  .sys-val { font-size: 10.5px; font-family: ui-monospace, monospace; text-align: right; white-space: nowrap; }
+  .sys-sub { margin-top: 9px; font-size: 11px; color: var(--muted); line-height: 1.5; text-align: center; }
+  /* 拖拽附件时盖住整屏的提示层 */
+  #dropHint {
+    position: fixed; inset: 0; z-index: 60; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, .45); color: #fff;
+    font-size: 16px; letter-spacing: .04em;
+    border: 2px dashed var(--brand); border-radius: 12px; margin: 10px;
+    pointer-events: none;
+  }
+  #dropHint.show { display: flex; }
   /* 会话列表 */
   .sb-sess-head {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 10px 14px 6px; font-size: 13px; color: var(--muted);
+    /* 与系统状态卡顶部的设备名（.sys-head）同字号同字重，避免「会话」发灰看不清 */
+    padding: 10px 14px 6px; font-size: 14px; font-weight: 600; color: var(--text);
   }
+  .sb-sess-head > span { letter-spacing: .01em; }
   #btnNewSess {
     border: 1px solid var(--line); background: var(--surface-2); color: var(--text);
     width: 24px; height: 24px; border-radius: 7px; cursor: pointer; font-size: 14px; line-height: 1;
@@ -673,9 +784,9 @@
     .status-text { max-width: 4em; }
     .hdr-right { gap: 5px; flex: 0 1 auto; min-width: 0; flex-wrap: nowrap; }
     .badge { padding: 3px 8px; font-size: 11px; }
-    /* 只保留电池这一个最重要的徽章，上下文与模式隐藏，信息可在侧边栏看到 */
+    /* 手机竖屏只保留模式徽章，电量与上下文移到侧栏状态卡 */
     #ctxBadge, #modeBadge { display: none !important; }
-    .hdr-right:has(#batteryBadge[hidden]) { display: none; }
+    .hdr-right:empty { display: none; }
 
     #messages { padding: 10px 10px; gap: 8px; }
     .msg { max-width: 92%; font-size: 15px; padding: 9px 12px; }
@@ -759,14 +870,22 @@
 <div id="app">
 <aside id="sidebar">
   <div class="sys-card">
-    <div class="sys-head"><span>Steam Deck</span><span class="sys-ip" id="sysIp">–</span></div>
+    <div class="sys-head"><span id="sysHost">Steam Deck</span><span class="sys-ip" id="sysIp">–</span></div>
     <div class="sys-row"><span class="sys-name">CPU</span><div class="bar"><div class="fill" id="cpuFill"></div></div><span class="sys-val" id="cpuVal">–</span></div>
-    <div class="sys-row"><span class="sys-name">内存</span><div class="bar"><div class="fill" id="memFill"></div></div><span class="sys-val" id="memVal">–</span></div>
-    <div class="sys-row"><span class="sys-name">硬盘</span><div class="bar"><div class="fill" id="diskFill"></div></div><span class="sys-val" id="diskVal">–</span></div>
+    <div class="sys-row"><span class="sys-name">RAM</span><div class="bar"><div class="fill" id="memFill"></div></div><span class="sys-val" id="memVal">–</span></div>
+    <div class="sys-row"><span class="sys-name">SSD</span><div class="bar"><div class="fill" id="ssdFill"></div></div><span class="sys-val" id="ssdVal">–</span></div>
+    <div class="sys-row" id="sdRow" hidden><span class="sys-name">TF</span><div class="bar"><div class="fill" id="sdFill"></div></div><span class="sys-val" id="sdVal">–</span></div>
     <div class="sys-sub" id="sysSub"></div>
   </div>
   <div class="sb-sess-head"><span>会话</span><button id="btnNewSess" title="新会话">＋</button></div>
   <div id="sessList"></div>
+  <div class="sb-brand">
+    <img class="brand-mark" src="logo-mark.png" alt="DeckMeido">
+    <span class="brand-name">
+      <span class="bn-text">DeckMeido</span>
+      <span class="bn-ver" id="brandVer">v…</span>
+    </span>
+  </div>
   <div class="sb-foot">
     <button id="btnTheme" title="切换主题">深色模式</button>
     <button id="settingsBtn" title="设置">设置</button>
@@ -777,13 +896,12 @@
 <header>
   <button class="cb-btn" id="btnMenu" title="菜单">菜单</button>
   <span class="dot" id="dot"></span>
-  <span class="logo">DeckMeido</span>
+  <span class="logo" id="hdrTitle" title="DeckMeido">DeckMeido</span>
   <span class="status-text" id="statusText">连接中…</span>
   <span class="spacer"></span>
   <div class="hdr-right">
     <span class="badge" id="ctxBadge" hidden></span>
     <span class="badge ctrl" id="ctrlBadge" hidden></span>
-    <span class="badge" id="batteryBadge" hidden></span>
     <span class="badge" id="modeBadge" hidden></span>
   </div>
 </header>
@@ -809,7 +927,7 @@
 
 <div id="composer">
   <div id="plusMenu">
-    <button id="pmImage">附加图片</button>
+    <button id="pmImage">附加图片 / 文件</button>
     <button id="pmFile">引用工作区文件</button>
     <button id="pmShot">引用当前屏幕截图</button>
   </div>
@@ -846,7 +964,8 @@
   </div>
 </div>
 
-<input type="file" id="imgInput" accept="image/*" hidden>
+<input type="file" id="imgInput" accept="image/*,.txt,.md,.pdf,.docx,.csv,.log,.json,.py,.js,.ts,.sh,.yml,.yaml,.toml,.ini,.cfg,.xml,.html,.css" multiple hidden>
+<div id="dropHint">松手即可添加附件</div>
 
 <div id="authOverlay">
   <div class="auth-card">
@@ -949,7 +1068,6 @@
   var sendBtn = document.getElementById('send');
   var dot = document.getElementById('dot');
   var statusText = document.getElementById('statusText');
-  var batteryBadge = document.getElementById('batteryBadge');
   var ctrlBadge = document.getElementById('ctrlBadge');
   var modeBadge = document.getElementById('modeBadge');
   var ctxBadge = document.getElementById('ctxBadge');
@@ -985,8 +1103,9 @@
 
   function fmtTime(ts) {
     var d = ts ? new Date(ts * 1000) : new Date();
-    return d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0');
+    return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
   }
+  function pad2(n) { return String(n).padStart(2, '0'); }
 
   function scrollBottom() {
     messages.scrollTop = messages.scrollHeight;
@@ -1022,10 +1141,22 @@
   }
 
   function addMsg(role, text, ts, events) {
-    // 历史回放时先摆事件时间线（截屏/搜索/终端输出），与实时对话的阅读顺序一致
-    if (events && events.length) renderEvents(events);
+    // 历史回放：事件与正文按「屏幕上出现过的顺序」串成一条时间线。
+    // 旧版把事件块整体摆在正文上方，于是「思考→说话→执行」的顺序被打乱成
+    // 「思考全在上、说话在中、命令在最下」；现在 order 里有序，按序摆放即可
+    if (events && events.length) {
+      var box = document.createElement('div');
+      box.className = 'events';
+      events.forEach(function (ev) { renderEvent(ev, box); });
+      // 一轮的尾巴：正文接在它真正说完的那个位置之后
+      box.appendChild(makeTextBubble(text, true, ts));
+      messages.appendChild(box);
+      scrollBottomSafe();
+      return;
+    }
     var el = document.createElement('div');
     el.className = 'msg ' + role;
+    if (ts) el.dataset.ts = String(ts);
     if (role === 'assistant' || role === 'user') {
       var body = document.createElement('div');
       body.innerHTML = renderMd(text);
@@ -1033,26 +1164,37 @@
     } else {
       el.textContent = text;
     }
-    var t = document.createElement('span');
-    t.className = 'time';
-    t.textContent = fmtTime(ts);
-    if (role === 'assistant') {
-      addMsgFoot(el, ts);
+    if (role === 'assistant' || role === 'user') {
+      // 用户和助手都给一套底部操作行（默认悬停才显示）
+      addMsgFoot(el, ts, role);
     } else {
+      var t = document.createElement('span');
+      t.className = 'time';
+      t.textContent = fmtTime(ts);
       el.appendChild(t);
     }
     messages.appendChild(el);
     scrollBottomSafe();
   }
 
-  // 回复气泡底部：重试 / 分享在左，时间在右
-  function addMsgFoot(el, ts) {
+  // 气泡底部：操作按钮在左，时间在右（鼠标移上去才显示，见 .msg-foot 样式）
+  function addMsgFoot(el, ts, role) {
     var foot = document.createElement('div');
     foot.className = 'msg-foot';
     var acts = document.createElement('div');
     acts.className = 'msg-acts';
-    acts.appendChild(makeActBtn('重试', function () { retryMsg(el); }));
+    if (role === 'user') {
+      // 主人自己的话：重试=把这句话再发一遍；删除=连它和下面那条回答一起撤掉
+      var rb = makeActBtn('重试', function () { retryUserMsg(el); });
+      rb.title = '重新发送这条消息';
+      acts.appendChild(rb);
+    } else {
+      acts.appendChild(makeActBtn('重试', function () { retryMsg(el); }));
+    }
     acts.appendChild(makeActBtn('分享', function () { enterSharePick(el); }));
+    var db = makeActBtn('删除', function () { deleteMsg(el, db); });
+    db.title = '从会话里删除（再点一次确认）';
+    acts.appendChild(db);
     foot.appendChild(acts);
     var t = document.createElement('span');
     t.className = 'time';
@@ -1107,8 +1249,8 @@
     head.appendChild(ic); head.appendChild(tx);
     head.addEventListener('click', function () {
       tl.classList.toggle('open');
-      var a = head.querySelector('.tl-arrow');
-      if (a) a.textContent = tl.classList.contains('open') ? '▾' : '▸';
+      // 方向由 CSS 的 .tl.open .tl-arrow 旋转负责，这里不再换字符，
+      // 否则「换字符 + 旋转 90°」会叠加成朝左的怪箭头
     });
     tl.appendChild(head);
     return { tl: tl, head: head };
@@ -1116,23 +1258,47 @@
 
   // 思维链行（live 流式与历史渲染共用）
   function makeThoughtRow(text, open) {
+    var body = text || '';
+    // 没有内容的思考不生成「思考 ▸」空头：屏幕上出现一排无内容的「思考 ·」纯属噪音
+    if (!body.trim()) return null;
     var r = makeTlRow('思考', null, open);
     var arrow = document.createElement('span');
     arrow.className = 'tl-arrow';
-    arrow.textContent = open ? '▾' : '▸';
+    // 三角由 CSS 绘制，不放字符；方向由 .tl.open .tl-arrow 旋转控制
     r.head.appendChild(arrow);
-    var body = document.createElement('div');
-    body.className = 'tl-body';
-    body.textContent = text || '';
-    r.tl.appendChild(body);
+    var bd = document.createElement('div');
+    bd.className = 'tl-body';
+    bd.textContent = body;
+    r.tl.appendChild(bd);
     if (open) r.tl.classList.add('open');
     return r.tl;
   }
 
-  // 渲染单个事件（思维链 / 工具调用+终端输出 / 文件改动）到容器
+  // 正文气泡（回合内按时间顺序穿插用）：final=true 时带底部按钮与时间
+  function makeTextBubble(text, final, ts) {
+    var el = document.createElement('div');
+    el.className = 'msg assistant in-turn';
+    if (ts) el.dataset.ts = String(ts);
+    var body = document.createElement('div');
+    body.className = 'stream-body';
+    body.innerHTML = renderMd(text);
+    el.appendChild(body);
+    if (final) addMsgFoot(el, ts, 'assistant');
+    return el;
+  }
+
+  // 渲染单个事件（思维链 / 过渡正文 / 工具调用+终端输出 / 文件改动）到容器
   function renderEvent(ev, box) {
     if (ev.type === 'thought') {
-      box.appendChild(makeThoughtRow(ev.text, false));
+      var tr = makeThoughtRow(ev.text, false);
+      if (tr) box.appendChild(tr);   // 空思考返回 null，不能直接 appendChild
+      return;
+    }
+    // 过渡正文（工具调用前说的话）：按事件顺序插在思维链与工具之间，
+    // 而不是攒到最后堆成一坨，重排后阅读顺序才是「思考→说话→执行→思考…」
+    if (ev.type === 'text') {
+      var seg = (ev.text || '').trim();
+      if (seg) box.appendChild(makeTextBubble(seg, false));
       return;
     }
     if (ev.type !== 'tool') return;
@@ -1151,7 +1317,7 @@
     } else {
       var arrow = document.createElement('span');
       arrow.className = 'tl-arrow';
-      arrow.textContent = ev.image ? '▾' : '▸';
+      // 三角由 CSS 绘制，方向交给 .tl.open 旋转（截图行默认展开）
       r.head.appendChild(arrow);
       // 截图默认展开，让用户直接看到画面
       if (ev.image) r.tl.classList.add('open');
@@ -1418,13 +1584,17 @@
           hideTyping();
           // 上一段正文已经说完（工具调用后会另起一段），翻篇进缓存
           turnCacheNextSeg();
-          streamEl = document.createElement('div');
-          streamEl.className = 'msg assistant';
-          streamBody = document.createElement('div');
-          streamBody.className = 'stream-body';
-          streamEl.appendChild(streamBody);
-          messages.appendChild(streamEl);
-          addMsgFoot(streamEl);
+          // 这段正文要落在时间线里「属于它的位置」：紧接在它之前的思考/工具之后，
+          // 而不是统一堆到所有事件下方。否则一整轮下来就成了
+          // 「思考全在上、说话在中、命令在最下」，滚屏后根本对不上谁先谁后
+          if (!liveBox) {
+            liveBox = document.createElement('div');
+            liveBox.className = 'events';
+            messages.appendChild(liveBox);
+          }
+          streamEl = makeTextBubble('', false);
+          streamBody = streamEl.querySelector('.stream-body');
+          liveBox.appendChild(streamEl);
           scrollBottomSafe();
           break;
         case 'delta':
@@ -1453,9 +1623,18 @@
             liveBox.className = 'events';
             messages.appendChild(liveBox);
           }
-          var trow = makeThoughtRow('', true);
-          liveBox.appendChild(trow);
-          liveThought = trow.querySelector('.tl-body');
+          // 流式阶段先建一个空壳，边收边填；结束时空的会被撤掉（不留空头）
+          var trow = makeTlRow('思考', null, true);
+          var tarr0 = document.createElement('span');
+          tarr0.className = 'tl-arrow';
+          // 三角由 CSS 绘制，方向交给 .tl.open 旋转
+          trow.head.appendChild(tarr0);
+          var tbd = document.createElement('div');
+          tbd.className = 'tl-body';
+          trow.tl.appendChild(tbd);
+          trow.tl.classList.add('open');
+          liveBox.appendChild(trow.tl);
+          liveThought = tbd;
           scrollBottomSafe();
           break;
         case 'thought_delta':
@@ -1466,14 +1645,19 @@
           break;
         case 'thought_end':
           if (liveThought) {
-            // 思考结束后折叠为「思考 ▸」行，点击可展开
             var trow2 = liveThought.parentNode;
+            // 空的思考块（模型啥也没想）直接撤掉，不留「思考 ▸」空头
+            if (!liveThought.textContent.trim()) {
+              if (trow2 && trow2.parentNode) trow2.parentNode.removeChild(trow2);
+              liveThought = null;
+              break;
+            }
+            // 思考结束后折叠为「思考 ▸」行，点击可展开
+            // 箭头方向交给 CSS：移除 open 类后自动转回朝右
             trow2.classList.remove('open');
-            var tarr = trow2.querySelector('.tl-arrow');
-            if (tarr) tarr.textContent = '▸';
+            liveThoughtShown++;   // 只在真的留下一条思考时计数
           }
           liveThought = null;
-          liveThoughtShown++;
           break;
         case 'tool_done':
           if (liveBox && msg.event) {
@@ -1483,11 +1667,30 @@
           }
           break;
         case 'assistant_message':
+          // 这一段负责把「这一轮结束」落实到界面上（补正文、挂按钮、清理时间线）。
+          // 里面任何一步抛异常，旧代码都会连带跳过后面的 flushQueue ——
+          // 结果就是排队的消息永远发不出去，表现成「按回车加入队列」完全不生效。
+          try {
           hideTyping();
           setBusy(false);
+          // 最终正文就是时间线里的最后一段气泡：原地把它补成「正式回复」（带按钮/时间），
+          // 而不是抽出来另起一条——否则这一段会掉到所有事件下面，顺序又乱回去
+          var promoted = false;   // 最终正文是否已原地补进时间线
           if (streamEl && streamEl.parentNode) {
-            // 只发了工具调用、没有正文的中间轮：流式容器只剩底部按钮和时间，整块丢掉
-            streamEl.parentNode.removeChild(streamEl);
+            if (msg.text) {
+              var fb = streamEl.querySelector('.stream-body');
+              if (fb) fb.innerHTML = renderMd(msg.text);
+              if (msg.ts) streamEl.dataset.ts = String(msg.ts);
+              addMsgFoot(streamEl, msg.ts, 'assistant');
+              promoted = true;
+              if (liveBox && streamEl.parentNode === liveBox) {
+                // 标记一下：整轮的末尾，供重试/分享识别
+                streamEl.classList.add('turn-final');
+              }
+            } else {
+              // 只发了工具调用、没有正文的中间轮：这一段空壳直接丢掉
+              streamEl.parentNode.removeChild(streamEl);
+            }
           }
           streamEl = null; streamBody = null;
           // 最终正文就是本轮屏幕上出现过的内容：整段订正后立刻落一份到本地，
@@ -1503,9 +1706,11 @@
           }
           if (msg.events && msg.events.length) {
             if (liveBox) {
-              // 补渲染未实时显示的事件，跳过已显示的工具块与思维链
+              // 补渲染未实时显示的事件：已实时展示过的工具块/思维链按数量跳过，
+              // 过渡正文（text）在流式阶段已经显示过了，一并跳过，避免段落重复
               var skip = liveToolCount, skipT = liveThoughtShown;
               msg.events.forEach(function (e) {
+                if (e.type === 'text') return;
                 if (e.type === 'tool' && skip > 0) { skip--; return; }
                 if (e.type === 'thought' && skipT > 0) { skipT--; return; }
                 renderEvent(e, liveBox);
@@ -1518,9 +1723,16 @@
             liveBox.parentNode.removeChild(liveBox);
           }
           liveBox = null; liveToolCount = 0; liveThoughtShown = 0;
-          addMsg('assistant', msg.text, msg.ts);
+          if (!promoted) addMsg('assistant', msg.text, msg.ts);
           refreshStatus();  // 更新上下文用量徽标
-          flushQueue(!!msg.cancelled);  // 有排队消息则自动发出
+          } catch (e) {
+            // 渲染出错不能拖住对话流程：记录一笔，继续往下走
+            addSystem('这一轮的界面渲染出了点问题，已跳过：' + (e && e.message ? e.message : e));
+          } finally {
+            // 队列的投递放在 finally 里：不管上面哪一步炸了，只要这一轮确实结束了，
+            // 排队的消息就必须发出去，否则主人会一直等一条永远不动的队列
+            flushQueue(!!msg.cancelled);
+          }
           break;
         case 'tool_activity':
           showTyping(msg.text);
@@ -1746,11 +1958,17 @@
         awaitingResync = false;
         setBusy(false);
         flushQueue(false);
+      } else if (msgQueue.length && !queueHeld
+                 && Date.now() - lastSendAt > 4000) {
+        // 队列自愈：服务端明确「没在跑」、队列却还压着东西，且距上次发送已经超过 4 秒
+        // （3000ms 的 status 间隔内足够走完一轮建 task），说明收尾事件根本没送到
+        // —— 比如被会话代次过滤掉，或者渲染中途抛了异常。
+        // 不处理的话这些消息会一直躺在输入框上方，主人以为「排队不生效」。
+        // queueHeld=true 表示主人是手动终止的，那是有意压住，不能替他发
+        setBusy(false);
+        showTyping('');
+        flushQueue(false);
       }
-    }
-    if (s.battery != null) {
-      batteryBadge.hidden = false;
-      batteryBadge.textContent = s.battery + '%' + (s.charging === 'Charging' ? ' 充电中' : '');
     }
     if (s.mode) {
       modeBadge.hidden = false;
@@ -1777,6 +1995,8 @@
   var queueBox = document.getElementById('queueBox');
   var msgQueue = [];              // 等待发送的消息 [{id, text}]
   var qid = 0;
+  var queueHeld = false;          // 手动终止后刻意压住队列：这时不该被自愈逻辑自动发出去
+  var lastSendAt = 0;             // 上一次真正把消息交给服务端的时间（毫秒）
   var forceSendAfterCancel = null; // 「立即发送」：终止当前后要立刻发出去的文本
   var queuedNoticeShown = false;   // 断联暂存提示只弹一次，别刷屏
   var awaitingResync = false;      // 刚重连、等第一条 status 来对齐运行状态
@@ -1847,14 +2067,18 @@
 
   // 一轮结束后：自动发出排队的下一条
   function flushQueue(cancelled) {
+    // 手动终止后把队列扣住：等主人自己决定什么时候发
+    queueHeld = !!cancelled;
     if (forceSendAfterCancel) {
       var ft = forceSendAfterCancel;
       forceSendAfterCancel = null;
+      queueHeld = false;
       doSend(ft);
       return;
     }
     // 手动终止后不自动发，保留队列等用户决定
     if (cancelled || !msgQueue.length) return;
+    queueHeld = false;
     doSend(msgQueue.shift().text);
     renderQueue();
   }
@@ -1883,17 +2107,105 @@
   }
   setInterval(refreshStatus, 30000);
 
+  // 删除：先点一下变成「确认删除」，再点一次才真删。
+  // Steam Deck 上误触很常见，直接删掉一整轮回答没法撤销，多一步更稳。
+  var pendingDelete = null;
+  function deleteMsg(el, btn) {
+    if (busy) {
+      addSystem('本轮回答还在生成，等结束了再删');
+      return;
+    }
+    if (pendingDelete && pendingDelete.btn === btn) {
+      // 第二次点击：确认删除
+      var target = pendingDelete.el;
+      pendingDelete = null;
+      clearTimeout(deleteTimer);
+      doDeleteMsg(target);
+      return;
+    }
+    if (pendingDelete) pendingDelete.restore();
+    var oldText = btn.textContent, oldTitle = btn.title;
+    btn.textContent = '确认？';
+    btn.title = '再点一次删除这条';
+    var restore = function () {
+      btn.textContent = oldText;
+      btn.title = oldTitle;
+    };
+    pendingDelete = { el: el, btn: btn, restore: restore };
+    clearTimeout(deleteTimer);
+    deleteTimer = setTimeout(function () {
+      if (pendingDelete && pendingDelete.btn === btn) { restore(); pendingDelete = null; }
+    }, 4000);
+  }
+  var deleteTimer = null;
+
+  // 真正执行删除：先从后端历史里摘掉，成功后再动 DOM
+  function doDeleteMsg(el) {
+    var isUser = el.classList.contains('user');
+    var ts = el.dataset.ts ? parseFloat(el.dataset.ts) : null;
+    var box = el.closest('.events');
+    // 这一轮整块时间线（.events）在界面上是一坨，删掉任意一条都要整块撤掉，
+    // 否则会留下半截思考/工具行，和后端历史对不上
+    var node = box || el;
+    // 删提问时后端会把紧随其后的回答一起摘掉，界面上对应的就是那条回答的容器
+    var extra = null;
+    if (isUser && !box) {
+      var sib = el.nextElementSibling;
+      if (sib && (sib.classList.contains('events') ||
+                  (sib.classList.contains('msg') && sib.classList.contains('assistant')))) {
+        extra = sib;
+      }
+    }
+    return fetch('/api/messages/delete?token=' + encodeURIComponent(token), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ts: ts, role: isUser ? 'user' : 'assistant', with_reply: isUser })
+    }).then(function (r) {
+      if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || '删除失败'); });
+      return r.json();
+    }).then(function () {
+      if (node.parentNode) node.parentNode.removeChild(node);
+      if (extra && extra.parentNode) extra.parentNode.removeChild(extra);
+      scrollBottomSafe();
+      refreshStatus();
+      return true;
+    }).catch(function (e) {
+      addSystem('删除失败：' + (e.message || e));
+      return false;
+    });
+  }
+
+  // 用户消息「重试」：把这句话重新发一遍。
+  // 必须等后端把老那条（连同它的回答）真正删掉之后再发，
+  // 否则历史里会短暂出现两条一模一样的提问，模型会当成主人重复说了两遍
+  function retryUserMsg(el) {
+    if (busy) { addSystem('等这一轮结束再重试'); return; }
+    var body = el.querySelector(':scope > div:not(.msg-foot)');
+    var text = (body ? body.innerText : el.textContent).trim();
+    if (!text) return;
+    doDeleteMsg(el).then(function (ok) { if (ok) doSend(text); });
+  }
+
   // 重试：撤掉这条 AI 回复并让模型重新回答
   function retryMsg(el) {
     if (busy) return;
-    // 只对最后一条回复生效：撤掉气泡和它前面的事件容器
-    if (el !== messages.lastElementChild) {
+    // 只对最后一条回复生效：撤掉这一轮的全部内容
+    var box = el.closest('.events');
+    var isLast = (el === messages.lastElementChild)
+                 || (!!box && box === messages.lastElementChild);
+    if (!isLast) {
       addSystem('只能重试最后一条回复');
       return;
     }
-    messages.removeChild(el);
-    var prev = messages.lastElementChild;
-    if (prev && prev.classList.contains('events')) messages.removeChild(prev);
+    if (box) {
+      // 整轮时间线（思考/过渡正文/工具/最终正文）一起撤掉，
+      // 否则重试后旧的思考与命令还留在屏幕上，和新一轮叠在一起看不出哪条是新的
+      if (box.parentNode) box.parentNode.removeChild(box);
+    } else {
+      messages.removeChild(el);
+      var prev = messages.lastElementChild;
+      if (prev && prev.classList.contains('events')) messages.removeChild(prev);
+    }
     setBusy(true);
     showTyping();
     fetch('/api/retry?token=' + encodeURIComponent(token), { method: 'POST' })
@@ -1922,6 +2234,7 @@
     }
     queuedNoticeShown = false;
     ws.send(JSON.stringify({ type: 'chat', text: text }));
+    lastSendAt = Date.now();   // 自愈逻辑据此判断「刚发出去，服务端可能还在建 task」
     setBusy(true);
   }
 
@@ -1968,6 +2281,9 @@
 
   sendBtn.addEventListener('click', send);
   input.addEventListener('keydown', function (e) {
+    // 中文输入法选词时也会走 Enter：此时 keyCode=229 或 isComposing=true，
+    // 拦下来交给输入法确认候选词，不能当成「发送/排队」，否则打拼音按回车就乱发
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitInput(); }
   });
   input.addEventListener('input', function () {
@@ -2039,6 +2355,25 @@
       })
       .catch(function () { verTag.textContent = '版本未知'; });
   }
+
+  // 侧栏字标后的版本徽章：/api/version 不校验令牌，登录前也能拿到，
+  // 所以页面一加载就填，不必等设置页打开
+  var brandVer = document.getElementById('brandVer');
+  function loadBrandVersion() {
+    if (!brandVer) return;
+    fetch('/api/version')
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (v) {
+        if (!v || !v.version) { brandVer.textContent = 'v?'; return; }
+        var full = String(v.version);
+        // "0.1.0-20-g3d32d2e" 只取前面的发行号，git 描述留给悬停提示
+        var short = full.split('-')[0] || full;
+        brandVer.textContent = 'v' + short;
+        brandVer.title = '版本 ' + full;
+      })
+      .catch(function () { brandVer.textContent = 'v?'; });
+  }
+  loadBrandVersion();
 
   updCheck.addEventListener('click', function () {
     updNote.textContent = '正在查询 GitHub 最新版本…';
@@ -2284,11 +2619,10 @@
   document.getElementById('shareCancel').addEventListener('click', exitSharePick);
 
   document.getElementById('shareGen').addEventListener('click', function () {
-    // 按屏幕上的顺序收集选中的回合
-    var picked = [];
-    Array.prototype.forEach.call(messages.children, function (node) {
-      if (node.classList.contains('msg') && node.classList.contains('on')) picked.push(node);
-    });
+    // 按屏幕上的顺序收集选中的回合。
+    // 正文现在嵌在时间线（.events）里，不再是 messages 的直接子节点，
+    // 所以按文档顺序取所有选中的气泡，而不是只扫一层
+    var picked = Array.prototype.slice.call(messages.querySelectorAll('.msg.on'));
     if (!picked.length) return;
     exitSharePick();
     renderShare(picked);
@@ -2441,26 +2775,102 @@
     if (!fileList.contains(e.target) && e.target.id !== 'pmFile') fileList.classList.remove('show');
   });
 
-  // 附加图片：上传后把图片标记插入输入框（发送时模型能看到图）
+  // 附加图片 / 文档：统一走 uploadFiles，图片插 ![](url)，文档插 @{路径}
   document.getElementById('pmImage').addEventListener('click', function () {
     plusMenu.classList.remove('show');
     imgInput.click();
   });
   imgInput.addEventListener('change', function () {
-    if (!imgInput.files.length) return;
+    uploadFiles(imgInput.files);
+    imgInput.value = '';
+  });
+
+  // 把一个文件 POST 到 /api/upload
+  function uploadOne(file) {
     var fd = new FormData();
-    fd.append('file', imgInput.files[0]);
-    addSystem('上传图片中…');
-    fetch('/api/upload?token=' + encodeURIComponent(token), { method: 'POST', body: fd })
+    fd.append('file', file);
+    return fetch('/api/upload?token=' + encodeURIComponent(token), { method: 'POST', body: fd })
       .then(function (r) { return r.json(); })
       .then(function (res) {
-        if (res.url) {
-          input.value += (input.value ? '\n' : '') + '![图片](' + res.url + ')';
+        if (!res || (!res.url && !res.path)) throw new Error('bad response');
+        return res;
+      });
+  }
+
+  // 批量上传；逐个插入标记，避免多文件时互相覆盖
+  function uploadFiles(files) {
+    if (!files || !files.length) return;
+    var list = Array.prototype.slice.call(files);
+    addSystem('上传中… ' + list.length + ' 个文件');
+    var chain = Promise.resolve();
+    list.forEach(function (f) {
+      chain = chain.then(function () {
+        return uploadOne(f).then(function (res) {
+          var cur = input.value;
+          var mark;
+          if (res.kind === 'image') {
+            mark = '![图片](' + res.url + ')';
+          } else {
+            mark = '@{' + res.path + '}';
+          }
+          input.value = cur + (cur && !/\s$/.test(cur) ? '\n' : '') + mark;
           input.focus();
-        } else addSystem('上传失败');
-      })
-      .catch(function () { addSystem('上传失败'); });
-    imgInput.value = '';
+        }).catch(function () {
+          addSystem('上传失败：' + f.name);
+        });
+      });
+    });
+    chain.then(function () {
+      input.style.height = 'auto';
+      input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+    });
+  }
+
+  // 粘贴：截图/图片或文件，直接作为附件
+  input.addEventListener('paste', function (e) {
+    var cd = e.clipboardData;
+    if (!cd) return;
+    var files = [];
+    if (cd.items && cd.items.length) {
+      for (var i = 0; i < cd.items.length; i++) {
+        var it = cd.items[i];
+        if (it.kind === 'file') {
+          var f = it.getAsFile();
+          if (f) files.push(f);
+        }
+      }
+    }
+    if (!files.length) return;   // 纯文本照常粘贴
+    e.preventDefault();
+    uploadFiles(files);
+  });
+
+  // 拖拽：整页接收，拖到窗口任意位置都能加附件
+  var dropHint = document.getElementById('dropHint');
+  var dragDepth = 0;
+  window.addEventListener('dragenter', function (e) {
+    if (!e.dataTransfer || Array.prototype.indexOf.call(e.dataTransfer.types, 'Files') < 0) return;
+    dragDepth++;
+    dropHint.classList.add('show');
+  });
+  window.addEventListener('dragover', function (e) {
+    if (e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types, 'Files') >= 0) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    }
+  });
+  window.addEventListener('dragleave', function () {
+    dragDepth--;
+    if (dragDepth <= 0) { dragDepth = 0; dropHint.classList.remove('show'); }
+  });
+  window.addEventListener('drop', function (e) {
+    if (!e.dataTransfer) return;
+    var files = e.dataTransfer.files;
+    if (!files || !files.length) return;
+    e.preventDefault();
+    dragDepth = 0;
+    dropHint.classList.remove('show');
+    uploadFiles(files);
   });
 
   // 引用工作区文件：@{路径}
@@ -2538,13 +2948,30 @@
       .then(function (d) {
         if (d.error) return;
         document.getElementById('sysIp').textContent = d.ip || '–';
+        if (d.hostname) document.getElementById('sysHost').textContent = d.hostname;
         setBar(document.getElementById('cpuFill'), document.getElementById('cpuVal'), d.cpu, Math.round(d.cpu) + '%');
         setBar(document.getElementById('memFill'), document.getElementById('memVal'), d.mem_pct,
-               fmtGB(d.mem_used) + '/' + fmtGB(d.mem_total));
-        setBar(document.getElementById('diskFill'), document.getElementById('diskVal'), d.disk_pct,
-               Math.round(d.disk_pct) + '%');
-        document.getElementById('sysSub').textContent =
-          '硬盘 ' + fmtGB(d.disk_used) + '/' + fmtGB(d.disk_total) + ' · 已运行 ' + fmtUptime(d.uptime);
+               fmtGB(d.mem_used));
+        // SSD：内置盘 /home 分区，没有数据时这一行留空
+        if (d.ssd_pct != null) {
+          setBar(document.getElementById('ssdFill'), document.getElementById('ssdVal'), d.ssd_pct,
+                 Math.round(d.ssd_pct) + '%');
+        }
+        // TF：插着卡才显示这一行
+        var sdRow = document.getElementById('sdRow');
+        if (d.sd_pct != null) {
+          sdRow.hidden = false;
+          sdRow.title = d.sd_mount || '';
+          setBar(document.getElementById('sdFill'), document.getElementById('sdVal'), d.sd_pct,
+                 Math.round(d.sd_pct) + '%');
+        } else {
+          sdRow.hidden = true;
+        }
+        // 副行：电量 + 运行时长（电量不再占顶栏徽章）
+        var sub = [];
+        if (d.battery != null) sub.push('电量 ' + d.battery + '%');
+        sub.push('已运行 ' + fmtUptime(d.uptime));
+        document.getElementById('sysSub').textContent = sub.join(' · ');
       })
       .catch(function () {});
   }
@@ -2553,6 +2980,14 @@
 
   // ---------- 侧栏：会话列表 ----------
   var sessList = document.getElementById('sessList');
+  var hdrTitle = document.getElementById('hdrTitle');
+  // 顶栏标题 = 当前会话标题（空会话回落到 DeckMeido）
+  function setHdrTitle(t) {
+    var name = String(t || '').trim();
+    if (!name) { name = 'DeckMeido'; hdrTitle.title = '新会话'; }
+    else { hdrTitle.title = name; }
+    if (hdrTitle.textContent !== name) hdrTitle.textContent = name;
+  }
   function loadSessions() {
     if (!token) return;
     fetch('/api/sessions?token=' + encodeURIComponent(token))
@@ -2560,13 +2995,15 @@
       .then(function (d) {
         currentSid = d.current;
         sessList.innerHTML = '';
+        var curTitle = '';
         (d.items || []).forEach(function (s) {
+          if (s.id === d.current) curTitle = s.title;
           var row = document.createElement('div');
           row.className = 'sess' + (s.id === d.current ? ' current' : '');
           var title = document.createElement('span');
           title.className = 's-title';
           title.textContent = s.title || '会话';
-          title.title = s.title + ' · ' + s.messages + ' 条消息';
+          title.title = (s.title || '会话') + ' · ' + s.messages + ' 条消息';
           row.appendChild(title);
           var del = document.createElement('button');
           del.className = 's-del';
@@ -2597,6 +3034,7 @@
           });
           sessList.appendChild(row);
         });
+        setHdrTitle(curTitle);
       })
       .catch(function () {});
   }

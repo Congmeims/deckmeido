@@ -9,6 +9,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -22,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .llm import LLMClient
-from . import depcheck, singleton, tools, updater
+from . import depcheck, power, singleton, tools, updater
 from .tts import TTS
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -300,6 +301,11 @@ def apply_config(cfg: dict):
     tts.voice = t.get("voice", "cmn")
     tts.speed = int(t.get("speed", 170))
     PERMISSION_MODE = cfg.get("security", {}).get("permission_mode", "auto")
+    # 桌面模式下执行命令/亮遮罩时阻止息屏（热更新即生效，不必重启）
+    wake_on = cfg.get("power", {}).get("keep_awake", True)
+    power.keeper.enabled = bool(wake_on)
+    if not power.keeper.enabled:
+        power.keeper.release_all()
     ws_dir = cfg.get("workspace", {}).get("dir", "")
     if ws_dir:
         try:
@@ -353,9 +359,81 @@ def _sess_path(sid: str) -> Path:
     return SESSIONS_DIR / f"{sid}.json"
 
 
+# 已被用户删除的会话号。删除动作只删文件，而「正在跑的那一轮」手里还捏着这个
+# sid：收尾时 save_session_snapshot(turn_sid) / 流式节流的 _write_streaming
+# 都会把文件原样写回来 —— 用户看到的就是「删了一个，冒出两个会话」。
+# 这里记一笔，所有落盘入口先查名单，删掉的会话绝不允许复活。
+# 只在启动时为空（重启后文件确实不存在了，也没人在跑老那一轮）。
+_deleted_sids: set[str] = set()
+
+
+def _set_title(data: dict, hist: list[dict]) -> None:
+    """给没有标题的空会话补一个带时间的标题，避免侧栏出现两个一模一样的「新会话」"""
+    if data.get("title") and data["title"] != "新会话":
+        return
+    first_user = next((m.get("content") for m in hist
+                       if m.get("role") == "user" and str(m.get("content") or "").strip()), None)
+    if first_user:
+        data["title"] = str(first_user).strip().replace("\n", " ")[:24]
+    else:
+        data["title"] = "新会话 " + time.strftime("%H:%M", time.localtime(data.get("created") or time.time()))
+
+
 def save_current_session():
     """把当前会话历史写盘，标题取第一条用户消息"""
     _write_session(current_sid, history)
+
+
+def _merge_histories(old_hist: list[dict], new_hist: list[dict]):
+    """把「内存里的新消息」追加到「磁盘上的老历史」后面，返回 (合并结果, 新增条数)。
+
+    判定新旧的依据是消息指纹——(role, content 前 200 字)。内存里的消息如果
+    磁盘上已经有了就跳过；没有的则按顺序补在末尾。
+    无法判定（比如内存里的消息在磁盘上找不到任何锚点）时返回 (None, 0)，
+    让调用方保守地保留磁盘内容。
+    """
+    def fp(m):
+        return (m.get("role"), str(m.get("content") or "")[:200])
+
+    old_fps = [fp(m) for m in old_hist]
+    old_set = set(old_fps)
+    new_fps = [fp(m) for m in new_hist]
+
+    # 内存里的消息必须有一条能在磁盘上找到，否则说明这两份根本不是同一条时间线，
+    # 强行拼接只会把历史搅乱（用户看到的「回复错乱」就是这么来的）
+    anchor = None
+    for i, f in enumerate(new_fps):
+        if f in old_set:
+            anchor = i
+    if anchor is None:
+        return None, 0
+
+    # 锚点之后的消息视为「新增」，按指纹去重后追加
+    added = []
+    seen = set()
+    for m in new_hist[anchor + 1:]:
+        f = fp(m)
+        if f in old_set or f in seen:
+            continue
+        seen.add(f)
+        added.append(m)
+    if not added:
+        return old_hist, 0
+    return old_hist + added, len(added)
+
+
+def _fresh_sid() -> str:
+    """生成一个目录里绝对不存在的会话号。
+
+    直接 token_hex(4) 理论上够随机，但启动路径里出现过「老文件改名 .broken 后
+    又用同一 sid 重建」的情况，新会话写回去正好覆盖掉还没救回来的历史。
+    这里显式重试，撞号就换一个。
+    """
+    for _ in range(20):
+        sid = secrets.token_hex(4)
+        if not _sess_path(sid).exists() and sid not in _deleted_sids:
+            return sid
+    return secrets.token_hex(8)
 
 
 def save_session_snapshot(sid: str, hist: list[dict]):
@@ -367,44 +445,67 @@ def save_session_snapshot(sid: str, hist: list[dict]):
     return True
 
 
-def _write_session(sid: str, hist: list[dict]):
-    """原子写入一个会话文件"""
+def _write_session(sid: str, hist: list[dict], allow_merge: bool = True):
+    """原子写入一个会话文件。
+
+    allow_merge=True（默认）：磁盘历史明显比本次要写的多时，不是简单拒绝，
+    而是做「磁盘为底 + 追加内存里多出来的新消息」的单调合并。
+    单纯拒绝虽然保住了老数据，但活会话的新消息会永远存不进去——
+    每次重启都退回老历史，用户看到的是「回复错乱/内容反复」。
+    合并后两边都不丢：老历史保底，新消息按需追加。
+    """
     with _SESS_WRITE_LOCK:
-        title = "新会话"
-        for m in hist:
-            if m.get("role") == "user":
-                title = (str(m.get("content") or "")).strip()[:24] or "新会话"
-                break
+        if sid in _deleted_sids:
+            # 会话已删除：迟到的落盘一律作废，否则等于把删掉的会话又变出来
+            return
+        write_hist = hist
         p = _sess_path(sid)
         created = None
         old_n = 0
+        old_hist = None
         if p.exists():
             try:
                 old = json.loads(p.read_text(encoding="utf-8"))
                 created = old.get("created")
-                old_n = len(old.get("history") or [])
+                old_hist = old.get("history") or []
+                old_n = len(old_hist)
             except Exception:
                 pass
 
-        # 防覆盖：磁盘里有大段历史，这次却要写进少得多的内容时，先把原文件留一份。
-        # 后端被重复拉起、会话在切换瞬间落盘等异常路径都可能导致这种「缩水写」，
-        # 用户视角就是「聊天记录丢了」——留个 .bak 至少还能救回来。
         new_n = len(hist)
-        if old_n >= 6 and new_n < old_n / 2:
-            bak = p.with_name(p.name + ".bak")
+        # 内存为空 = 刚建的新会话，绝不能拿磁盘老历史来「补全」；
+        # 也绝不能让空内容覆盖磁盘。两种情况都是直接拒绝写入。
+        if allow_merge and new_n == 0 and old_n > 0:
+            print(f"[DeckMeido] 拒绝空写入：会话 {sid} 磁盘有 {old_n} 条，"
+                  f"内存为空，保持磁盘内容不变", file=sys.stderr)
+            return
+        if allow_merge and old_n >= 6 and new_n < old_n / 2 and old_hist:
+            # 判为「缩水写」：留档 + 合并，而不是覆盖
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            bak = p.with_name(p.name + f".shrunk-{stamp}-{os.getpid()}")
             try:
                 shutil.copy2(p, bak)
-                print(
-                    f"[DeckMeido] 会话 {sid} 历史从 {old_n} 条缩到 {new_n} 条，"
-                    f"已备份到 {bak.name}",
-                    file=sys.stderr,
-                )
             except Exception:
                 pass
+            merged, added = _merge_histories(old_hist, hist)
+            if merged is not None:
+                print(
+                    f"[DeckMeido] 缩水写已合并：会话 {sid} 磁盘 {old_n} 条 / 内存 {new_n} 条"
+                    f" → {len(merged)} 条（追加 {added} 条新消息），原文件留档 {bak.name}",
+                    file=sys.stderr,
+                )
+                write_hist = merged
+            else:
+                print(
+                    f"[DeckMeido] 无法合并：会话 {sid} 磁盘 {old_n} 条 / 内存 {new_n} 条"
+                    f"，保留磁盘内容，原文件留档 {bak.name}",
+                    file=sys.stderr,
+                )
+                write_hist = old_hist
 
-        data = {"id": sid, "title": title,
-                "created": created or time.time(), "updated": time.time(),
-                "history": hist}
+        data = {"id": sid, "created": created or time.time(), "updated": time.time(),
+                "history": write_hist}
+        _set_title(data, write_hist)
         # 压缩游标必须一起落盘：否则重启后模型重新吃到全量历史，
         # 白白撑爆上下文窗口，又要再压缩一遍
         comp = _compact_for(sid)
@@ -457,6 +558,8 @@ def _write_streaming(sid: str, text: str, parts: list[dict] | None = None) -> No
     只存 text 的话，一轮里先说话、再调工具、再说一段的，中途被杀就只剩最后一段。
     """
     with _SESS_WRITE_LOCK:
+        if sid in _deleted_sids:
+            return
         p = _sess_path(sid)
         data: dict = {}
         if p.exists():
@@ -468,6 +571,7 @@ def _write_streaming(sid: str, text: str, parts: list[dict] | None = None) -> No
         data.setdefault("title", "新会话")
         data.setdefault("created", time.time())
         data.setdefault("history", [])
+        _set_title(data, data.get("history") or [])
         data["updated"] = time.time()
         data["_streaming"] = {"text": text, "ts": time.time(),
                               "parts": list(parts or [])}
@@ -530,6 +634,8 @@ def clear_stream(sid: str = "") -> None:
     sid = sid or _turn.get("sid") or current_sid
     _stream_buf.update({"sid": "", "text": "", "last": 0.0, "written": 0, "events": []})
     with _SESS_WRITE_LOCK:
+        if sid in _deleted_sids:
+            return
         p = _sess_path(sid)
         if not p.exists():
             return
@@ -550,6 +656,29 @@ def clear_stream(sid: str = "") -> None:
                 pass
 
 
+_UPLOAD_RE = re.compile(r"!\[[^\]]*\]\((/uploads/[^\s)]+\.(?:png|jpe?g|webp))\)", re.I)
+
+
+def _to_vision_content(text: str):
+    """消息里含上传图片引用时转成多模态 content（供 vision 模型看图）"""
+    matches = _UPLOAD_RE.findall(text)
+    if not matches:
+        return text
+    parts = []
+    for url in matches:
+        fp = STATIC_DIR / url.lstrip("/")
+        if not fp.is_file():
+            continue
+        import base64
+        ext = "jpeg" if fp.suffix.lower() in (".jpg", ".jpeg") else fp.suffix.lstrip(".").lower()
+        b64 = base64.b64encode(fp.read_bytes()).decode()
+        parts.append({"type": "image_url", "image_url": {"url": f"data:image/{ext};base64,{b64}"}})
+    if not parts:
+        return text
+    parts.append({"type": "text", "text": _UPLOAD_RE.sub("[图片]", text)})
+    return parts
+
+
 def init_sessions():
     """启动时恢复最近的会话；没有历史则创建默认会话"""
     global current_sid, history, _ctx_used, _sess_epoch
@@ -557,16 +686,26 @@ def init_sessions():
     if not files:
         save_current_session()
         return
-    try:
-        data = json.loads(files[0].read_text(encoding="utf-8"))
-        current_sid = data.get("id", "default")
-        history = data.get("history", [])
-        # 恢复压缩游标：摘要 + 已压缩到的位置，配合完整 history 使用，
-        # 界面上仍能看到全部记录，模型只吃「摘要 + 后面的原文」
+
+    # 逐个试：以前只认 mtime 最新的那一个，它坏了就 history.clear() 整个重来，
+    # 几十轮历史当场归零。现在坏一个就跳过试下一个，全坏才开新会话。
+    # 注意要排除「空会话文件」：空文件不是损坏，但拿它当恢复结果同样等于清空，
+    # 所以空 history 的文件也当作不合格，继续往旧文件里找。
+    def _restore(data: dict, src: Path) -> bool:
+        """从一个会话文件恢复出完整状态；成功返回 True"""
+        global current_sid, history, _ctx_used
+        sid = data.get("id") or src.stem
+        hist = data.get("history") or []
+        if not isinstance(hist, list) or not hist:
+            return False
+        current_sid = sid
+        history = hist
         comp = data.get("compact")
         if isinstance(comp, dict) and (comp.get("summary") or comp.get("upto")):
-            _set_compact(current_sid, comp.get("summary") or "",
+            _set_compact(sid, comp.get("summary") or "",
                          min(int(comp.get("upto") or 0), len(history)))
+        else:
+            _compact_map.pop(sid, None)
         # 上一轮回答被打断：把当时流式落盘的半截正文恢复成一条「回答中断」的消息，
         # 否则用户只看到自己的提问，像是回答凭空消失了
         partial = data.pop("_streaming", None)
@@ -606,14 +745,34 @@ def init_sessions():
                 _write_session(current_sid, history)
             except Exception as e:
                 print(f"[DeckMeido] 恢复中断回答后落盘失败：{e}", file=sys.stderr)
-    except Exception:
-        # 文件损坏：先留个备份再重开会话，别让一个坏文件把关掉的历史彻底毁掉
+        print(f"[DeckMeido] 已从 {src.name} 恢复会话 {current_sid}（{len(history)} 条）",
+              file=sys.stderr)
+        return True
+
+    for f in files:
         try:
-            files[0].rename(files[0].with_name(files[0].name + ".broken"))
-        except OSError:
-            pass
-        history.clear()
-        save_current_session()
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except Exception as e:
+            # 单个文件损坏：留个备份，继续试下一个，别让一个坏文件把历史全毁了
+            print(f"[DeckMeido] 会话文件 {f.name} 解析失败（{e}），已留档并尝试下一个",
+                  file=sys.stderr)
+            try:
+                f.rename(f.with_name(f.name + ".broken"))
+            except OSError:
+                pass
+            continue
+        try:
+            if _restore(data, f):
+                return
+        except Exception as e:
+            print(f"[DeckMeido] 从 {f.name} 恢复失败（{e}），尝试下一个", file=sys.stderr)
+            continue
+
+    # 全部不可用：开一个全新会话顶上（换随机 sid，避免和目录里残存的旧文件撞号）
+    current_sid = _fresh_sid()
+    history = []
+    _ctx_used = 0
+    save_current_session()
 
 
 init_sessions()
@@ -740,6 +899,8 @@ def get_status() -> dict:
         # 控制类控件（点击输入/窗口聚焦/原生打字/构建依赖）的实测结果，
         # 前端在电量徽章左侧显示成「x/x + 绿灯/黄灯/红灯」
         "controls": depcheck.summary(),
+        # 桌面模式下执行命令/亮遮罩时是否正压着「别息屏」（前端不展示，排障用）
+        "keep_awake": power.keeper.status(),
     }
 
 
@@ -770,7 +931,6 @@ class ChatRequest(BaseModel):
     message: str
 
 
-_UPLOAD_RE = re.compile(r"!\[[^\]]*\]\((/uploads/[^\s)]+\.(?:png|jpe?g|webp))\)", re.I)
 _CTX_RE = re.compile(r"@\{([^}]+)\}")
 
 
@@ -785,40 +945,83 @@ def _expand_context(text: str) -> str:
             return f"\n[文件 {p} 的内容]：\n```\n{body}\n```\n"
         except OSError as e:
             return f"\n[文件 {p} 读取失败：{e}]\n"
-    return _CTX_RE.sub(_expand_context, text) if "@{" in text else text
+    return _CTX_RE.sub(repl, text) if "@{" in text else text
 
 
-def _to_vision_content(text: str):
-    """消息里含上传图片引用时转成多模态 content（供 vision 模型看图）"""
-    matches = _UPLOAD_RE.findall(text)
-    if not matches:
-        return text
-    parts = []
-    for url in matches:
-        fp = STATIC_DIR / url.lstrip("/")
-        if not fp.is_file():
-            continue
-        import base64
-        ext = "jpeg" if fp.suffix.lower() in (".jpg", ".jpeg") else fp.suffix.lstrip(".").lower()
-        b64 = base64.b64encode(fp.read_bytes()).decode()
-        parts.append({"type": "image_url", "image_url": {"url": f"data:image/{ext};base64,{b64}"}})
-    if not parts:
-        return text
-    parts.append({"type": "text", "text": _UPLOAD_RE.sub("[图片]", text)})
-    return parts
+_IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_TEXT_EXT = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", ".sh",
+             ".yml", ".yaml", ".toml", ".ini", ".cfg", ".xml", ".html", ".css",
+             ".c", ".h", ".cpp", ".rs", ".go", ".java", ".sql", ".conf"}
+# 单个附件上限，防止一次拖进几个 G 的文件把服务拖死
+_UPLOAD_MAX = 20 * 1024 * 1024
+
+
+def _extract_text(raw: bytes, ext: str):
+    """尽量把文档抽成纯文本；抽不出来返回 None（按二进制附件处理）"""
+    if ext in _TEXT_EXT:
+        return raw.decode("utf-8", errors="replace")
+    if ext == ".docx":
+        # docx 就是个 zip，正文在 word/document.xml，去掉标签即可
+        import io
+        import zipfile
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                xml = z.read("word/document.xml").decode("utf-8", errors="replace")
+        except (KeyError, zipfile.BadZipFile, OSError):
+            return None
+        xml = xml.replace("</w:p>", "\n")
+        return re.sub(r"<[^>]+>", "", xml).strip()
+    if ext == ".pdf":
+        # 有 pdftotext 就抽文字层，没有就算了
+        try:
+            r = subprocess.run(["pdftotext", "-q", "-", "-"], input=raw,
+                               capture_output=True, timeout=25)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode != 0:
+            return None
+        return r.stdout.decode("utf-8", errors="replace") or None
+    return None
 
 
 @app.post("/api/upload", dependencies=[Depends(check_token)])
 async def api_upload(file: UploadFile):
-    """上传图片附件（随消息一起发给模型）"""
-    up = STATIC_DIR / "uploads"
-    up.mkdir(exist_ok=True)
-    ext = Path(file.filename or "img.png").suffix.lower() or ".png"
-    if ext not in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
-        ext = ".png"
-    name = f"up_{int(time.time())}{ext}"
-    (up / name).write_bytes(await file.read())
-    return {"url": f"/uploads/{name}"}
+    """上传附件。
+
+    图片 → static/uploads/，返回 /uploads/xxx.png，前端插成 ![图片](url) 走多模态；
+    其他文件 → 工作区 uploads/，返回相对工作区的路径，前端插成 @{uploads/xxx}，
+    由 _expand_context 带上正文（文本类直接读，docx/pdf 现抽文字）。
+    """
+    raw = await file.read()
+    if len(raw) > _UPLOAD_MAX:
+        raise HTTPException(status_code=413, detail="文件超过 20MB")
+    fn = Path(file.filename or "file")
+    ext = fn.suffix.lower()
+    stem = re.sub(r"[^\w\-.]+", "_", fn.stem)[:40] or "file"
+    ts = int(time.time())
+
+    if ext in _IMG_EXT or not ext:
+        ext = ext if ext in _IMG_EXT else ".png"
+        up = STATIC_DIR / "uploads"
+        up.mkdir(exist_ok=True)
+        name = f"up_{ts}{ext}"
+        (up / name).write_bytes(raw)
+        return {"url": f"/uploads/{name}", "kind": "image", "name": fn.name}
+
+    up = tools.WORKSPACE / "uploads"
+    up.mkdir(parents=True, exist_ok=True)
+    body = _extract_text(raw, ext)
+    if body is not None:
+        # 有文字层就存成 .txt，@{} 展开时不会喂二进制给模型
+        keep = up / f"{ts}_{stem}.txt"
+        keep.write_text(f"# {fn.name}\n\n{body}", encoding="utf-8")
+        kind = "text"
+    else:
+        keep = up / f"{ts}_{stem}{ext}"
+        keep.write_bytes(raw)
+        kind = "binary"
+    rel = str(keep.relative_to(tools.WORKSPACE))
+    return {"url": f"/uploads/{keep.name}", "path": rel, "kind": kind, "name": fn.name}
 
 
 @app.get("/api/files", dependencies=[Depends(check_token)])
@@ -1139,12 +1342,16 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
     # 所以这里拿到的引用在被切走之后依然只属于这一轮
     hist = history
     sid_tag = {"sid": turn_sid}
+    # 同一次调用取一个时间戳，同时用于「广播给界面的 ts」和「历史里的 ts」。
+    # 前端删除消息时靠这个 ts 找回后端对应的那条：两处各自 time.time() 会差几毫秒，
+    # 按 ts 精确匹配就永远对不上，删除按钮会退化成「删最后一条同角色消息」
+    user_ts = time.time()
     if announce:
-        await manager.broadcast({"type": "user_message", "text": text, "ts": time.time(), **sid_tag})
+        await manager.broadcast({"type": "user_message", "text": text, "ts": user_ts, **sid_tag})
         feed_push("user_message", text=text)
     # @{文件} 展开为内容；图片标记在 run_agent 里转成多模态 content
     hist.append({"role": "user", "content": text, "llm": _expand_context(text),
-                 "ts": time.time()})
+                 "ts": user_ts})
     events: list[dict] = []
     # 标题取自第一条用户消息，所以用户一发出就落盘并刷新侧栏，不必等整轮回答结束
     save_session_snapshot(turn_sid, hist)
@@ -1203,8 +1410,11 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
     finally:
         set_overlay(False)
 
+    # 助手消息同样只取一次时间戳：落盘用的和广播给界面的是同一个值，
+    # 前端按 data-ts 删除才能精确命中这一条
+    asst_ts = time.time()
     hist.append({"role": "assistant", "content": reply, "events": events,
-                 "ts": time.time()})
+                 "ts": asst_ts})
     # 关键：写回「本轮所属」的会话文件。中途被切走时 current_sid 已经指向别处，
     # 用 save_current_session 会把这一轮错写进新会话（串回复的根源）
     save_session_snapshot(turn_sid, hist)
@@ -1212,7 +1422,14 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
     clear_stream(turn_sid)
     detached = _turn_detached(turn_epoch)
     _turn["active"] = False
-    if not detached and reply.strip():
+    turn_deleted = turn_sid in _deleted_sids
+    if turn_deleted:
+        # 这一轮跑到一半会话被删了：结果按用户意愿丢弃，但要明确告知，
+        # 否则用户看到的是「回答消失了」
+        await manager.broadcast({"type": "system", "text": "该会话已被删除，本轮回答未保存",
+                                 "ts": time.time()})
+        feed_push("system", text="该会话已被删除，本轮回答未保存")
+    if not detached and not turn_deleted and reply.strip():
         # 给前端一次「最终正文」：带 final=True，前端据此把那句界面上的气泡存进
         # localStorage 崩溃缓冲。中途被截断的工具过渡话不带这个标记，回滚时不会残留
         await manager.broadcast({"type": "delta", "text": "", "final": True,
@@ -1224,7 +1441,7 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
                                  "ts": time.time()})
         feed_push("system", text="上一轮对话已完成，结果保存在原会话中")
     else:
-        await manager.broadcast({"type": "assistant_message", "text": reply, "ts": time.time(),
+        await manager.broadcast({"type": "assistant_message", "text": reply, "ts": asst_ts,
                                  "events": events, **sid_tag})
         feed_push("assistant_message", text=reply, events=events)
         # 语音播报：只播报最终回复，不播报思维链/工具过程（后台进行，不阻塞）
@@ -1273,6 +1490,9 @@ async def compact_history(auto: bool = False, hist: list[dict] | None = None,
         save_current_session()
     else:
         save_session_snapshot(sid, hist)
+    if sid in _deleted_sids:
+        # 压缩摘要别往已删除的会话上写系统提示
+        return summary
     note = (f"{'已自动压缩上下文' if auto else '已压缩上下文'}"
             f"（{len(old)} 条旧消息 → 摘要，聊天记录完整保留）")
     await manager.broadcast({"type": "system", "text": note, "ts": time.time()})
@@ -1286,20 +1506,58 @@ async def api_compact():
     return {"ok": True, "summary": summary[:300]}
 
 
+def _sd_card_info() -> dict:
+    """内存卡占用：找 /dev/mmcblk* 分区（SteamOS 自动挂在 /run/media/<用户>/<卷名>）
+
+    没插卡就返回空 dict，前端据此整行隐藏。
+    """
+    import psutil
+    try:
+        parts = psutil.disk_partitions(all=True)
+    except Exception:
+        return {}
+    for part in parts:
+        if not part.device.startswith("/dev/mmcblk"):
+            continue
+        try:
+            du = psutil.disk_usage(part.mountpoint)
+        except OSError:
+            continue
+        mount = part.mountpoint.rstrip("/")
+        return {
+            "sd_label": os.path.basename(mount) or mount,
+            "sd_mount": mount,
+            "sd_pct": du.percent, "sd_used": du.used, "sd_total": du.total,
+        }
+    return {}
+
+
 @app.get("/api/sysinfo", dependencies=[Depends(check_token)])
 async def api_sysinfo():
-    """侧栏状态卡：CPU / 内存 / 硬盘占用 / 运行时长 / 局域网 IP"""
+    """侧栏状态卡：CPU / 内存 / SSD / 内存卡占用 / 电量 / 运行时长 / 局域网 IP"""
     try:
         import psutil
         vm = psutil.virtual_memory()
-        du = psutil.disk_usage("/home")  # SteamOS 根分区只读且小，用户数据在 /home
-        return {
+        data = {
             "cpu": psutil.cpu_percent(),
             "mem_pct": vm.percent, "mem_used": vm.used, "mem_total": vm.total,
-            "disk_pct": du.percent, "disk_used": du.used, "disk_total": du.total,
             "uptime": int(time.time() - psutil.boot_time()),
             "ip": _lan_ip(),
+            # 设备名：优先用户自己设的 hostname（SteamOS 默认 deck@steamdeck）
+            "hostname": socket.gethostname(),
         }
+        # 内置盘：SteamOS 根分区只读且很小，用户数据都在 /home，看它才有意义
+        try:
+            du = psutil.disk_usage("/home")
+            data.update({"ssd_pct": du.percent, "ssd_used": du.used, "ssd_total": du.total})
+        except OSError:
+            pass
+        battery = read_first("/sys/class/power_supply/BAT1/capacity")
+        charging = read_first("/sys/class/power_supply/BAT1/status")
+        data["battery"] = int(battery) if battery.isdigit() else None
+        data["charging"] = charging or None
+        data.update(_sd_card_info())
+        return data
     except Exception as e:
         return {"error": str(e)}
 
@@ -1339,7 +1597,7 @@ async def api_sessions():
 async def api_session_create():
     global current_sid, history, _ctx_used, _sess_epoch
     save_current_session()
-    current_sid = secrets.token_hex(4)
+    current_sid = _fresh_sid()
     # 换对象而不是原地 clear：还在跑的那一轮持有旧列表引用，
     # 原地清空会把它的历史一起抹掉，结果就变成「有问无答」
     history = []
@@ -1385,23 +1643,121 @@ async def api_session_switch(req: SwitchReq):
     return {"ok": True}
 
 
+class MsgDeleteReq(BaseModel):
+    ts: float | None = None          # 按消息时间戳定位（前端每条消息都带 data-ts）
+    role: str = "assistant"          # 兜底：没有 ts 时按角色删最后一条
+    with_reply: bool = False         # 删用户消息时，连它下面那条回答一起删
+
+
+@app.post("/api/messages/delete", dependencies=[Depends(check_token)])
+async def api_message_delete(req: MsgDeleteReq):
+    """删除会话里的单条消息。
+
+    只从「当前会话的历史」里摘掉那一条，并立刻落盘；不发 history 全量重推，
+    否则整屏会重绘、滚动位置跳到顶上。前端自己把 DOM 上的那条摘掉即可。
+
+    为什么按 ts 定位而不是按序号：界面上的顺序和 history 不完全一一对应
+    （一轮助手回答在界面上可能拆成 思考/正文/工具 好几块，但在 history 里
+    只有一条），用序号会删错行。ts 是每条消息落盘时就写进去的，唯一且稳定。
+    """
+    global _ctx_used
+    if _turn.get("active"):
+        raise HTTPException(status_code=409, detail="本轮回答还在生成，请等它结束再删除")
+
+    hidx = -1
+    if req.ts:
+        # 时间戳浮点比较留一点容差：JSON 往返可能丢精度
+        best = None
+        for i, m in enumerate(history):
+            t = m.get("ts")
+            if not isinstance(t, (int, float)):
+                continue
+            if abs(float(t) - float(req.ts)) <= 0.001:
+                best = i
+                break
+        hidx = best if best is not None else -1
+    if hidx < 0:
+        # 没有匹配到 ts：退化成「删同角色最后一条」，避免前端按钮完全失效
+        want = req.role if req.role in ("user", "assistant") else "assistant"
+        for i in range(len(history) - 1, -1, -1):
+            if history[i].get("role") == want:
+                hidx = i
+                break
+    if hidx < 0:
+        raise HTTPException(status_code=404, detail="找不到这条消息")
+
+    target = history[hidx]
+    removed = 1
+    # 删用户消息时，把紧跟着的那条助手回答一起带走：
+    # 只删提问留着回答，模型下次读历史会看到「没有问题的答案」，很容易胡接
+    if req.with_reply and target.get("role") == "user":
+        if hidx + 1 < len(history) and history[hidx + 1].get("role") == "assistant":
+            del history[hidx + 1]
+            removed += 1
+    del history[hidx]
+
+    # 压缩游标要跟着收：否则游标指向的条数比历史还长，
+    # 发给模型的上下文会整段错位（摘要跳过了还没被摘要的消息）
+    sid = current_sid
+    comp = _compact_for(sid)
+    if comp["upto"] > len(history):
+        _set_compact(sid, comp["summary"], len(history))
+
+    save_current_session()
+    _ctx_used = _estimate_tokens(_build_llm_msgs(history, SYSTEM_PROMPT, current_sid))
+    await manager.broadcast({"type": "session_changed", "current": current_sid})
+    return {"ok": True, "removed": removed, "left": len(history)}
+
+
 @app.delete("/api/sessions/{sid}", dependencies=[Depends(check_token)])
 async def api_session_delete(sid: str):
     global current_sid, history, _ctx_used, _sess_epoch
+    # 先拉黑再删文件：反过来的话，删完到拉黑之间那一瞬间的落盘（流式回调）
+    # 就能把文件写回来，等于白删
+    _deleted_sids.add(sid)
     p = _sess_path(sid)
     if p.exists():
-        p.unlink()
+        try:
+            p.unlink()
+        except OSError as e:
+            _deleted_sids.discard(sid)
+            raise HTTPException(status_code=500, detail=f"删除失败：{e}")
     if sid == current_sid:
-        # 删掉的是当前会话：开一个全新会话顶上
-        current_sid = secrets.token_hex(4)
-        history = []
-        _ctx_used = 0
+        # 删掉的是当前会话。以前这里无条件 _fresh_sid() 再落盘一个空会话，
+        # 于是「删一个」必然「多一个」；现在先试着切到剩下最新的那个，
+        # 真的一个都不剩了才新建（且标题带时间，不再和别的「新会话」重名）
         _sess_epoch += 1
         _turn["active"] = False
-        save_current_session()
+        rest = []
+        for f in sorted(SESSIONS_DIR.glob("*.json"),
+                        key=lambda x: x.stat().st_mtime, reverse=True):
+            try:
+                d = json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if (d.get("id") or f.stem) in _deleted_sids:
+                continue
+            rest.append(d)
+        nxt = next((d for d in rest if d.get("history")), None)
+        if nxt is None:
+            current_sid = _fresh_sid()
+            history = []
+            _ctx_used = 0
+            save_current_session()
+        else:
+            current_sid = nxt.get("id") or _fresh_sid()
+            # 换对象而不是原地 clear：在跑的那一轮仍持有旧列表引用
+            history = nxt.get("history") or []
+            comp = nxt.get("compact")
+            if isinstance(comp, dict) and (comp.get("summary") or comp.get("upto")):
+                _set_compact(current_sid, comp.get("summary") or "",
+                             min(int(comp.get("upto") or 0), len(history)))
+            else:
+                _compact_map.pop(current_sid, None)
+            _ctx_used = _estimate_tokens(_build_llm_msgs(history, SYSTEM_PROMPT, current_sid))
         await manager.broadcast({"type": "history", "messages": history, "sid": current_sid})
         await manager.broadcast({"type": "session_changed", "current": current_sid})
-    return {"ok": True}
+    return {"ok": True, "current": current_sid}
 
 
 # 旧接口兼容：新会话
@@ -1631,11 +1987,16 @@ def set_overlay(show: bool, text: str = "") -> None:
     if not show:
         _overlay_state["passthrough"] = False
         _overlay_state["since"] = 0.0
+        # 遮罩收起：不再需要为它压着电源抑制（命令还在跑的话那条原因仍在，
+        # 计数归零才真的释放，见 power.AwakeKeeper）
+        power.keeper.release("overlay")
     else:
         # 记下「从什么时候开始要它亮」。看门狗据此判断是不是有哪条异常路径
         # 漏了 set_overlay(False)，把遮罩永远留在屏幕上。
         if not _overlay_state.get("since"):
             _overlay_state["since"] = time.time()
+        # 遮罩亮着 = 用户可能正盯着看操作过程，别在这时候息屏
+        power.keeper.hold("overlay", text or "正在操作设备")
         ensure_overlay()
 
 
@@ -1772,6 +2133,11 @@ async def _boot_overlay():
 async def _shutdown_overlay():
     # 服务被重启/停止时把自己拉起的遮罩一起收掉，别留孤儿
     stop_overlay()
+    # 电源抑制也一起放掉，别让下一个进程/系统替我们背着
+    try:
+        power.keeper.shutdown()
+    except Exception:
+        pass
     # 退出前抢救一次：正在生成的正文与内存历史立刻落盘。
     # 客户端退出、systemctl restart、升级重启都走这条路径，
     # 少了这一步，被打断的那一轮回答就会整段消失（用户视角就是「记录丢了」）

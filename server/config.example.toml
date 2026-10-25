@@ -32,6 +32,11 @@ context_window = 0
 # 上下文占用达到该比例时自动压缩（0.95 = 95%）
 compact_ratio = 0.95
 
+[power]
+# 桌面模式下 DeckMeido 正在执行命令或显示操作遮罩时，阻止息屏与休眠
+# （游戏模式下完全不干预，交给 Steam 自己管电源）
+keep_awake = true
+
 [persona]
 # 人格设定：改这里就能换人格，重启生效
 name = "DeckMeido"

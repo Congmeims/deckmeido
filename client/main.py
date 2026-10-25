@@ -18,7 +18,7 @@ import urllib.request
 import hashlib
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, QUrl
+from PySide6.QtCore import QEvent, QLibraryInfo, QObject, Qt, QTimer, QTranslator, QUrl
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
@@ -239,10 +239,42 @@ def acquire_single_instance() -> QLocalServer | None:
     return server
 
 
+def install_translators(app: QApplication) -> None:
+    """给 Qt 内置界面（右键菜单、对话框等）装上中文翻译
+
+    QWebEngineView 的右键菜单（Reload / Save page / Back…）是 Qt/Chromium
+    自带的，不走网页内容，所以改网页没用——必须在 QApplication 上装
+    QTranslator 才能变成中文。翻译 .qm 随 PySide6 一起装着，只是没人加载。
+    """
+    # 允许用 DECKMEIDO_QT_LANG 覆盖，默认跟随系统；系统若为英文则退回 zh_CN
+    lang = os.environ.get("DECKMEIDO_QT_LANG")
+    if not lang:
+        for var in ("LANG", "LC_ALL", "LC_MESSAGES"):
+            val = os.environ.get(var, "")
+            if val.lower().startswith("zh"):
+                lang = "zh_CN" if "cn" in val.lower() or "hans" in val.lower() else "zh_TW"
+                break
+    if not lang:
+        lang = "zh_CN"
+
+    base = os.environ.get("DECKMEIDO_QT_TRANSLATIONS") or QLibraryInfo.path(
+        QLibraryInfo.LibraryPath.TranslationsPath
+    )
+    # Qt 本体 + WebEngine（右键菜单在 WebEngine 里）+ 基础控件，三个都要装
+    for stem in ("qtbase", "qtwebengine", "qt", "qtmultimedia", "qtwebsockets"):
+        path = os.path.join(base, f"{stem}_{lang}.qm")
+        if not os.path.exists(path):
+            continue
+        tr = QTranslator(app)
+        if tr.load(path):
+            app.installTranslator(tr)
+
+
 def main() -> int:
     QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setApplicationName("DeckMeido")
+    install_translators(app)
     # 关掉窗口时先最小化到托盘，由托盘菜单决定是否真退出
     app.setQuitOnLastWindowClosed(False)
 
@@ -293,6 +325,8 @@ def main() -> int:
     view = QWebEngineView()
     view.setPage(WebPage(view))
     view.setWindowTitle("DeckMeido")
+    # 屏蔽网页区右键菜单（Reload/Save page 等 Qt 自带项，在本客户端无用）
+    view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
     view.resize(WINDOW_W, WINDOW_H)
     icon_path = DECKMEIDO_DIR / "assets" / "logo.png"
     icon = QIcon(str(icon_path)) if icon_path.exists() else QIcon()

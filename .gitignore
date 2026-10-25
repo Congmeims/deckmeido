@@ -29,3 +29,13 @@ uninstall.sh
 
 # 上传的图片（运行时产物）
 server/static/uploads/
+
+# 编辑过程中的临时备份（*.bak-*、*.bak-时间戳、_backup_*/）
+*.bak-*
+*.bak
+_backup_*/
+server/*.bak*
+server/static/*.bak*
+server/backup*.log*
+server/backend.log*
+server/static/_logo_prev.png

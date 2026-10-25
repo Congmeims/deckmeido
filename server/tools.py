@@ -14,6 +14,8 @@ from pathlib import Path
 
 import httpx
 
+from . import power
+
 HTTP = httpx.AsyncClient(timeout=20, follow_redirects=True)
 
 # ---------- 工具中文名（界面提示统一用中文，不暴露内部函数名） ----------
@@ -1234,11 +1236,28 @@ EXECUTORS = {
 }
 
 
+# 不需要「保持常亮」的工具：查天气、联网搜索、读写文件这类不碰屏幕也不动
+# 设备状态的动作，几毫秒就结束，挂抑制反而是白折腾（每次都 fork 两个外部命令）
+_NO_KEEP_AWAKE = {
+    "get_weather", "web_search", "find_game", "list_installed_games",
+    "list_emulator_roms", "check_system_updates", "screenshot",
+}
+
+
 async def execute(name: str, args: dict) -> str:
     fn = EXECUTORS.get(name)
     if not fn:
         return f"未知工具：{name}"
+    # 执行期间别让屏幕黑掉/机器睡着：run_command 可能跑几分钟，
+    # 用户回来看到的应该是进度，而不是一个锁屏界面。
+    # 桌面模式判断和非空原因计数都在 power 里，游戏模式/纯查询工具会自动跳过。
+    keep = name not in _NO_KEEP_AWAKE
+    if keep:
+        power.keeper.hold("command", f"正在{cn_name(name)}")
     try:
         return await fn(**args)
     except Exception as e:
         return f"工具 {name} 执行失败：{e}"
+    finally:
+        if keep:
+            power.keeper.release("command")
