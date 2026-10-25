@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import tempfile
 from pathlib import Path
 
@@ -354,6 +355,66 @@ def _fix_display_env(env: dict):
     env.setdefault("KDE_SESSION_VERSION", "6")
 
 
+# 正在跑的 run_command 子进程。取消靠 asyncio 的 CancelledError 传播，
+# 但只要有一处 await 被卡住，那一条取消链就断了；这里留一份登记表，
+# 让「终止」还能沿着它把进程树直接砍掉（不依赖任务本身是否响应取消）
+_LIVE_PROCS: set[asyncio.subprocess.Process] = set()
+
+
+async def abort_all_procs(grace: float = 2.0) -> int:
+    """杀掉所有登记在案的子进程树，返回处理条数（终止按钮的第二道保险）"""
+    procs = list(_LIVE_PROCS)
+    for p in procs:
+        try:
+            await _kill_tree(p, grace)
+        except Exception:
+            pass
+        _LIVE_PROCS.discard(p)
+    return len(procs)
+
+
+async def _kill_tree(proc: asyncio.subprocess.Process, grace: float = 2.0) -> None:
+    """杀掉整棵进程树，绝不能只 kill 直接子进程。
+
+    这里踩过一个很隐蔽的坑：`run_command` 用 `bash -c` 跑命令，`proc.kill()`
+    只杀掉 bash 本身，孙子进程（`sleep`、`cat`、`spectacle` 之类）还活着并继续
+    占着继承来的 stdout 管道。于是随后的 `await proc.wait()` 永远等不到管道 EOF，
+    用户点了「终止」之后这一轮就卡在 finally 里出不来 —— 表现就是：
+    网页上点了终止，界面还一直显示「正在执行」，遮罩也不撤，必须刷新页面。
+
+    修法：子进程是用 start_new_session=True 起的，本身就是新会话首进程，
+    所以 os.killpg 能一次带走整组。先 SIGTERM 让进程有机会自己收尾，
+    超时再 SIGKILL 兜底。
+    """
+    if proc.returncode is not None:
+        return
+    pgid = None
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError):
+        pgid = None
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            if pgid is not None:
+                os.killpg(pgid, sig)
+            else:
+                proc.send_signal(sig)
+        except (ProcessLookupError, PermissionError):
+            break
+        try:
+            # 管道被孙进程占着时 wait() 可能一直不返回，所以这里必须带超时；
+            # 超时说明还有进程活着，交给下一轮 SIGKILL
+            await asyncio.wait_for(proc.wait(), grace)
+            return
+        except asyncio.TimeoutError:
+            continue
+    # 走到这里说明进程组已不属于我们（或已退出但 wait 没回来），兜底回收一次
+    try:
+        await asyncio.wait_for(proc.wait(), 1.0)
+    except (asyncio.TimeoutError, ProcessLookupError):
+        pass
+
+
 async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin: str = "") -> str:
     timeout = max(1, min(int(timeout or 60), 300))
     env = dict(os.environ)
@@ -383,6 +444,7 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
         executable="/bin/bash",
         start_new_session=True,
     )
+    _LIVE_PROCS.add(proc)
     launcher = group_file is not None
     launch_wait = 3.0
     # 真·超时（命令卡死）要杀掉；启动器等满 launch_wait 只是「它在常驻运行」，不能杀
@@ -399,19 +461,23 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
             launcher_done = True
             out, _ = await asyncio.wait_for(proc.communicate(feed), timeout)
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        await _kill_tree(proc)
         return (f"命令超时（{timeout}s），已强制终止。\n"
                 "提示：若命令需要多次交互输入，请在 stdin 里按行准备好全部答案；"
                 "若是长任务，请用 nohup ... > /tmp/日志 2>&1 & 放后台")
     except asyncio.CancelledError:
-        # 用户点了终止：杀掉进程并向上传递取消
-        proc.kill()
-        await proc.wait()
-        raise
+        # 用户点了终止：整棵进程树一起杀，并向上传递取消。
+        # 注意这里不能因为清理失败而吞掉 CancelledError，否则外层会以为「正常结束」
+        try:
+            await _kill_tree(proc)
+        finally:
+            raise
     finally:
         # 点击已经发完，遮罩恢复接收点击，用户仍可随时点一下终止
         await _set_overlay_passthrough(False)
+        # 这一轮的 await 链已经走完，从登记表里摘掉：
+        # 不摘的话「终止」的二次保险会去砍已经交差的、甚至用户故意留着常驻的程序
+        _LIVE_PROCS.discard(proc)
     text = out.decode("utf-8", "replace").strip()
     if stdin:
         # 伪终端会回显输入，把疑似密码的行打码（短输入如菜单选项保留）
@@ -431,8 +497,7 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
                 pass
             group_file.unlink(missing_ok=True)
         if not started:
-            proc.kill()
-            await proc.wait()
+            await _kill_tree(proc)
             return ("命令没有正常启动（进程已退出且没有留下运行中的程序）。"
                     f"\n{text}" if text else "命令没有正常启动（进程已退出且没有留下运行中的程序）。")
         msg = f"已在后台启动（等了 {launch_wait:.0f}s 程序仍在前台运行，判定为常驻程序，已放它继续跑）。"

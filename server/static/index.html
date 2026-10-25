@@ -974,6 +974,15 @@
   var reconnectTimer = null;
   var backoff = 1000;
 
+  // 当前会话号（会话列表加载后回填）。提前声明：WS 消息回调里要用它做过期判定
+  var currentSid = null;
+  // 手动终止后的静默窗口：这段时间内不因 status.running 重新点亮终止态
+  var cancelGuardUntil = 0;
+  // 属于「某一轮对话」的消息类型：这些才需要按会话号过滤
+  var TURN_SCOPED = ['user_message', 'stream_start', 'delta', 'thought_start',
+                     'thought_delta', 'thought_end', 'tool_done', 'tool_activity',
+                     'assistant_message'];
+
   function fmtTime(ts) {
     var d = ts ? new Date(ts * 1000) : new Date();
     return d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0');
@@ -1286,9 +1295,18 @@
     ws.onmessage = function (ev) {
       var msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      // 会话代次过滤：别的端切了会话后，正在跑的那一轮还会继续往外吐流式片段。
+      // 这些片段不属于当前屏幕上的会话，丢弃，否则新会话里会冒出上一轮的回答。
+      // 注意只过滤「本轮对话产物」，history / session_changed / status 必须放行，
+      // 否则切会话后本端会一直停在旧会话上不同步
+      if (msg.sid && currentSid && msg.sid !== currentSid
+          && TURN_SCOPED.indexOf(msg.type) >= 0) return;
       switch (msg.type) {
         case 'history':
+          if (msg.sid) currentSid = msg.sid;
           messages.innerHTML = '';
+          // 清空后必须重算按钮：否则切会话/新连接时，上一轮残留的终止态会一直挂着
+          updateSendBtn();
           (msg.messages || []).forEach(function (m) {
             // 用户消息不落时间戳，助手消息带上事件（截屏图/搜索/终端输出），刷新后才不会丢
             addMsg(m.role === 'user' ? 'user' : 'assistant', m.content, m.ts,
@@ -1305,6 +1323,8 @@
           break;
         case 'user_message':
           hideTyping();
+          cancelGuardUntil = 0;   // 新的一轮真的开始了，取消静默窗口失效
+          setBusy(true);          // 别的端发起的任务，这边也要能一键叫停
           addMsg('user', msg.text, msg.ts);
           liveBox = document.createElement('div');
           liveBox.className = 'events';
@@ -1602,14 +1622,21 @@
 
   function renderStatus(s) {
     renderControls(s.controls);
-    // 重连后的第一次状态回报：对齐「服务端是否还在跑」，
-    // 空闲就把断联期间暂存的队列补发出去，运行中就继续保持终止态
-    if (awaitingResync) {
-      awaitingResync = false;
-      if (s.running) {
-        setBusy(true);
+    // 服务端只要还在跑，前端就保持终止态 —— 哪怕是别的端（手机/桌面客户端）
+    // 发起的任务，主人在这边也能一键叫停。
+    var guarding = Date.now() < cancelGuardUntil;
+    if (s.running && !guarding) {
+      if (awaitingResync) {
+        awaitingResync = false;
         showTyping('已重连，等待服务端处理完这一轮…');
-      } else {
+      }
+      if (!busy) setBusy(true);
+    } else if (!s.running) {
+      // 只在对账（重连回来第一次 status）时用服务端状态复位本地忙碌态，
+      // 平时不乱清 busy：doSend 刚发出、服务端还没建好 task 的瞬间收到
+      // 一条「未运行」的 status，会把刚点亮的终止态误掐掉
+      if (awaitingResync) {
+        awaitingResync = false;
         setBusy(false);
         flushQueue(false);
       }
@@ -1726,13 +1753,18 @@
   }
 
   function updateSendBtn() {
-    // 运行中且输入框为空 → 「终止」；运行中但有文字 → 发送（排队）
-    if (busy && !input.value.trim()) {
+    // 只要 agent 在跑就一直是「终止」——主人希望任何时刻都能一键叫停。
+    // 排队改由回车承担，跟输入框里有没有字无关。
+    if (busy) {
       sendBtn.textContent = '终止';
       sendBtn.classList.add('stop');
+      sendBtn.title = '终止当前操作（输入框里按回车 = 加入队列）';
+      input.placeholder = '按回车加入队列，等这一轮结束自动发送';
     } else {
       sendBtn.textContent = '发送';
       sendBtn.classList.remove('stop');
+      sendBtn.title = '';
+      input.placeholder = '@ 添加上下文，/ 使用命令';
     }
   }
 
@@ -1786,36 +1818,50 @@
     setBusy(true);
   }
 
-  function send() {
+  // 排队：agent 运行中按回车把输入框内容塞进队列
+  function enqueueInput() {
     var text = input.value.trim();
-    if (busy) {
-      if (text) {
-        // agent 运行中：排队等待发送（Trae 式）
-        msgQueue.push({ id: ++qid, text: text });
-        renderQueue();
-        input.value = '';
-        input.style.height = 'auto';
-        updateSendBtn();
-        input.focus();
-      } else {
-        // 输入框为空：终止当前操作
-        fetch('/api/cancel?token=' + encodeURIComponent(token), { method: 'POST' })
-          .catch(function () {});
-        setBusy(false);
-        hideTyping();
-      }
-      return;
-    }
+    if (!text) return;
+    msgQueue.push({ id: ++qid, text: text });
+    renderQueue();
+    input.value = '';
+    input.style.height = 'auto';
+    updateSendBtn();
+    input.focus();
+  }
+
+  // 终止当前这一轮
+  function doCancel() {
+    // 取消后服务端的 task 要过一小会儿才真的 done()，这期间的 status 还会报 running=true。
+    // 加个静默窗口，免得刚停下又被状态回报顶回「终止」，按钮看着像卡死了
+    cancelGuardUntil = Date.now() + 5000;
+    fetch('/api/cancel?token=' + encodeURIComponent(token), { method: 'POST' })
+      .catch(function () {});
+    setBusy(false);
+    hideTyping();
+  }
+
+  // 按钮点击：运行中 = 终止；空闲 = 发送输入框内容
+  function send() {
+    if (busy) { doCancel(); return; }
+    var text = input.value.trim();
     if (!text) return;
     doSend(text);
     input.value = '';
     input.style.height = 'auto';
+    updateSendBtn();
     input.focus();
+  }
+
+  // 回车：运行中 = 排队；空闲 = 发送
+  function submitInput() {
+    if (busy) { enqueueInput(); return; }
+    send();
   }
 
   sendBtn.addEventListener('click', send);
   input.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitInput(); }
   });
   input.addEventListener('input', function () {
     input.style.height = 'auto';
@@ -2400,7 +2446,6 @@
 
   // ---------- 侧栏：会话列表 ----------
   var sessList = document.getElementById('sessList');
-  var currentSid = null;
   function loadSessions() {
     if (!token) return;
     fetch('/api/sessions?token=' + encodeURIComponent(token))
