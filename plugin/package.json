@@ -1,0 +1,25 @@
+{
+  "name": "deckmeido-plugin",
+  "version": "0.1.0",
+  "description": "在 QAM 里带上当前游戏画面问 AI",
+  "type": "module",
+  "scripts": {
+    "build": "rollup -c",
+    "watch": "rollup -c -w"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Congmeims/SDagent.git"
+  },
+  "dependencies": {
+    "@decky/api": "^1.1.2",
+    "@decky/ui": "^4.7.0",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@decky/rollup": "^1.0.1",
+    "@types/react": "^18.3.3",
+    "rollup": "^4.21.0",
+    "typescript": "^5.5.4"
+  }
+}

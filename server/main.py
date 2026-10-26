@@ -2662,7 +2662,17 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
             data = await ws.receive_json()
             if data.get("type") == "chat":
                 try:
-                    await start_chat(str(data.get("text", "")).strip())
+                    # 插件那条路要从 ws 直接带图和真实工作区进来：
+                    # 它挂在 gamescope 上，请求和流式都在同一条连接里，
+                    # 走不了"先 POST 拿结果再订阅"的两段式。
+                    ws_root = data.get("workspace")
+                    await start_chat(
+                        str(data.get("text", "")).strip(),
+                        image=data.get("image") or None,
+                        image_prompt=data.get("image_prompt")
+                        or "（这是当前游戏画面，结合画面回答用户的问题）",
+                        workspace=Path(ws_root).expanduser() if ws_root else None,
+                    )
                 except asyncio.CancelledError:
                     pass  # 用户点了终止，保持 ws 连接
                 except Exception as exc:
