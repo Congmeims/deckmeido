@@ -263,6 +263,46 @@ deckmeido/
 - 联网搜索依赖 `ddgs`，已列入 `requirements.txt` 默认安装；环境里没有它时搜索工具会直接返回「No module named 'ddgs'」，不会静默降级
 - 会话历史保存在本机 `server/sessions/`，不含云端同步
 
+## 待办
+
+以下为已确认要改、尚未动手的事项，按方向分组，顺序不代表优先级。
+
+### 安装与首次使用
+
+- **初始配置向导** — `api_key` 为空时，后端只打印一行「LLM API Key 未配置，详见 config.toml」，新装用户不知道该去哪填。目标：首次启动引导，或 Web 面板首次打开时直接跳设置页
+- **`install.sh` 界面重做** — 现在只有 `==>` / `[!]` / `[x]` 四种前缀，没有 banner 和分区。目标：ASCII logo + 标题 + 框线分区 + 依赖表格 + 完成卡片
+- **`install.sh` 的 `?` 符号** — 第 188、194 行 `printf '%s?%s %s [y/N] '`，`%s` 是黄色转义，裸 `?` 在部分字体下会被渲染成 emoji 风格，观感很差。改成 `>>>` 或 `[?]`
+- **Release 内置离线依赖包** — `DEPS_PACMAN`（`espeak-ng` / `ydotool` / `wtype` / `fakeroot`）加 AUR 的 `kdotool-bin`，目前全靠联网现装，下载慢或断网时安装会卡住。目标：把 `.pkg.tar.zst` 一并打进 Release，`install.sh --deps` 优先本地包、失败再回退联网
+  - 注意：SteamOS 的 A/B 镜像切换会让 pacman 缓存失效，离线包路径要能跨镜像复用
+
+### 工具能力
+
+- **`desktop` 补齐手势** — `action` 目前只有 `focus` / `click` / `move` / `type` / `where`，滚动与拖拽只能靠 `run_command` 手拼 `ydotool`，慢且易错。目标：新增 `scroll`（dx/dy）与 `drag`（起止点、中间插值），把常见点击 / 拖动 / 滚动做成预设
+- **模拟 Steam Deck 触摸板** — 掌机触摸板是双向滑动 + 轻点，和鼠标滚轮不是一回事。目标：能模拟触摸板 swipe 与双指滚动，供游戏模式或需要精细纵向滚动的场景使用
+
+### 界面与交互
+
+- **遮罩改按工具判定** — 现在整轮常显，连「清空回收站」这种不需要看屏幕的命令也会盖住全屏。目标：区分「真的会动屏幕」和「纯后台执行」，后者不遮挡视线
+- **手机端上下文用量徽章** — `index.html:787` 在 ≤560px 时用 `display:none !important` 把徽章隐藏，注释写「移到侧栏状态卡」，但侧栏 `pollSys()` 并没有这一项，导致窄屏完全看不到用量。目标：在侧栏补上
+- **文件下载改气泡卡片** — 生成的文件目前只能给一条裸 URL 让用户复制。目标：以附件气泡呈现（图标 + 文件名 + 大小），右侧独立下载按钮，点击直接另存
+
+### 游戏模式
+
+- **远程控制** — 让局域网设备通过 HTTP 注入按键与触摸，实现「远程下一句指令，agent 代为操作」。路线已确认：`ydotool`（键鼠，`ydotoold` 已在跑）+ `/dev/uinput`（手柄，`deck` 已在 `input` 组且设备可写）；decky-flow 的 EIS 桥是本机 Unix socket 而非网桥，这一层可以省掉
+  - 前置：**先做网络鉴权**。`:18765` 目前无 token 监听 `0.0.0.0`，等于把「可执行命令」的入口开放给整个局域网
+  - 待实测：切到 gamescope 后后端（user 级 systemd）是否被重建、`ydotoold` 是否存活
+  - 待补：`ydotool` 造不出 uinput gamepad（ABXY / 摇杆 / 扳机），需另写虚拟手柄
+  - 定位：LLM 推理一来一回 1~3 秒，不适合动作游戏，适合「帮我跑日常 / 挂机刷素材」
+- **Decky 插件联动查攻略** — 游戏里按一下「查攻略」：截当前画面 → 交给 DeckMeido 推理 → 结果回到 QAM 面板或手机端
+  - 载体：独立 Decky 插件。`plugin_loader.service` 是 `multi-user.target` + `User=root`，切 gamescope 不会停，是游戏模式下唯一可靠的常驻入口；DeckMeido 后端是 user 级，切会话大概率断
+  - 三块能力：游戏内截帧 / QAM 入口 + 热键 / 调后端推理并回显
+  - 待拍板：攻略来源（内置库 / 现搜 / 先搜后总结）、截帧触发（手动 / 自动识别）、结果呈现位置、是否注册全局热键（会与 Steam 输入争抢）
+  - 已知风险：gamescope 下 `kdotool` 全废；PipeWire 截帧只在桌面模式验证过，游戏模式需实测
+
+### 依赖
+
+- **`ddgs`** — 已在 `requirements.txt` 解注释并列为默认安装（`1c598a0`），但本机 `.venv` 尚未安装，`web_search` 仍返回 `No module named 'ddgs'`
+
 ---
 
 <p align="center"><sub>DeckMeido · 为你守着这台掌机的女仆</sub></p>
