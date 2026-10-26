@@ -819,8 +819,10 @@
     .status-text { max-width: 4em; }
     .hdr-right { gap: 5px; flex: 0 1 auto; min-width: 0; flex-wrap: nowrap; }
     .badge { padding: 3px 8px; font-size: 11px; }
-    /* 手机竖屏顶栏只保留模式徽章：上下文用量移进侧栏状态卡（见 #ctxRow） */
-    #ctxBadge, #modeBadge { display: none !important; }
+    /* 手机竖屏顶栏只留模式徽章：上下文用量移进侧栏状态卡（见 #ctxRow）。
+       模式徽章本身要留——在游戏模式里刷 QAM 以外的网页时，它就靠这个
+       认出「当前是游戏模式」，藏掉反而让人以为回桌面了 */
+    #ctxBadge { display: none !important; }
     .hdr-right:empty { display: none; }
 
     #messages { padding: 10px 10px; gap: 8px; }

@@ -2659,17 +2659,24 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
         return
     await manager.connect(ws)
     # 来源：优先信调用方显式声明的 client（插件标 qam，桌面客户端标 client），
-    # 没声明就按 UA 猜——手机浏览器自动算 mobile，其余算 web
+    # 没声明就按 UA 猜——手机浏览器自动算 mobile，其余算 web。
+    # ws_mode 用来记住「这条连接是在什么模式下连上的」：状态广播是全局的，
+    # 游戏模式的判定（pgrep gamescope）对所有连着的端都成立，桌面网页就会
+    # 跟着显示成「游戏模式」。所以按连接自己的会话判定，桌面网页永远是桌面
     ua = ws.headers.get("user-agent", "")
     ua_client = "mobile" if ("Mobile" in ua or "Android" in ua) else "web"
+    ws_mode = get_status()["mode"]
     try:
         # 新连接同步历史（带上 sid，前端才能建立会话代次基线，
         # 否则 currentSid 一直是空值，代次过滤整条失效）
         await ws.send_json({"type": "history", "messages": history, "sid": current_sid})
-        await ws.send_json({"type": "status", "data": get_status()})
+        await ws.send_json({"type": "status",
+                            "data": {**get_status(), "mode": ws_mode}})
         while True:
             data = await ws.receive_json()
             if data.get("type") == "chat":
+                # 开始发问就刷新：这条连接此刻在什么模式下，就是它自己的模式
+                ws_mode = get_status()["mode"]
                 try:
                     # 插件那条路要从 ws 直接带图和真实工作区进来：
                     # 它挂在 gamescope 上，请求和流式都在同一条连接里，
