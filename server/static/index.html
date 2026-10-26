@@ -823,6 +823,8 @@
        模式徽章本身要留——在游戏模式里刷 QAM 以外的网页时，它就靠这个
        认出「当前是游戏模式」，藏掉反而让人以为回桌面了 */
     #ctxBadge { display: none !important; }
+    /* 极窄屏（<360px）：模式徽章也收窄，但必须留着 */
+    #modeBadge { padding: 3px 7px; font-size: 10.5px; }
     .hdr-right:empty { display: none; }
 
     #messages { padding: 10px 10px; gap: 8px; }
@@ -1239,9 +1241,13 @@
     return s;
   }
 
-  // 本端来源标识：后端按 UA 也能猜，但桌面客户端内嵌的也是这个页面，
-  // 光看 UA 分不出「电脑浏览器」和「客户端」，所以由前端自己声明
+  // 本端来源标识：优先用后端在 history 里回传的 my_client（那是它实际看到的
+  // UA），没收到之前先按 UA 自己猜。桌面客户端内嵌的也是这个页面，
+  // 光看 UA 分不出「电脑浏览器」和「客户端」，所以客户端要自己声明
+  var localClient = null;
+
   function myClient() {
+    if (localClient) return localClient;
     if (IS_NATIVE) return 'client';
     return /Mobile|Android/.test(navigator.userAgent) ? 'mobile' : 'web';
   }
@@ -1271,7 +1277,9 @@
       var src = document.createElement('span');
       src.className = 'msg-src';
       src.textContent = client === myClient() ? '本端' : CLIENT_LABEL[client];
-      src.title = '发起来源：' + CLIENT_LABEL[client];
+      // 把原始值和本端认定一起写进 title：角标认错时一眼能看出是哪一边算错了
+      src.title = '发起来源：' + CLIENT_LABEL[client] + '（' + client
+                  + '）；本端认定为 ' + myClient();
       el.appendChild(src);
     }
     if (role === 'assistant' || role === 'user') {
@@ -1625,6 +1633,8 @@
       switch (msg.type) {
         case 'history':
           if (msg.sid) currentSid = msg.sid;
+          // 本端身份以后端这条连接实际看到的为准：前端按 UA 猜只是兜底
+          if (msg.my_client) localClient = msg.my_client;
           messages.innerHTML = '';
           // 清空后必须重算按钮：否则切会话/新连接时，上一轮残留的终止态会一直挂着
           updateSendBtn();

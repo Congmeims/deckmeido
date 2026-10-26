@@ -2669,7 +2669,8 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
     try:
         # 新连接同步历史（带上 sid，前端才能建立会话代次基线，
         # 否则 currentSid 一直是空值，代次过滤整条失效）
-        await ws.send_json({"type": "history", "messages": history, "sid": current_sid})
+        await ws.send_json({"type": "history", "messages": history, "sid": current_sid,
+                            "my_client": ua_client})
         await ws.send_json({"type": "status",
                             "data": {**get_status(), "mode": ws_mode}})
         while True:
