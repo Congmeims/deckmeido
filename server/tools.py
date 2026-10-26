@@ -1232,9 +1232,11 @@ async def _screenshot_gamescope(path: Path) -> bool:
     # 必须指向 gamescope 所属会话，不能是后端自己的 uid（root 时是 /run/user/0）
     env["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
     raw = path.with_suffix(".raw.png")
+    # gst-launch 把每个 argv 当成一个独立 token，元素名和属性必须分开传，
+    # 写成 "pipewiresrc path=78" 会被判成语法错误
     cmd = [
-        "gst-launch-1.0", "-q", f"pipewiresrc path={node} num-buffers=6", "!",
-        "videoconvert", "!", "pngenc", "!", f"filesink location={raw}",
+        "gst-launch-1.0", "-q", "pipewiresrc", f"path={node}", "num-buffers=6", "!",
+        "videoconvert", "!", "pngenc", "!", "filesink", f"location={raw}",
     ]
     # root 跑时降权到会话用户：PipeWire 的 socket 权限按用户隔离，root 直连会被拒
     if os.getuid() == 0 and uid != 0:
