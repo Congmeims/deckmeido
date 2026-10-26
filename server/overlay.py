@@ -1,10 +1,12 @@
 """DeckMeido 操作遮罩
 
 agent 操作这台设备期间，在桌面上叠加一层半透明全屏遮罩，显示当前正在做什么。
-用户点一下遮罩（触摸屏轻触、鼠标点击、触摸板点击均可）立刻调用 /api/cancel
-终止当前操作并撤掉遮罩。
+用户点一下遮罩（触摸屏轻触、鼠标点击、触摸板点击均可）、或者按一下音量键，
+立刻调用 /api/cancel 终止当前操作并撤掉遮罩。
 
-遮罩不读取任何输入设备，也不需要任何系统权限。
+音量键监听只在遮罩显示期间生效：遮罩一出现就独占（grab）Steam Controller
+的输入节点，此时音量键不再调音量、改成「强制停止」；遮罩一消失立刻松手
+（ungrab），音量键恢复原样。独占期间读到的事件一律不再转发给系统。
 """
 from __future__ import annotations
 
@@ -12,7 +14,9 @@ import hashlib
 import json
 import math
 import os
+import select
 import signal
+import struct
 import sys
 import threading
 import time
@@ -123,6 +127,196 @@ class SwayLogo(QWidget):
             p.end()
 
 
+class VolumeKeyStop:
+    """遮罩显示期间，把音量键变成「强制停止」
+
+    为什么不是简单注册个快捷键：音量键是普通 evdev 设备上的硬件键，读它而不抓住
+    它，系统照样会调音量，遮罩期间就成了「既停任务又改音量」。而 evdev 的一个设备
+    同时只能被一个进程独占（grab），独占期间读到的事件也**不会**再进系统。
+    所以本类的策略是：
+      - 遮罩显示 → grab，读到的音量键当停止键，其它事件丢弃（不回放）
+      - 遮罩消失 → ungrab，音量键立刻恢复原样
+    代价是遮罩期间音量真的调不了，这是「只在遮罩时监听」的必然结果，
+    换来的是松手即恢复、不会像常驻占用那样把音量键永久弄坏。
+
+    Steam Deck 上音量键**不在** Steam Controller 节点上，而是走
+    `AT Translated Set 2 keyboard`（键盘节点）。不同机型/系统版本挂在哪都可能变，
+    所以不按名字找：扫 /dev/input/event*，用 capabilities 位图筛出真的声明了
+    KEY_VOLUMEUP/DOWN 的设备，再逐个 probe 哪个真能读到事件。
+
+    安全性：`_release()` 与 grab 成对，监听线程是 daemon，遮罩进程退出时内核
+    会随文件描述符关闭自动释放独占，不会把音量键留在「按了没反应」的状态。
+    """
+
+    VOLUME_KEYS = (114, 115)          # KEY_VOLUMEDOWN / KEY_VOLUMEUP
+    _EV_KEY = 0x01
+    _KEY_PRESS = 1
+    _EVENT = struct.Struct("llHHi")   # struct input_event（64 位下 24 字节）
+
+    def __init__(self, on_stop):
+        self._on_stop = on_stop
+        self._lock = threading.Lock()
+        self._want = False
+        self._fd: int | None = None
+        self._wake_r: int | None = None
+        self._wake_w: int | None = None
+        self._thread = threading.Thread(
+            target=self._run, name="volume-key-stop", daemon=True)
+
+    # ---------- 对外 ----------
+    def set_active(self, active: bool) -> None:
+        """遮罩显示/消失时调用；可反复调用，只在真正变化时才动设备"""
+        with self._lock:
+            if active == self._want:
+                return
+            self._want = active
+            wake = self._wake_w
+        if wake is not None:
+            try:
+                os.write(wake, b"\x01")   # 让 select 立刻醒来，切到新状态
+            except OSError:
+                pass
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def shutdown(self) -> None:
+        """进程退出前同步松手，别把音量键锁死"""
+        self.set_active(False)
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.5)
+
+    # ---------- 内部 ----------
+    @classmethod
+    def _volume_devices(cls) -> list[str]:
+        """声明了音量键的输入节点，最可能真发音量键的排前面
+
+        有两个坑，都是实机踩出来的：
+        1. `capabilities/key` 是声明，不是事实。Deck 上 Steam Controller 的两个
+           节点都声明了 KEY_VOLUMEUP，但按下音量键读到事件的是
+           `AT Translated Set 2 keyboard`——内置键盘节点。
+        2. 所以先按 sysfs 设备名把键盘类节点提上来（名字以 keyboard 结尾），
+           剩下的伪节点只作兜底；真伪最终由 `_open` 里的 probe 定。
+        选择顺序变了但兜底逻辑不变：probe 全失败就当作没有音量键，遮罩照常能用。
+        """
+        try:
+            names = sorted(os.listdir("/dev/input"))
+        except OSError:
+            return []
+        real, other = [], []
+        for name in names:
+            if not name.startswith("event"):
+                continue
+            dev = Path("/sys/class/input") / name / "device"
+            if not cls._has_volume_keys(dev / "capabilities/key"):
+                continue
+            try:
+                label = (dev / "name").read_text().strip()
+            except OSError:
+                label = ""
+            (real if "keyboard" in label.lower() else other).append(
+                f"/dev/input/{name}")
+        return real + other
+
+    @classmethod
+    def _has_volume_keys(cls, cap: Path) -> bool:
+        """解析 capabilities/key 的位图，确认设备声明了音量键
+
+        sysfs 里这张位图是 **hex 字节串**（形如 `feffffdfffcfffff`），
+        取值要按字节倒序当大整数读，不能按 64 位字拼接——按字拼出来的结果
+        会把 K 附近整片位都点亮，于是键盘节点（真正发音量键的那个）反而被判成
+        「没有音量键」，而 Steam Controller 那些死节点被判成「有」。
+        """
+        try:
+            raw = cap.read_text().split()
+        except OSError:
+            return False
+        val = 0
+        for word in raw:
+            val = (val << (4 * len(word))) | int(word, 16)
+        return any(val >> k & 1 for k in cls.VOLUME_KEYS)
+
+    def _open(self) -> bool:
+        """独占第一个能打开、能 grab 的候选节点
+
+        顺序由 `_volume_devices` 决定（键盘类节点优先）。不能在这里「等一小会看
+        有没有事件」来判活：用户没按的时候所有节点都是安静的，任何按时间窗的
+        probe 都会把好节点也否掉，遮罩期间就变成按了没反应。
+        """
+        for path in self._volume_devices():
+            try:
+                import fcntl
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except (ImportError, OSError):
+                continue
+            # 遮罩在 XWayland 里跑，属于 deck 用户，本身就在 input 组里；
+            # 万一没权限 EVIOCGRAB 会失败，此时跳过这个节点
+            try:
+                fcntl.ioctl(fd, 0x40044590, 1)   # EVIOCGRAB
+            except OSError:
+                os.close(fd)
+                continue
+            self._fd = fd
+            return True
+        return False
+
+    def _release(self) -> None:
+        """放开独占：关掉 fd 就是 ungrab（独占随最后一个引用释放而解除）"""
+        if self._fd is None:
+            return
+        try:
+            os.close(self._fd)
+        except OSError:
+            pass
+        self._fd = None
+
+    def _run(self) -> None:
+        """监听线程主体：常驻，按 _want 在「独占读」与「松手」之间切换"""
+        self._wake_r, self._wake_w = os.pipe()
+        os.set_blocking(self._wake_r, False)
+        while True:
+            try:
+                fds = [self._wake_r] + ([self._fd] if self._fd is not None else [])
+                ready, _, _ = select.select(fds, [], [], 0.5)
+                for fd in ready:
+                    if fd == self._wake_r:
+                        self._drain_wake()
+                    else:
+                        self._drain_events()
+                with self._lock:
+                    want = self._want
+                if want and self._fd is None:
+                    self._open()
+                elif not want and self._fd is not None:
+                    self._release()
+            except Exception:
+                self._release()   # 出任何岔子先松手，别把音量键锁死
+                time.sleep(0.2)
+
+    def _drain_wake(self) -> None:
+        try:
+            while os.read(self._wake_r, 64):
+                pass
+        except OSError:
+            pass
+
+    def _drain_events(self) -> None:
+        while self._fd is not None:
+            try:
+                data = os.read(self._fd, self._EVENT.size * 64)
+            except BlockingIOError:
+                return
+            except OSError:
+                return
+            if not data:
+                return
+            for off in range(0, len(data) - self._EVENT.size + 1, self._EVENT.size):
+                _s, _us, typ, code, value = self._EVENT.unpack_from(data, off)
+                if typ == self._EV_KEY and value == self._KEY_PRESS \
+                        and code in self.VOLUME_KEYS:
+                    self._on_stop()
+
+
 class Mask(QWidget):
     def __init__(self):
         # 覆盖重定向窗口（绕过窗口管理器）：不进任务栏、始终盖在普通窗口之上。
@@ -163,7 +357,7 @@ class Mask(QWidget):
         self.action.setFixedWidth(584)
         self.action.setMinimumHeight(20)
 
-        self.hint = QLabel("点任意位置立即停止")
+        self.hint = QLabel("点任意位置或按音量键立即停止")
         self.hint.setFont(ui_font(14, bold=True))
         self.hint.setStyleSheet(
             "color: #fff; background: rgba(232, 74, 74, 235);"
@@ -207,6 +401,10 @@ class Mask(QWidget):
         self.urgent_timer = QTimer(self)
         self.urgent_timer.timeout.connect(self._poll_urgent)
         self.urgent_timer.start(URGENT_MS)
+
+        # 音量键当「强制停止」：只在遮罩真的显示时独占设备，见 VolumeKeyStop
+        self.volume_stop = VolumeKeyStop(self._on_volume_stop)
+        self.volume_stop.start()
 
     # ---------- 后端状态 ----------
     def _fetch(self, ack: bool = True) -> dict:
@@ -382,6 +580,10 @@ class Mask(QWidget):
         QTimer.singleShot(300, self.hide)
 
     # ---------- 交互 ----------
+    def _on_volume_stop(self):
+        """音量键回调：来自监听线程，交回 Qt 主线程再动界面"""
+        QTimer.singleShot(0, self._cancel)
+
     def mousePressEvent(self, ev):
         if ev.button() == Qt.LeftButton:
             self._cancel()
@@ -427,6 +629,15 @@ class Mask(QWidget):
         self.card.move((self.width() - self.card.width()) // 2, top)
 
     # ---------- 绘制 ----------
+    def _sync_volume_grab(self):
+        """音量键独占跟随「遮罩是否真的显示」
+
+        不在遮罩时绝不占用：用户平时调音量、系统 OSD 都照旧。
+        穿透（agent 自己在点）与截图抬高期间遮罩是藏起来的，这时也不必独占，
+        否则用户会用音量键去碰一段根本没有遮罩可点的空窗。
+        """
+        self.volume_stop.set_active(self.isVisible())
+
     def _show_mask(self):
         """覆盖重定向窗口不走 showFullScreen，直接铺满整块屏幕"""
         scr = self.screen() or QApplication.primaryScreen()
@@ -437,6 +648,17 @@ class Mask(QWidget):
             self._apply_input_transparency(True)
         self.show()
         self.raise_()
+        self._sync_volume_grab()
+
+    def hideEvent(self, ev):
+        # 所有隐藏路径（后端点完、穿透、截图抬高、最短显示到期）都会经过这里，
+        # 统一在这里松手，音量键一消失就恢复
+        self._sync_volume_grab()
+        super().hideEvent(ev)
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        self._sync_volume_grab()
 
     def _tick(self):
         if not self.isVisible():
@@ -664,6 +886,11 @@ def main() -> int:
         try:
             single.close()
             QLocalServer.removeServer(server_name())
+        except Exception:
+            pass
+        # 退出前主动松开音量键独占，别让它停在「按了没反应」的状态
+        try:
+            mask.volume_stop.shutdown()
         except Exception:
             pass
         app.quit()

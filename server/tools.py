@@ -1156,11 +1156,49 @@ async def _list_emulator_roms(system: str = "") -> str:
     return f"共 {sum(counts.values())} 个游戏文件：\n" + "\n".join(lines)
 
 
+def _session_user() -> tuple[int, str] | None:
+    """gamescope / PipeWire 所在会话的 (uid, 用户名)；找不到返回 None
+
+    后端常以 root 跑（插件 flags 里有 root），此时 os.getuid() 是 0，
+    而 gamescope 在 deck 用户的图形会话里，套接字在 /run/user/1000。
+    直接用 getuid() 会连到 /run/user/0，抓帧必然失败。
+    """
+    import pwd
+
+    if os.getuid() != 0:
+        return os.getuid(), pwd.getpwuid(os.getuid()).pw_name
+    # root：找一个真实登录的普通用户会话，优先 uid=1000（SteamOS 的 deck）
+    candidates: list[tuple[int, str]] = []
+    try:
+        for d in Path("/run/user").iterdir():
+            if not d.name.isdigit():
+                continue
+            uid = int(d.name)
+            # 有 pulse 或 dbus 用户总线的才算活着的图形/音频会话
+            if uid == 0 or not ((d / "pulse").exists() or (d / "bus").exists()):
+                continue
+            try:
+                candidates.append((uid, pwd.getpwuid(uid).pw_name))
+            except KeyError:
+                continue
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0] != 1000, x[0]))
+    return candidates[0]
+
+
 async def _gamescope_pw_node() -> str | None:
     """游戏模式下找 gamescope 的 PipeWire 视频节点 id；找不到返回 None"""
+    sess = _session_user()
+    env = dict(os.environ)
+    if sess:
+        env["XDG_RUNTIME_DIR"] = f"/run/user/{sess[0]}"
     try:
         proc = await asyncio.create_subprocess_exec(
             "pw-dump", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            env=env,
         )
         out, _ = await proc.communicate()
         nodes = json.loads(out or b"[]")
@@ -1173,24 +1211,40 @@ async def _gamescope_pw_node() -> str | None:
     return None
 
 
+async def _raw_ok(raw: Path) -> bool:
+    """抓帧产物是否有效：存在且大于 10KB（pngenc 失败时会留下空文件）"""
+    try:
+        return raw.exists() and raw.stat().st_size >= 10000
+    except OSError:
+        return False
+
+
 async def _screenshot_gamescope(path: Path) -> bool:
     """游戏模式：从 gamescope 的 PipeWire 视频节点直接抓一帧（不经过桌面会话）"""
     node = await _gamescope_pw_node()
     if not node or not shutil.which("gst-launch-1.0"):
         return False
+    sess = _session_user()
+    if not sess:
+        return False
+    uid, user = sess
     env = dict(os.environ)
-    env["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
+    # 必须指向 gamescope 所属会话，不能是后端自己的 uid（root 时是 /run/user/0）
+    env["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
     raw = path.with_suffix(".raw.png")
     cmd = [
         "gst-launch-1.0", "-q", f"pipewiresrc path={node} num-buffers=6", "!",
         "videoconvert", "!", "pngenc", "!", f"filesink location={raw}",
     ]
+    # root 跑时降权到会话用户：PipeWire 的 socket 权限按用户隔离，root 直连会被拒
+    if os.getuid() == 0 and uid != 0:
+        cmd = ["runuser", "-u", user, "--", *cmd]
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=env,
         )
         await asyncio.wait_for(proc.wait(), timeout=25)
-        if not raw.exists() or raw.stat().st_size < 10000:
+        if not await _raw_ok(raw):
             return False
         # pngenc 连续 6 帧会覆盖同一文件，取到的就是最后一帧，直接搬过来
         raw.replace(path)
