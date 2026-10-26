@@ -14,6 +14,8 @@ type Status = {
   uid: number;
   as_user: string;
   proxy: string;
+  // 虚拟手柄能不能用（/dev/uinput 存在且可写）
+  gamepad: boolean;
 };
 
 // 插件后端推上来的流式消息
@@ -42,6 +44,40 @@ const CARD: React.CSSProperties = {
 const ERR_COLOR = "#e06c75";
 const DIM = "#8b929a";
 
+// 面板上的手柄键位，分两排：上面是 ABXY + 扳机，下面是方向键 + 菜单键
+const PAD_ROWS: { key: string; label: string }[][] = [
+  [
+    { key: "y", label: "Y" },
+    { key: "x", label: "X" },
+    { key: "b", label: "B" },
+    { key: "a", label: "A" },
+  ],
+  [
+    { key: "lb", label: "LB" },
+    { key: "rb", label: "RB" },
+    { key: "start", label: "≡" },
+    { key: "select", label: "◱" },
+  ],
+  [
+    { key: "up", label: "↑" },
+    { key: "down", label: "↓" },
+    { key: "left", label: "←" },
+    { key: "right", label: "→" },
+  ],
+];
+
+const PAD_BTN: React.CSSProperties = {
+  flex: 1,
+  // Steam 的字体在 QAM 里偏大，按钮给足高度才好用手柄点
+  padding: "10px 0",
+  fontSize: 13,
+  borderRadius: 4,
+  border: "1px solid rgba(255,255,255,.14)",
+  background: "rgba(255,255,255,.06)",
+  color: "#fff",
+  textAlign: "center",
+};
+
 export default definePlugin(() => ({
   name: "DeckMeido",
   titleView: <div>DeckMeido</div>,
@@ -59,6 +95,8 @@ function Content() {
   // 当前这一轮正在做什么（后端 tool_activity 的原文），空表示还没开始动手
   const [activity, setActivity] = useState("");
   const [withShot, setWithShot] = useState(true);
+  // 手柄区最近一次操作的结果，只用来给一句提示
+  const [padMsg, setPadMsg] = useState("");
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   // 流式正文先在 ref 里攒，避免每个 token 都触发一次全量状态重排
@@ -213,6 +251,22 @@ function Content() {
     setError("这一轮已中断");
   };
 
+  const padPress = async (key: string) => {
+    if (!status?.gamepad) {
+      setPadMsg("/dev/uinput 不可用，手柄按键发不出去");
+      return;
+    }
+    try {
+      const r = (await call<[string], { ok: boolean; error?: string }>(
+        "gamepad_press",
+        key
+      )) as { ok: boolean; error?: string };
+      setPadMsg(r.ok ? `已发送 ${key.toUpperCase()}` : (r.error ?? "发送失败"));
+    } catch (e: any) {
+      setPadMsg(String(e?.message ?? e));
+    }
+  };
+
   return (
     <PanelSection title="DeckMeido">
       <PanelSectionRow>
@@ -258,6 +312,28 @@ function Content() {
           </div>
         </PanelSectionRow>
       )}
+
+      <PanelSectionRow>
+        <div style={{ fontSize: 10, color: DIM, marginBottom: 2 }}>
+          {padMsg || "模拟手柄按键（发给前台游戏）"}
+        </div>
+      </PanelSectionRow>
+
+      {PAD_ROWS.map((row, ri) => (
+        <PanelSectionRow key={ri}>
+          <Focusable style={{ display: "flex", gap: 4 }}>
+            {row.map((b) => (
+              <div
+                key={b.key}
+                style={{ ...PAD_BTN, opacity: status?.gamepad ? 1 : 0.4 }}
+                onClick={() => padPress(b.key)}
+              >
+                {b.label}
+              </div>
+            ))}
+          </Focusable>
+        </PanelSectionRow>
+      ))}
 
       {turns.length > 0 && (
         <PanelSectionRow>

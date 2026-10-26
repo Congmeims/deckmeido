@@ -217,6 +217,213 @@ async def grab_screenshot() -> tuple[bool, str]:
     return ok, payload
 
 
+# ---------- 虚拟手柄（uinput） ----------
+#
+# gamescope 既不认 XTest 也不认 Wayland 的虚拟键盘协议，能进游戏模式的只有
+# /dev/uinput 虚拟设备（Steam Input、Sunshine 走的都是这条）。插件以 root
+# 加载，直接写 /dev/uinput 就行，不需要 libei 或任何外部二进制。
+#
+# 为什么不能只建键盘：摇杆（ABS_X/ABS_Y）和扳机（ABS_Z/ABS_RZ）是绝对值轴，
+# 一个 EV_KEY-only 的设备扛不了；反过来手柄设备也发不出键盘字符。所以这里是
+# 一个带 EV_KEY + EV_ABS 的手柄设备，只用于「模拟手柄」，键盘仍由后端 ydotool 负责。
+
+import struct
+
+_UI_DEV_CREATE = 0x5501
+_UI_DEV_DESTROY = 0x5502
+_UI_SET_EVBIT = 0x40045564
+_UI_SET_KEYBIT = 0x40045565
+_UI_SET_ABSBIT = 0x40045567
+_UI_DEV_SETUP = 0x405C5503
+_UI_ABS_SETUP = 0x401C5504
+_UI_GET_VERSION = 0x80045505
+
+_EV_SYN, _EV_KEY, _EV_ABS = 0x00, 0x01, 0x03
+_ABS_X, _ABS_Y, _ABS_Z, _ABS_RZ = 0x00, 0x01, 0x02, 0x05
+_BTN_SOUTH, _BTN_EAST, _BTN_NORTH, _BTN_WEST = 0x130, 0x131, 0x133, 0x134
+_BTN_TL, _BTN_TR = 0x136, 0x137
+
+# 摇杆量程按 Linux 手柄惯例走 -32767..32767，死区留 0
+_STICK_MIN, _STICK_MAX = -32767, 32767
+# 扳机按 Steam 习惯走 0..32767
+_TRIG_MAX = 32767
+
+# 面板上能按的名字 → 键位。名字取玩家熟悉的叫法，ABXY 按 Xbox 布局对应。
+_GAMEPAD_KEYS = {
+    "a": _BTN_SOUTH,
+    "b": _BTN_EAST,
+    "x": _BTN_NORTH,
+    "y": _BTN_WEST,
+    "lb": _BTN_TL,
+    "rb": _BTN_TR,
+    # 方向键在 Linux 里也是 BTN_* 键位
+    "up": 0x220,
+    "down": 0x221,
+    "left": 0x222,
+    "right": 0x223,
+    "start": 0x13B,
+    "select": 0x13A,
+}
+
+
+class _Gamepad:
+    """一个常驻的虚拟手柄，多个按钮共用一个设备。
+
+    设备只在第一次按键时创建，闲置 _IDLE_CLOSE 秒后销毁 —— 一直挂着一个
+    虚拟手柄会让 Steam 认为有手柄连着（比如强制把界面切成手柄导航）。
+    """
+
+    _IDLE_CLOSE = 60.0
+
+    def __init__(self):
+        self._fd: int | None = None
+        self._lock = asyncio.Lock()
+        self._idle: asyncio.Task | None = None
+
+    @property
+    def open(self) -> bool:
+        return self._fd is not None
+
+    def _emit(self, typ: int, code: int, value: int):
+        """struct input_event：timeval 的 tv_sec/tv_usec 都是 64 位 long，
+        所以这里写 qq 而不是 ll（32 位系统上 ll 只有 4 字节，结构体会对不上）"""
+        os.write(self._fd, struct.pack("qqHHi", 0, 0, typ, code, value))
+
+    def _syn(self):
+        self._emit(_EV_SYN, 0, 0)
+
+    def _create(self):
+        import fcntl
+
+        fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            # 键位表要先问内核要版本，旧内核不认 UI_DEV_SETUP（这时只能靠
+            # 老的 uinput_user_dev 写结构体，SteamOS 不会出现，直接报错）
+            try:
+                fcntl.ioctl(fd, _UI_GET_VERSION, b"\x00" * 4)
+            except OSError:
+                pass
+            fcntl.ioctl(fd, _UI_SET_EVBIT, _EV_KEY)
+            fcntl.ioctl(fd, _UI_SET_EVBIT, _EV_SYN)
+            fcntl.ioctl(fd, _UI_SET_EVBIT, _EV_ABS)
+            for code in _GAMEPAD_KEYS.values():
+                fcntl.ioctl(fd, _UI_SET_KEYBIT, code)
+            for code, lo, hi in (
+                (_ABS_X, _STICK_MIN, _STICK_MAX),
+                (_ABS_Y, _STICK_MIN, _STICK_MAX),
+                (_ABS_Z, 0, _TRIG_MAX),
+                (_ABS_RZ, 0, _TRIG_MAX),
+            ):
+                fcntl.ioctl(fd, _UI_SET_ABSBIT, code)
+                # uinput_abs_setup：code(2) + pad(2) + absinfo{value,min,max,fuzz,flat,resolution}(6*4)
+                fcntl.ioctl(
+                    fd, _UI_ABS_SETUP,
+                    struct.pack("HHiiiiii", code, 0, 0, lo, hi, 0, 0, 0),
+                )
+            # uinput_setup：id{bustype,vendor,product,version}(4*2) + name(80) + ff_effects_max(4)
+            fcntl.ioctl(
+                fd, _UI_DEV_SETUP,
+                struct.pack("HHHH80sI", 0x03, 0x045E, 0x02FD, 0x0001, b"DeckMeido Gamepad", 0),
+            )
+            fcntl.ioctl(fd, _UI_DEV_CREATE)
+        except Exception:
+            os.close(fd)
+            raise
+        self._fd = fd
+        decky.logger.info("虚拟手柄已创建")
+        # 设备刚出现时内核还没有它的节点，先给一小段时间让游戏侧枚举到
+        self._syn()
+
+    def _destroy(self):
+        if self._fd is None:
+            return
+        try:
+            import fcntl
+
+            fcntl.ioctl(self._fd, _UI_DEV_DESTROY)
+        except Exception:
+            pass
+        try:
+            os.close(self._fd)
+        except Exception:
+            pass
+        self._fd = None
+        decky.logger.info("虚拟手柄已销毁")
+
+    def _touch_idle(self):
+        """空闲计时：一段时间没人按就把设备收掉"""
+        if self._idle is not None:
+            self._idle.cancel()
+        self._idle = asyncio.create_task(self._close_later())
+
+    async def _close_later(self):
+        try:
+            await asyncio.sleep(self._IDLE_CLOSE)
+        except asyncio.CancelledError:
+            return
+        async with self._lock:
+            if self._fd is not None:
+                self._destroy()
+
+    async def press(self, key: str, ms: int = 80) -> dict:
+        """按一下再松开。ms 是按住时长，太短游戏会丢（一帧里按下又抬起）"""
+        name = str(key or "").strip().lower()
+        code = _GAMEPAD_KEYS.get(name)
+        if code is None:
+            return {"ok": False, "error": f"不认识的手柄键：{key}"}
+        ms = max(30, min(int(ms or 80), 2000))
+        async with self._lock:
+            try:
+                if self._fd is None:
+                    self._create()
+                self._emit(_EV_KEY, code, 1)
+                self._syn()
+                await asyncio.sleep(ms / 1000)
+                self._emit(_EV_KEY, code, 0)
+                self._syn()
+            except FileNotFoundError:
+                return {"ok": False, "error": "没有 /dev/uinput：uinput 内核模块未加载"}
+            except PermissionError:
+                return {"ok": False, "error": "打不开 /dev/uinput：插件需要以 root 加载"}
+            except Exception as exc:
+                return {"ok": False, "error": f"手柄注入失败：{exc}"}
+            self._touch_idle()
+        return {"ok": True, "key": name, "ms": ms}
+
+    async def stick(self, x: float, y: float) -> dict:
+        """左摇杆，两个参数都是 -1..1（1 是右/下）"""
+        try:
+            vx = int(max(-1.0, min(1.0, float(x))) * _STICK_MAX)
+            vy = int(max(-1.0, min(1.0, float(y))) * _STICK_MAX)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "摇杆值要是 -1..1 的数字"}
+        async with self._lock:
+            try:
+                if self._fd is None:
+                    self._create()
+                self._emit(_EV_ABS, _ABS_X, vx)
+                self._emit(_EV_ABS, _ABS_Y, vy)
+                self._syn()
+            except FileNotFoundError:
+                return {"ok": False, "error": "没有 /dev/uinput：uinput 内核模块未加载"}
+            except PermissionError:
+                return {"ok": False, "error": "打不开 /dev/uinput：插件需要以 root 加载"}
+            except Exception as exc:
+                return {"ok": False, "error": f"摇杆注入失败：{exc}"}
+            self._touch_idle()
+        return {"ok": True, "x": vx, "y": vy}
+
+    async def close(self):
+        if self._idle is not None:
+            self._idle.cancel()
+            self._idle = None
+        async with self._lock:
+            self._destroy()
+
+
+_GAMEPAD = _Gamepad()
+
+
 # ---------- 与后端 :18765 的通话 ----------
 #
 # 后端每轮对话的广播是发给「所有」ws 连接的，同一个后端可能同时挂着网页端。
@@ -553,6 +760,8 @@ class Plugin:
             "uid": os.getuid(),
             "as_user": " ".join(_run_as()) or "(self)",
             "proxy": "websockets" if _ws_connect else "raw",
+            # 虚拟手柄能不能用：设备节点在 + 进程有写权限
+            "gamepad": os.access("/dev/uinput", os.W_OK) if os.path.exists("/dev/uinput") else False,
         }
 
     async def screenshot(self) -> dict:
@@ -560,6 +769,20 @@ class Plugin:
         if ok:
             return {"ok": True, "image": payload}
         return {"ok": False, "error": payload}
+
+    async def gamepad_press(self, key: str, ms: int = 80) -> dict:
+        """模拟按一下手柄键：a/b/x/y/lb/rb/up/down/left/right/start/select"""
+        return await _GAMEPAD.press(key, ms)
+
+    async def gamepad_stick(self, x: float, y: float) -> dict:
+        """左摇杆推到 (x, y)，范围 -1..1；推完不会自动回中，
+        面板松手时会再调一次 gamepad_stick(0, 0)"""
+        return await _GAMEPAD.stick(x, y)
+
+    async def gamepad_close(self) -> dict:
+        """收掉虚拟手柄设备（不再需要时才调，避免 Steam 一直以为接了手柄）"""
+        await _GAMEPAD.close()
+        return {"ok": True}
 
     async def start_turn(self, text: str, image: str | None = None) -> dict:
         """把一轮对话发给后端。返回后流式内容通过 deckmeido_delta 推给前端"""
@@ -631,8 +854,11 @@ class Plugin:
 
     async def _unload(self):
         await _drop_backend()
+        # 不显式销毁的话，虚拟手柄会跟着内核一直挂着，下一次加载前都算「有手柄连着」
+        await _GAMEPAD.close()
         decky.logger.info("DeckMeido 插件卸载")
 
     async def _uninstall(self):
         await _drop_backend()
+        await _GAMEPAD.close()
         decky.logger.info("DeckMeido 插件卸载")
