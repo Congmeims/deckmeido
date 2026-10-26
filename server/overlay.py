@@ -189,23 +189,34 @@ class VolumeKeyStop:
     # ---------- 内部 ----------
     @classmethod
     def _volume_devices(cls) -> list[str]:
-        """所有声明了音量键的输入节点，按 /dev/input 里的顺序返回
+        """声明了音量键的输入节点，最可能真发音量键的排前面
 
-        声明了不等于真在这台设备上发（内核给每个节点都注册了整套 KEY_* 位图
-        很常见），所以调用方还要 probe。键盘节点排前面，试试成本最低。
+        有两个坑，都是实机踩出来的：
+        1. `capabilities/key` 是声明，不是事实。Deck 上 Steam Controller 的两个
+           节点都声明了 KEY_VOLUMEUP，但按下音量键读到事件的是
+           `AT Translated Set 2 keyboard`——内置键盘节点。
+        2. 所以先按 sysfs 设备名把键盘类节点提上来（名字以 keyboard 结尾），
+           剩下的伪节点只作兜底；真伪最终由 `_open` 里的 probe 定。
+        选择顺序变了但兜底逻辑不变：probe 全失败就当作没有音量键，遮罩照常能用。
         """
         try:
             names = sorted(os.listdir("/dev/input"))
         except OSError:
             return []
-        out: list[str] = []
+        real, other = [], []
         for name in names:
             if not name.startswith("event"):
                 continue
-            cap = Path("/sys/class/input") / name / "device/capabilities/key"
-            if cls._has_volume_keys(cap):
-                out.append(f"/dev/input/{name}")
-        return out
+            dev = Path("/sys/class/input") / name / "device"
+            if not cls._has_volume_keys(dev / "capabilities/key"):
+                continue
+            try:
+                label = (dev / "name").read_text().strip()
+            except OSError:
+                label = ""
+            (real if "keyboard" in label.lower() else other).append(
+                f"/dev/input/{name}")
+        return real + other
 
     @classmethod
     def _has_volume_keys(cls, cap: Path) -> bool:
@@ -226,11 +237,11 @@ class VolumeKeyStop:
         return any(val >> k & 1 for k in cls.VOLUME_KEYS)
 
     def _open(self) -> bool:
-        """抓一个真正会发音量键的设备；probe 失败就换下一个
+        """独占第一个能打开、能 grab 的候选节点
 
-        probe 必须做：Deck 上 `Valve Software Steam Controller` 两个节点都声明了
-        KEY_VOLUMEUP，但按下音量键读到事件的是 `AT Translated Set 2 keyboard`。
-        只按声明挑会挑到永远不会来事件的节点，遮罩期间就「按了像没按」。
+        顺序由 `_volume_devices` 决定（键盘类节点优先）。不能在这里「等一小会看
+        有没有事件」来判活：用户没按的时候所有节点都是安静的，任何按时间窗的
+        probe 都会把好节点也否掉，遮罩期间就变成按了没反应。
         """
         for path in self._volume_devices():
             try:
@@ -245,43 +256,12 @@ class VolumeKeyStop:
             except OSError:
                 os.close(fd)
                 continue
-            if self._produces_events(fd):
-                self._fd = fd
-                return True
-            self._release(fd)
+            self._fd = fd
+            return True
         return False
 
-    @classmethod
-    def _produces_events(cls, fd: int) -> bool:
-        """独占后等一小会儿，看这个节点到底有没有事件流
-
-        Deck 那几个「声明了音量键」的假节点是死的，读永远读不到东西；
-        真节点按键时会出事件。用固定窗口（不是等用户按），代价 ~0.15s。
-        """
-        end = time.monotonic() + 0.15
-        while time.monotonic() < end:
-            try:
-                r, _, _ = select.select([fd], [], [], 0.05)
-            except OSError:
-                return False
-            if not r:
-                continue
-            try:
-                data = os.read(fd, cls._EVENT.size * 64)
-            except OSError:
-                return False
-            if data:
-                return True
-        return False
-
-    def _release(self, fd: int | None = None) -> None:
+    def _release(self) -> None:
         """放开独占：关掉 fd 就是 ungrab（独占随最后一个引用释放而解除）"""
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            return
         if self._fd is None:
             return
         try:

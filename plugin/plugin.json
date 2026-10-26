@@ -1,0 +1,10 @@
+{
+  "name": "DeckMeido",
+  "author": "Congmeims",
+  "flags": ["root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["ai", "utility"],
+    "description": "在 QAM 里带上当前游戏画面问 AI，答复流式显示。"
+  }
+}
