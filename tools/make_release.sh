@@ -59,6 +59,15 @@ chmod +x "$STAGE/$NAME/install.sh"
 printf '%s\n' "$VER" > "$STAGE/$NAME/VERSION"
 gen_notes "$STAGE/$NAME/RELEASE-NOTES.md"
 
+# 离线依赖包：把 deploy/deps/*.pkg.tar.zst 一起带上。
+# install.sh 会优先吃这个目录里的包，装不上再回退联网。目录为空就跳过，
+# 不阻断发版——离线包是锦上添花，不该让打包卡住。
+if compgen -G "$ROOT/deploy/deps/*.pkg.tar.zst" > /dev/null; then
+  mkdir -p "$STAGE/$NAME/deploy/deps"
+  cp "$ROOT"/deploy/deps/*.pkg.tar.zst "$STAGE/$NAME/deploy/deps/"
+  echo "已并入离线依赖：$(ls "$STAGE/$NAME/deploy/deps" | wc -l) 个包"
+fi
+
 tar -C "$STAGE" -czf "$OUT/$NAME.tar.gz" "$NAME"
 
 # 校验和：单文件一份 + 汇总一份，安装前可 sha256sum -c 核对

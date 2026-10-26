@@ -1489,14 +1489,8 @@
       reconnectTimer = null;
       authOverlay.classList.remove('show');
       authErr.textContent = '';
-      // 首次使用（还没配模型）自动打开设置页，省得用户找不到入口
-      if (!onboarded) {
-        onboarded = true;
-        fetch('/api/config?token=' + encodeURIComponent(token))
-          .then(function (r) { return r.ok ? r.json() : null; })
-          .then(function (c) { if (c && !c.llm_configured) openSettings(); })
-          .catch(function () {});
-      }
+      // 连接成功：接下来第一条 status 会带上 llm_configured，由它决定要不要弹设置页
+      if (onboardState === '') onboardState = 'pending';
     };
 
     ws.onmessage = function (ev) {
@@ -1986,7 +1980,13 @@
       ctxBadge.classList.toggle('danger', pct >= 95);
     }
     if (s.llm_configured === false) {
-      addSystem('提示：LLM API Key 未配置，详见 config.toml');
+      addSystem('提示：还没有配置模型。点顶部「设置」填 API 地址和 Key 就能开始对话');
+    }
+    // 首次引导：只在第一次拿到 status 时判断。没配模型就直接把设置页顶出来，
+    // 配好了就静默放行（onboardState 落到 done，之后重连都不再检查）
+    if (onboardState !== 'done') {
+      onboardState = 'done';
+      if (s.llm_configured === false) openSettings();
     }
   }
 
@@ -2304,8 +2304,12 @@
 
   // 连接中临时关闭自动重连（改令牌时会被服务端踢下线，不能让旧逻辑又弹回鉴权页）
   var suppressReconnect = false;
-  // 首次连接只做一次引导检查
-  var onboarded = false;
+  // 首次引导的状态机：'' 未检查 → 'pending' 等 status 报出配置情况 → 'done'
+  // 不能用布尔值：ws.onopen 会按重连次数反复触发，而 status 消息总是晚于
+  // onopen 到达，直接在 onopen 里判 c.llm_configured 会因为并发请求拿不到
+  // 结果而错过引导。改成「onopen 置 pending，第一条 status 决定要不要弹」，
+  // 并处理 status 早于 onopen 到达的情况。
+  var onboardState = '';
 
   // ---------- 设置面板 ----------
   var settingsBtn = document.getElementById('settingsBtn');
@@ -2452,7 +2456,7 @@
         cfgUrl.value = location.origin + '/?token=' + encodeURIComponent(c.token || '');
         // 没配 Key 时直接把设置页顶到最显眼的位置当首次引导
         if (!c.llm_configured) {
-          cfgHint.textContent = '还没有配置模型：填好上面的 API 地址和 Key 就能开始对话';
+          cfgHint.textContent = '首次使用：填好上面的 API 地址和 Key，保存后就能开始对话';
         }
       })
       .catch(function (e) {

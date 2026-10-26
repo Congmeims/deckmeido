@@ -1383,7 +1383,7 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
         # 用户既看不到状态，也没有终止入口。
         set_overlay(True, "正在思考")
         if not llm.configured:
-            reply = "LLM 未配置 API Key。请在设置里填入 api_key。"
+            reply = "还没有配置模型。点右上角「设置」填好 API 地址和 Key 就能开始对话。"
         elif pending_action and tools.is_confirm(text):
             # 用户确认了挂起的危险操作
             action, pending_action = pending_action, None

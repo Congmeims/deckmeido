@@ -251,6 +251,71 @@ DEPS_PACMAN=(espeak-ng ydotool wtype fakeroot)
 DEPS_AUR=(kdotool-bin)
 DEPS_AUR_FALLBACK=(kdotool)
 
+# Release 里附带的离线包目录（deploy/deps/，随发布包一起分发）。
+# SteamOS 换镜像会重建 /usr，pacman 缓存也会失效，所以不能指望
+# /var/cache/pacman/pkg 里还有东西；这些 .pkg.tar.zst 是独立一份。
+OFFLINE_DIR="$HERE/deploy/deps"
+
+# 离线包的安装记录。值是一组包名，记录「上次凭离线包装成功的都有谁」。
+# 用途有两个：镜像更新后知道该重装哪些，以及 offline_stale 判断
+# 离线包是不是已经过期（比系统仓库还老就别硬装）。
+offline_stamp() { printf '%s' "$CONFIG_DIR/.deps-offline"; }
+
+# 用本地包直接装，不碰网络。缺点是不会自动补齐依赖树以外的版本约束，
+# 所以装完仍然实测一遍命令在不在。
+offline_pacman_install() {
+  local want=("$@") files=() p
+  [ -d "$OFFLINE_DIR" ] || return 1
+  for p in "${want[@]}"; do
+    local hit
+    hit=$(find "$OFFLINE_DIR" -maxdepth 1 -name "$p-*.pkg.tar.zst" 2>/dev/null | sort | tail -n1)
+    [ -n "$hit" ] && files+=("$hit")
+  done
+  [ ${#files[@]} -gt 0 ] || return 1
+  info "从离线包安装：$(printf '%s ' "${files[@]##*/}")"
+  local log
+  if log=$(sudo pacman -U --noconfirm --needed "${files[@]}" 2>&1); then
+    info "离线包安装完成"
+  else
+    warn "离线包安装失败，稍后回退联网"
+    dim "$(printf '%s' "$log" | tail -12)"
+    return 1
+  fi
+  # 记录装成的那几个（用包名前缀文件名去掉版本号）
+  local names=() base
+  for p in "${files[@]}"; do
+    base="$(basename "$p")"
+    names+=("${base%%-[0-9]*}")
+  done
+  mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+  printf '%s\n' "${names[*]}" > "$(offline_stamp)" 2>/dev/null || true
+  return 0
+}
+
+# 离线包是不是比系统仓库还旧。SteamOS 换镜像后 holo 仓库里的 espeak-ng
+# 之类可能已经升级过一轮，再用旧包装回去会被 pacman 判成降级。
+# 这里只做提示，不拦着装——离线优先本来就是用在断网场景。
+offline_check_fresh() {
+  [ -d "$OFFLINE_DIR" ] || return 0
+  need_cmd expac || return 0
+  local p f lv
+  for f in "$OFFLINE_DIR"/*.pkg.tar.zst; do
+    [ -e "$f" ] || continue
+    p=$(basename "$f")
+    p="${p%%-[0-9]*}"
+    lv=$(expac -S '%v' "$p" 2>/dev/null | head -n1)
+    [ -n "$lv" ] || continue
+    local have
+    have=$(basename "$f" .pkg.tar.zst)
+    have="${have#"$p"-}"
+    have="${have%-*}"
+    if [ "$(printf '%s\n%s\n' "$have" "$lv" | sort -V | tail -n1)" = "$lv" ] && [ "$have" != "$lv" ]; then
+      warn "离线包 $p $have 比系统仓库的 $lv 旧"
+      dim "断网时装它仍可用；联网时建议让它走仓库：bash install.sh install --deps"
+    fi
+  done
+}
+
 deps_intro() {
   # 安装前把每个控件是干什么的说清楚，用户才知道为什么要给 sudo
   local miss_pacman=() miss_aur=() miss_other=()
@@ -278,12 +343,23 @@ deps_intro() {
   [ ${#miss_pacman[@]} -gt 0 ] && dim "待安装（pacman）：${miss_pacman[*]}"
   [ ${#miss_aur[@]}    -gt 0 ] && dim "待安装（AUR）：${miss_aur[*]}（需要 paru 或 yay）"
   [ ${#miss_other[@]}  -gt 0 ] && dim "未找到：${miss_other[*]}（KDE 一般自带，可忽略）"
+  # 有离线包就先说一声，用户能预期「不用等下载」
+  if [ -d "$OFFLINE_DIR" ]; then
+    local n; n=$(find "$OFFLINE_DIR" -maxdepth 1 -name '*.pkg.tar.zst' 2>/dev/null | wc -l)
+    if [ "${n:-0}" -gt 0 ]; then
+      dim "包内自带离线依赖 ${n} 个，将优先本地安装，失败再联网"
+      offline_check_fresh
+    fi
+  fi
   dim "安装过程会用 sudo 关闭 SteamOS 根分区只读保护并安装系统包，不会改动你的游戏与个人文件。"
 }
 
 ask_yes() {
   # 只有在 stdin 不是终端（例如被别处管道/程序调用）时才默认不装；
   # 直接粘贴多行命令时 stdin 仍是终端，正常询问
+  #
+  # 提示符用 [?] 而不是裸 ?：裸问号在部分字体里会落到 emoji 码位，
+  # 渲染成黄色的 ❓，和整屏的字符画对不上
   if [ ! -t 0 ]; then
     if [ -r /dev/tty ]; then
       printf '%s[?]%s %s [y/N] ' "$C_WARN" "$C_END" "$1" > /dev/tty
@@ -337,6 +413,24 @@ install_pacman_deps() {
   # 否则 pacman 会认为已装而直接跳过）。-Sy 而不 -Syu，避免顺带滚系统
   local log ok=1 pkgs=()
   [ ${#todo[@]} -gt 0 ] && pkgs+=("${todo[@]}")
+
+  # 离线优先：Release 自带 deploy/deps/ 时先吃本地包，不碰网络。
+  # 断网、壁纸引擎抢占带宽、holo 仓库抽风这几种情况下能不能装上，
+  # 差别就在这一步。装不上（包不全/依赖对不上）再走原来的联网流程。
+  local still=()
+  if [ ${#pkgs[@]} -gt 0 ] && [ -d "$OFFLINE_DIR" ]; then
+    if offline_pacman_install "${pkgs[@]}"; then
+      local p
+      for p in "${pkgs[@]}"; do need_cmd "$p" || still+=("$p"); done
+      if [ ${#still[@]} -eq 0 ]; then
+        pkgs=()
+      else
+        warn "离线包装完仍缺：${still[*]}，回退联网"
+        pkgs=("${still[@]}")
+      fi
+    fi
+  fi
+
   if [ ${#pkgs[@]} -gt 0 ]; then
     if log=$(sudo pacman -Sy --needed --noconfirm "${pkgs[@]}" 2>&1); then
       info "pacman 安装完成"

@@ -269,11 +269,12 @@ deckmeido/
 
 ### 安装与首次使用
 
-- **初始配置向导** — `api_key` 为空时，后端只打印一行「LLM API Key 未配置，详见 config.toml」，新装用户不知道该去哪填。目标：首次启动引导，或 Web 面板首次打开时直接跳设置页
-- **`install.sh` 界面重做** — 现在只有 `==>` / `[!]` / `[x]` 四种前缀，没有 banner 和分区。目标：ASCII logo + 标题 + 框线分区 + 依赖表格 + 完成卡片
-- **`install.sh` 的 `?` 符号** — 第 188、194 行 `printf '%s?%s %s [y/N] '`，`%s` 是黄色转义，裸 `?` 在部分字体下会被渲染成 emoji 风格，观感很差。改成 `>>>` 或 `[?]`
-- **Release 内置离线依赖包** — `DEPS_PACMAN`（`espeak-ng` / `ydotool` / `wtype` / `fakeroot`）加 AUR 的 `kdotool-bin`，目前全靠联网现装，下载慢或断网时安装会卡住。目标：把 `.pkg.tar.zst` 一并打进 Release，`install.sh --deps` 优先本地包、失败再回退联网
-  - 注意：SteamOS 的 A/B 镜像切换会让 pacman 缓存失效，离线包路径要能跨镜像复用
+- ~~**初始配置向导**~~ — 已做：Web 面板首次拿到 status 时若 `llm_configured` 为 false 就直接弹出设置页（原先用 `fetch('/api/config')` 并发判断，经常抢在 status 之前拿不到结果而错过引导，已改成等 status 决定）。后端未配置时的回复也改成引导文案
+- ~~**`install.sh` 界面重做**~~ — 已做：figlet `Big` 字体的大字标题 + 框线分区 + 依赖表格 + 完成卡片
+- ~~**`install.sh` 的 `?` 符号**~~ — 已做：改为 `[?]`
+- ~~**Release 内置离线依赖包**~~ — 已做：`tools/fetch_offline_deps.sh` 把依赖树下载到 `deploy/deps/`，`make_release.sh` 打进发布包，`install.sh` 优先 `pacman -U` 本地包、装不上或实测仍缺再回退联网
+  - SteamOS 的 A/B 镜像切换会让 pacman 缓存失效，所以离线包独立存放在 `deploy/deps/`，不复用 `/var/cache/pacman/pkg`
+  - 离线包不进仓库（`.gitignore`），发版前在 Deck 上重跑一次 `fetch_offline_deps.sh`，否则包会比 holo 仓库旧
 
 ### 工具能力
 
