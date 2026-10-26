@@ -5,24 +5,48 @@
 # 这样改完代码只要重启 Decky 就能生效，不用重复部署。
 #
 # 用法：
-#   bash plugin/deploy.sh           构建并部署
-#   bash plugin/deploy.sh --remove  卸载插件
-#   bash plugin/deploy.sh --no-build 跳过前端构建（dist 已存在时用）
+#   bash plugin/deploy.sh               构建并部署
+#   bash plugin/deploy.sh --remove      卸载插件
+#   bash plugin/deploy.sh --no-build    跳过前端构建（dist 已存在时用）
+#   bash plugin/deploy.sh --check       只报状态，不改任何东西（install.sh 用）
+#
+# 退出码：0 = 已就绪 / 成功；1 = 失败；2 = 环境不具备（没装 Decky、没装 npm），
+# 这种情况 install.sh 不该当错误处理，只提示一句。
+#
+# 被 install.sh 调用时（DECKMEIDO_NONINTERACTIVE=1）不打印颜色和多余提示。
 set -euo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGINS_ROOT="${DECKY_PLUGINS_DIR:-$HOME/homebrew/plugins}"
 TARGET="$PLUGINS_ROOT/DeckMeido"
+NONINTERACTIVE="${DECKMEIDO_NONINTERACTIVE:-0}"
 
 C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_END=$'\033[0m'
-[ -t 1 ] || { C_OK=""; C_WARN=""; C_ERR=""; C_DIM=""; C_END=""; }
+if [ ! -t 1 ] || [ "$NONINTERACTIVE" = "1" ]; then C_OK=""; C_WARN=""; C_ERR=""; C_DIM=""; C_END=""; fi
 info() { printf '%s==>%s %s\n' "$C_OK" "$C_END" "$*"; }
 warn() { printf '%s[!]%s %s\n' "$C_WARN" "$C_END" "$*"; }
 die()  { printf '%s[x]%s %s\n' "$C_ERR" "$C_END" "$*" >&2; exit 1; }
 dim()  { printf '%s    %s%s\n' "$C_DIM" "$*" "$C_END"; }
 
+case "${1:-}" in
+  --remove) MODE=remove ;;
+  --check)  MODE=check ;;
+  --no-build) MODE=deploy; BUILD=0 ;;
+  "")       MODE=deploy; BUILD=1 ;;
+  *)        die "不认识的参数：$1（可用：--remove / --check / --no-build）" ;;
+esac
+BUILD="${BUILD:-1}"
+
+# ---- 只看状态 ----
+if [ "$MODE" = "check" ]; then
+  [ -d "$PLUGINS_ROOT" ] || { dim "没装 Decky Loader（$PLUGINS_ROOT 不存在），跳过插件"; exit 2; }
+  [ -L "$TARGET" ] && info "Decky 插件已链接到 $PLUGIN_DIR" || { warn "Decky 插件未部署"; exit 1; }
+  [ -f "$PLUGIN_DIR/dist/index.js" ] || { warn "插件缺 dist/index.js，需要构建"; exit 1; }
+  exit 0
+fi
+
 # ---- 卸载 ----
-if [ "${1:-}" = "--remove" ]; then
+if [ "$MODE" = "remove" ]; then
   if [ -L "$TARGET" ] || [ -d "$TARGET" ]; then
     rm -rf "$TARGET"
     info "已移除 $TARGET"
@@ -35,7 +59,9 @@ fi
 
 # ---- 前置检查 ----
 if [ ! -d "$PLUGINS_ROOT" ]; then
-  die "没找到 $PLUGINS_ROOT。请先安装 Decky Loader：https://github.com/SteamDeckHomebrew/decky-loader"
+  warn "没找到 $PLUGINS_ROOT，跳过插件部署"
+  dim "装好 Decky Loader 后再跑一次：bash plugin/deploy.sh"
+  exit 2
 fi
 
 if [ "$(id -u)" = "0" ]; then
@@ -43,7 +69,7 @@ if [ "$(id -u)" = "0" ]; then
 fi
 
 # ---- 构建前端 ----
-if [ "${1:-}" != "--no-build" ]; then
+if [ "$BUILD" = "1" ]; then
   need_build=1
   if [ -d "$PLUGIN_DIR/dist" ] && [ -f "$PLUGIN_DIR/package.json" ]; then
     # dist 比源码新就跳过，省得每次都等 npm
@@ -54,7 +80,11 @@ if [ "${1:-}" != "--no-build" ]; then
   fi
 
   if [ "$need_build" = "1" ]; then
-    command -v npm >/dev/null 2>&1 || die "没装 npm（pacman -S nodejs npm）"
+    if ! command -v npm >/dev/null 2>&1; then
+      warn "没装 npm，无法构建插件前端"
+      dim "装好 nodejs/npm 后再跑：bash plugin/deploy.sh"
+      exit 2
+    fi
     info "构建前端"
     cd "$PLUGIN_DIR"
     if [ ! -d node_modules ]; then
