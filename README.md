@@ -286,6 +286,15 @@ deckmeido/
 - **手机端上下文用量徽章** — `index.html:787` 在 ≤560px 时用 `display:none !important` 把徽章隐藏，注释写「移到侧栏状态卡」，但侧栏 `pollSys()` 并没有这一项，导致窄屏完全看不到用量。目标：在侧栏补上
 - **文件下载改气泡卡片** — 生成的文件目前只能给一条裸 URL 让用户复制。目标：以附件气泡呈现（图标 + 文件名 + 大小），右侧独立下载按钮，点击直接另存
 
+### 实时画面
+
+- **网页端实时画面（MJPEG 推流）** — 网页端以 30fps 或可变帧率查看设备实时画面，用于遥控时确认状态
+  - 路线：游戏模式复用现有 gamescope PipeWire 节点，`pipewiresrc ! videorate ! videoscale ! jpegenc ! multipartmux ! fdsink` 常驻管线，前端 `<img src="/api/stream?token=…">` 走浏览器原生 MJPEG；桌面模式只能走 portal `ScreenCast`（`CreateSession` / `SelectSources` / `Start` / `OpenPipeWireRemote` 接口齐全，但首次需用户在弹出的系统对话框里授权）
+  - 实测数据：`gst-launch-1.0` 的 `pipewiresrc` / `jpegenc` / `multipartmux` 三个插件齐备；1280×800 q70 约 16KB/帧（PIL 编码 129fps，CPU 有余量），30fps ≈ 0.5MB/s，960×600 q60 ≈ 0.3MB/s
+  - 已排除：`mss` 抓 30 帧仅 0.12s 但 Wayland 原生 gamescope 表面全黑；`spectacle` 单次 806ms，约 1.2fps
+  - 已知坑：遮罩是独立 Layer Shell 窗口，游戏模式截不到但桌面模式会混入画面，推流期间需自动 `lift` 或由前端叠加；持续 30fps 编码在掌机上有耗电与发热代价，默认按需（静止降帧 / 帧差触发）；MJPEG 流必须挂 `check_token`，否则等于新开一个免密看屏入口
+  - 待定：分辨率与画质档位、是否只在对话框打开时推流、要不要另做 WebRTC 备选（延迟更低但实现重）
+
 ### 游戏模式
 
 - **远程控制** — 让局域网设备通过 HTTP 注入按键与触摸，实现「远程下一句指令，agent 代为操作」。路线已确认：`ydotool`（键鼠，`ydotoold` 已在跑）+ `/dev/uinput`（手柄，`deck` 已在 `input` 组且设备可写）；decky-flow 的 EIS 桥是本机 Unix socket 而非网桥，这一层可以省掉
