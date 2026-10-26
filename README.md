@@ -42,7 +42,8 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 | 能力 | 说明 |
 | --- | --- |
 | 打开与操作桌面 | 聚焦窗口、按屏幕坐标点击、移动光标、输入文本 |
-| 截图 | 游戏模式（gamescope）走 PipeWire 抓帧；桌面模式 spectacle 优先，失败退回 mss；截图时自动收起遮罩 |
+| 游戏模式 | Decky 插件（QAM 面板）里直接对话、看流式回答、虚拟手柄按键；截帧走 gamescope PipeWire 节点 |
+| 截图 | 游戏模式（gamescope）走 PipeWire 抓帧；桌面模式 spectacle 优先，失败退回 mss；截图时自动收起遮罩；抓帧以 deck 用户身份降权执行（`XDG_RUNTIME_DIR` 必须是 `/run/user/1000`） |
 | 执行命令 | bash 命令，超时保护、危险命令识别；启动浏览器等常驻程序会自动判定并立即返回，不阻塞 |
 | Steam 库 | 列出已安装游戏、商店搜索、通过客户端下载安装（危险操作，强制确认） |
 | 模拟器 | 扫描 EmuDeck 标准目录 `~/Emulation/roms`，按机型统计 |
@@ -53,6 +54,9 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 ### 交互细节
 
 - **操作遮罩**：只在会动屏幕的工具执行期间显示半透明遮罩（点击、打字、滚动、拉起可见窗口），随时可点击终止；跑命令、翻文件这类纯后台动作不遮挡视线；注入鼠标/键盘的那几百毫秒内自动透明穿透，避免点击被遮罩吃掉；截图时自动收起
+- **音量键强制停止**：遮罩期间独占监听音量加/减键，按一下即终止当前操作，不用等画面卡住再找鼠标点。只在遮罩显示时 `EVIOCGRAB` 抢占设备，遮罩消失立刻放开，平时不影响调音量
+- **发起来源标注**：同一条对话里每条用户消息都带来源角标——`本端` / `网页` / `手机` / `客户端` / `QAM`。手机浏览器按 UA 自动识别，无需手动设置；没标来源的老消息不显示角标
+- **控件自检三态**：绿灯可用 / 红灯故障 / 灰灯「当前环境不适用」（如游戏模式下没有 KWin，`kdotool` 不再误报红灯）。灯色只统计真正需要工作的控件，游戏模式下显示为 `x/5` 而非 `x/6`
 - **权限三档**（作用于 `run_command`）：`manual` 每条命令都审批 / `auto` 只读自动、命中危险特征才确认 / `full` 完全放行。`write_file` / `edit_file` 不受此开关约束，任何模式下都直接落盘；`install_game` 与 `self_update upgrade` 无论模式如何都强制确认
 - **语音播报**：调用 Deck 内置 TTS，在掌机扬声器上念出回复
 - **图片上传**：拖拽或点击上传，服务端按类型分类存储
@@ -299,16 +303,28 @@ deckmeido/
 
 ### 游戏模式
 
+- ~~**Decky 插件载体**~~ — 已做：`plugin/` 是独立 Decky 插件，`plugin/deploy.sh` 装到 `~/homebrew/plugins`（目录属 `root:root`，需要 sudo，或建软链接指向 `~/deckmeido/plugin`）。QAM 面板里能对话、看流式回答、点虚拟手柄
+- ~~**游戏内截帧**~~ — 已做：`pw-dump` 找到 `node.name=gamescope` 且 `media.class=Video/Source` 的节点，`gst-launch-1.0` 抓帧。踩过两个坑：① root 跑时要 `runuser -u deck` 降权，`XDG_RUNTIME_DIR` 必须指向 `/run/user/1000`；② `pipewiresrc path=N num-buffers=6` 必须拆成独立 argv token，整段塞一个 token 会让 gst 报 `syntax error` 并静默降级成纯文本
+- ~~**虚拟手柄**~~ — 已做：`plugin` 侧 `_VirtualPad` 走 `/dev/uinput`，ABXY / 十字键 / 摇杆可用；`deck` 用户对 `/dev/uinput` 有 ACL（`user:deck:rw-`）
 - **远程控制** — 让局域网设备通过 HTTP 注入按键与触摸，实现「远程下一句指令，agent 代为操作」。路线已确认：`ydotool`（键鼠，`ydotoold` 已在跑）+ `/dev/uinput`（手柄，`deck` 已在 `input` 组且设备可写）；decky-flow 的 EIS 桥是本机 Unix socket 而非网桥，这一层可以省掉
   - 前置：**先做网络鉴权**。`:18765` 目前无 token 监听 `0.0.0.0`，等于把「可执行命令」的入口开放给整个局域网
-  - 待实测：切到 gamescope 后后端（user 级 systemd）是否被重建、`ydotoold` 是否存活
-  - 待补：`ydotool` 造不出 uinput gamepad（ABXY / 摇杆 / 扳机），需另写虚拟手柄
+  - 已实测：切到 gamescope 后后端存活、`:18765` 正常监听、`ydotoold` 未断、QAM 的 WebSocket 连通
   - 定位：LLM 推理一来一回 1~3 秒，不适合动作游戏，适合「帮我跑日常 / 挂机刷素材」
+- **抓帧失败要有提示** — 现在 PipeWire 抓帧失败会静默降级成纯文本问答，界面上看不出「这张图没抓到」，用户会以为模型没看画面
+
+### 已知问题
+
+- **切游戏模式时 PySide6 客户端崩溃** — `The Wayland connection broke`。客户端是 Wayland 原生窗口，gamescope 会话重建时连接被断
+- **journal 每分钟一条 sudo 噪声** — `a password is required ... USER=root ; COMMAND=/usr/bin/true`，来源是 `depcheck.sudo_nopasswd()` 的免密探测
+- **`plugin/` 目录所有权会漂移** — Decky 以 root 写入插件目录，一次之后 `plugin/` 就变成 `root:root`，deck 用户再 `git pull` 会报 `unable to unlink old 'plugin/main.py': Permission denied`，需要 `sudo chown -R deck:deck` 修回
+
+### 游戏模式（续）
+
 - **Decky 插件联动查攻略** — 游戏里按一下「查攻略」：截当前画面 → 交给 DeckMeido 推理 → 结果回到 QAM 面板或手机端
   - 载体：独立 Decky 插件。`plugin_loader.service` 是 `multi-user.target` + `User=root`，切 gamescope 不会停，是游戏模式下唯一可靠的常驻入口；DeckMeido 后端是 user 级，切会话大概率断
   - 三块能力：游戏内截帧 / QAM 入口 + 热键 / 调后端推理并回显
   - 待拍板：攻略来源（内置库 / 现搜 / 先搜后总结）、截帧触发（手动 / 自动识别）、结果呈现位置、是否注册全局热键（会与 Steam 输入争抢）
-  - 已知风险：gamescope 下 `kdotool` 全废；PipeWire 截帧只在桌面模式验证过，游戏模式需实测
+  - 已知风险：gamescope 下 `kdotool` 全废（自检已改为灰灯「不适用」）；PipeWire 截帧已在游戏模式实测通过
 
 ### 依赖
 
