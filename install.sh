@@ -41,9 +41,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------- 输出 ----------
 if [ -t 1 ]; then
-  C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_END=$'\033[0m'
+  C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'
+  C_B=$'\033[1m'; C_C=$'\033[36m'; C_END=$'\033[0m'
 else
-  C_OK=""; C_WARN=""; C_ERR=""; C_DIM=""; C_END=""
+  C_OK=""; C_WARN=""; C_ERR=""; C_DIM=""; C_B=""; C_C=""; C_END=""
 fi
 info() { printf '%s==>%s %s\n' "$C_OK" "$C_END" "$*"; }
 warn() { printf '%s[!]%s %s\n' "$C_WARN" "$C_END" "$*"; }
@@ -51,6 +52,101 @@ die()  { printf '%s[x]%s %s\n' "$C_ERR" "$C_END" "$*" >&2; exit 1; }
 dim()  { printf '%s    %s%s\n' "$C_DIM" "$*" "$C_END"; }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------- 文本宽度 ----------
+# 终端里中文占 2 列，按字符数排版框线一定会歪，这里按显示宽度算。
+# 只覆盖中日韩 + 全角标点，够本脚本用了（纯 bash，不依赖 wc -L）
+disp_len() {
+  local s="$1" i cp w=0
+  for ((i = 0; i < ${#s}; i++)); do
+    printf -v cp '%d' "'${s:i:1}"
+    # UTF-8 首字节之外的位置 "'x" 拿到的是字节值，汉字会 >127，按 2 列处理
+    if [ "$cp" -ge 9472 ] || { [ "$cp" -ge 128 ] && [ "$cp" -lt 256 ]; }; then
+      w=$((w + 2))
+    else
+      w=$((w + 1))
+    fi
+  done
+  printf '%s' "$w"
+}
+
+# 终端够不够宽：中文按 2 列算，banner 最宽约 70 列
+term_cols() {
+  local c="${COLUMNS:-}"
+  [ -n "$c" ] || c=$(tput cols 2>/dev/null || echo 80)
+  printf '%s' "${c:-80}"
+}
+ui_fits() { [ -t 1 ] && [ "$(term_cols)" -ge 72 ]; }
+
+HRULE="────────────────────────────────────────────────────────────"
+
+# 分区标题：┌─ 名称 ───────
+section() {
+  local title="$1"
+  if ui_fits; then
+    local head="── $title " used fill
+    used=$(disp_len "$head")
+    fill=$((62 - used))
+    [ "$fill" -lt 2 ] && fill=2
+    printf '\n%s┌%s%s%s\n' "$C_C" "$head" "$(printf '─%.0s' $(seq 1 "$fill"))" "$C_END"
+  else
+    printf '\n==> %s\n' "$title"
+  fi
+}
+
+# 表格一行：左列定宽 14，右列自动换行不缩进过头
+table_row() {
+  local left="$1" right="$2" pad
+  pad=$((14 - $(disp_len "$left")))
+  [ "$pad" -lt 1 ] && pad=1
+  printf '  %s%s%s%*s%s\n' "$C_OK" "$left" "$C_END" "$pad" "" "$right"
+}
+
+# 完成卡片：带边框的结果汇总
+card() {
+  if ui_fits; then printf '\n%s┌%s┐%s\n' "$C_C" "$HRULE" "$C_END"; else echo; fi
+}
+card_line() {
+  local text="$1" pad
+  if ui_fits; then
+    pad=$((58 - $(disp_len "$text")))
+    [ "$pad" -lt 0 ] && pad=0
+    printf '%s│%s %s%*s%s│%s\n' "$C_C" "$C_END" "$text" "$pad" "" "$C_C" "$C_END"
+  else
+    printf '  %s\n' "$text"
+  fi
+}
+card_title() {
+  local text="$1" pad
+  if ui_fits; then
+    pad=$((58 - $(disp_len "$text")))
+    [ "$pad" -lt 0 ] && pad=0
+    printf '%s│%s %s%s%s%*s%s│%s\n' "$C_C" "$C_END" "$C_B" "$text" "$C_END" "$pad" "" "$C_C" "$C_END"
+  else
+    printf '%s\n' "$text"
+  fi
+}
+card_end() {
+  if ui_fits; then printf '%s└%s┘%s\n' "$C_C" "$HRULE" "$C_END"; fi
+}
+
+# 开场：DeckMeido 大字（figlet "Big" 字体），下面接标题与简介
+print_banner() {
+  ui_fits || return 0
+  printf '%s\n' "$C_C"
+  cat <<'ART'
+ _____            _    __  __      _     _
+|  __ \          | |  |  \/  |    (_)   | |
+| |  | | ___  ___| | _| \  / | ___ _  __| | ___
+| |  | |/ _ \/ __| |/ / |\/| |/ _ \ |/ _` |/ _ \
+| |__| |  __/ (__|   <| |  | |  __/ | (_| | (_) |
+|_____/ \___|\___|_|\_\_|  |_|\___|_|\__,_|\___/
+ART
+  printf '%s\n' "$C_END"
+  printf '\n  %s住在 Steam Deck 里的 AI 女仆%s\n' "$C_B" "$C_END"
+  printf '  %s替你聊天、查攻略、开游戏、点屏幕——这一台掌机的女仆%s\n' "$C_DIM" "$C_END"
+  printf '  %s%s%s\n\n' "$C_DIM" "$(printf '─%.0s' $(seq 1 54))" "$C_END"
+}
 
 # SteamOS 镜像号：换镜像时 /usr 下 pacman 装的包会被整片冲掉，这是本脚本
 # 一切「装完还要实测」逻辑的根源。之前 BUILD_ID 从未赋值，导致镜像变动
@@ -162,17 +258,22 @@ deps_intro() {
   need_cmd kdotool   || miss_aur+=("${DEPS_AUR[0]}")
   need_cmd spectacle || miss_other+=("spectacle")
 
-  echo
-  info "关于控制类系统控件（推荐安装）"
+  section "控制类系统控件（推荐安装）"
   dim "DeckMeido 的「帮你在桌面上操作」能力依赖下面这些系统包；"
   dim "不装也能聊天、截图、执行命令，但没法替你点鼠标、敲键盘、念出回复。"
   echo
-  printf '  %sydotool%s   模拟鼠标点击 / 键盘输入（搭配 ydotoold 守护进程）\n' "$C_OK" "$C_END"
-  printf '  %skdotool%s   按窗口标题查找并聚焦窗口，配合 ydotool 点击正确的位置\n' "$C_OK" "$C_END"
-  printf '  %swtype%s     Wayland 原生打字，ydotool type 不支持中文时的备选\n' "$C_OK" "$C_END"
-  printf '  %sespeak-ng%s 把回复念出来（语音播报）\n' "$C_OK" "$C_END"
-  printf '  %sfakeroot%s  编译 AUR 包（kdotool）时 makepkg 必需的构建依赖\n' "$C_OK" "$C_END"
-  printf '  %sspectacle%s KDE 截图工具，用于「看看当前屏幕」\n' "$C_OK" "$C_END"
+  local st
+  for p in ydotool kdotool wtype espeak-ng fakeroot spectacle; do
+    if need_cmd "$p"; then st="${C_OK}已装${C_END}"; else st="${C_WARN}待装${C_END}"; fi
+    case "$p" in
+      ydotool)   table_row "$p" "$st  模拟鼠标点击 / 键盘输入（搭配 ydotoold 守护进程）" ;;
+      kdotool)   table_row "$p" "$st  按窗口标题查找并聚焦窗口，配合 ydotool 点击正确的位置" ;;
+      wtype)     table_row "$p" "$st  Wayland 原生打字，ydotool type 不支持中文时的备选" ;;
+      espeak-ng) table_row "$p" "$st  把回复念出来（语音播报）" ;;
+      fakeroot)  table_row "$p" "$st  编译 AUR 包（kdotool）时 makepkg 必需的构建依赖" ;;
+      spectacle) table_row "$p" "$st  KDE 截图工具，用于「看看当前屏幕」" ;;
+    esac
+  done
   echo
   [ ${#miss_pacman[@]} -gt 0 ] && dim "待安装（pacman）：${miss_pacman[*]}"
   [ ${#miss_aur[@]}    -gt 0 ] && dim "待安装（AUR）：${miss_aur[*]}（需要 paru 或 yay）"
@@ -185,13 +286,13 @@ ask_yes() {
   # 直接粘贴多行命令时 stdin 仍是终端，正常询问
   if [ ! -t 0 ]; then
     if [ -r /dev/tty ]; then
-      printf '%s?%s %s [y/N] ' "$C_WARN" "$C_END" "$1" > /dev/tty
+      printf '%s[?]%s %s [y/N] ' "$C_WARN" "$C_END" "$1" > /dev/tty
       read -r ans < /dev/tty || return 1
     else
       return 1
     fi
   else
-    printf '%s?%s %s [y/N] ' "$C_WARN" "$C_END" "$1"
+    printf '%s[?]%s %s [y/N] ' "$C_WARN" "$C_END" "$1"
     read -r ans || return 1
   fi
   case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
@@ -817,34 +918,43 @@ PY
 }
 
 print_done() {
-  local ip token
+  local ip token ve
   ip=$(lan_ip)
   [ -n "$ip" ] || ip=$(hostname -I 2>/dev/null | awk '{print $1}')
   [ -n "$ip" ] || ip="<deck-ip>"
   token=$(read_token)
+  ve=$(cat "$INSTALL_DIR/VERSION" 2>/dev/null || echo '未知')
+  card
+  card_title "DeckMeido 已就绪  ·  v$ve"
+  card_line ""
+  card_line "本机控制台   http://127.0.0.1:$PORT/?token=$token"
+  card_line "局域网访问   http://$ip:$PORT/?token=$token"
+  card_line "访问令牌     默认 meido，可在客户端设置页修改"
+  card_line "配置文件     $INSTALL_DIR/server/config.toml"
+  card_line ""
+  card_line "首次打开地址会弹出设置页，填 API 地址与 Key 即可对话"
+  card_line "以后升级     bash $INSTALL_DIR/install.sh upgrade"
+  card_line "卸载         bash $INSTALL_DIR/uninstall.sh"
+  card_line "             （加 --purge 连配置、会话、工作区一起删）"
+  card_end
   echo
-  info "DeckMeido 已就绪"
-  dim "本机控制台:  http://127.0.0.1:$PORT/?token=$token"
-  dim "局域网访问:  http://$ip:$PORT/?token=$token"
-  dim "访问令牌默认为 meido 可在客户端设置页修改"
-  dim "配置文件:    $INSTALL_DIR/server/config.toml"
-  dim "卸载脚本:    bash $INSTALL_DIR/uninstall.sh   （加 --purge 连配置一起删）"
-  echo
-  dim "下一步：打开上面的地址，首次会弹出设置页，填 API 地址与 Key 即可对话"
-  dim "以后升级：网页设置页点「检查更新」，或执行 bash $INSTALL_DIR/install.sh upgrade"
-  echo
-  dim "当前版本:    $(cat "$INSTALL_DIR/VERSION" 2>/dev/null || echo '未知')"
 }
 
 # ---------- 子命令 ----------
 do_install() {
   local deps="${1:-}"
+  print_banner
+  section "环境预检"
   check_prereq
   info "安装目录：$INSTALL_DIR"
   preflight
+  section "同步程序文件"
   sync_files
+  section "Python 运行环境"
   venv_install
+  section "写入配置"
   prepare_config
+  section "桌面入口与服务"
   stop_service
   install_service
   install_desktop
@@ -861,6 +971,7 @@ do_install() {
       dim "已跳过。之后想装：bash install.sh install --deps"
     fi
   fi
+  section "启动"
   # 服务由客户端拉起：装完顺手开一次客户端，后台服务就一并起来了
   if launch_client && wait_ready; then
     print_done
@@ -887,12 +998,17 @@ stop_client() {
 do_upgrade() {
   local deps="${1:-}"
   [ -d "$INSTALL_DIR" ] || die "$INSTALL_DIR 不存在，请先执行安装"
+  print_banner
+  section "环境预检"
   check_prereq
   # 顺序要紧：先停客户端（否则它的 watchdog 会把旧后端拉回来），再停服务
   stop_client
   stop_service
+  section "同步程序文件"
   sync_files
+  section "Python 运行环境"
   venv_install
+  section "桌面入口与服务"
   install_service
   install_desktop
   install_uninstaller
@@ -902,6 +1018,7 @@ do_upgrade() {
   else
     system_notes
   fi
+  section "启动"
   # 服务由客户端拉起：升级后关掉旧客户端再开新的，新代码才会生效
   launch_client && wait_ready || true
   if need_cmd curl && wait_ready; then
