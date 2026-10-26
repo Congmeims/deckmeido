@@ -23,12 +23,25 @@ import time
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QPointF
+from PySide6.QtCore import Qt, QTimer, QPointF, QEvent, QCoreApplication
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFrame, QGraphicsDropShadowEffect, QLabel, QVBoxLayout, QWidget,
 )
+
+
+class _StopRequested(QEvent):
+    """监听线程 → 主线程：请把当前任务停掉
+
+    用自定义 QEvent 而不是 QTimer.singleShot：后者要求调用线程有 Qt 事件循环，
+    监听线程没有；postEvent 则是线程安全的，事件会排进接收者的线程队列。
+    """
+    TYPE = QEvent.Type(QEvent.registerEventType())
+
+    def __init__(self):
+        super().__init__(self.TYPE)
+
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 LOGO_PX = 152     # 卡片上方 logo 的显示边长
@@ -581,8 +594,21 @@ class Mask(QWidget):
 
     # ---------- 交互 ----------
     def _on_volume_stop(self):
-        """音量键回调：来自监听线程，交回 Qt 主线程再动界面"""
-        QTimer.singleShot(0, self._cancel)
+        """音量键回调：来自监听线程，交回 Qt 主线程再动界面
+
+        不能用 QTimer.singleShot：它在调用线程找一个有事件循环的 QThread，
+        而监听线程是纯 Python 线程、没有 Qt 事件循环，定时器就是死的——
+        实测按键能读到（日志有 stop by key），但 _cancel 一次都没执行。
+        改走事件总线：postEvent 是线程安全的，事件会排进主线程的事件队列。
+        """
+        QCoreApplication.postEvent(self, _StopRequested())
+
+    def event(self, ev):
+        # 音量键的停止请求从监听线程投递过来，在这里回到主线程执行
+        if ev.type() == _StopRequested.TYPE:
+            self._cancel()
+            return True
+        return super().event(ev)
 
     def mousePressEvent(self, ev):
         if ev.button() == Qt.LeftButton:
