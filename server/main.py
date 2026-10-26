@@ -1046,6 +1046,44 @@ async def api_files():
     return {"workspace": str(tools.WORKSPACE), "files": out}
 
 
+@app.get("/files/{path:path}", dependencies=[Depends(check_token)])
+async def api_workspace_file(path: str):
+    """下载工作区里的文件（网页端附件卡片用）
+
+    路径必须落在工作区内：模型给的链接是相对工作区的路径，这里只认这个根，
+    防止 ../ 一路穿到工作区外面去。
+    """
+    root = tools.WORKSPACE.resolve()
+    try:
+        target = (root / path).resolve()
+    except OSError:
+        raise HTTPException(status_code=404, detail="file not found")
+    if root != target and root not in target.parents:
+        raise HTTPException(status_code=403, detail="outside workspace")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    return FileResponse(target, filename=target.name)
+
+
+@app.post("/api/file_stat", dependencies=[Depends(check_token)])
+async def api_file_stat(payload: dict):
+    """附件卡片补大小：{path: 相对工作区的路径} → {size, name}"""
+    rel = str(payload.get("path", "")).strip()
+    if not rel:
+        raise HTTPException(status_code=404, detail="file not found")
+    root = tools.WORKSPACE.resolve()
+    try:
+        target = (root / rel).resolve()
+    except OSError:
+        raise HTTPException(status_code=404, detail="file not found")
+    if root != target and root not in target.parents:
+        raise HTTPException(status_code=403, detail="outside workspace")
+    try:
+        return {"size": target.stat().st_size, "name": target.name}
+    except OSError:
+        raise HTTPException(status_code=404, detail="file not found")
+
+
 @app.get("/api/status", dependencies=[Depends(check_token)])
 async def api_status():
     return get_status()
@@ -1373,15 +1411,11 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
         await compact_history(auto=True, hist=hist)
 
     try:
-        # 遮罩从这一轮开始就常显，一直到模型开始写正式回答为止。
-        #
-        # 为什么要常显：遮罩的用途是给用户一个「随时点一下终止」的入口，而 agent
-        # 操作桌面的时候用户的手是没法直接按终止的；反过来，真正在注入鼠标的那几
-        # 百毫秒里遮罩反而要藏起来（见 set_overlay_passthrough），否则点击会打在
-        # 遮罩上被当成「用户终止」。以前只在「点鼠标/打字」的那一下亮，于是整轮
-        # 思考过程（模型推理、翻文件、跑命令、写剪贴板）屏幕都是干净的，
-        # 用户既看不到状态，也没有终止入口。
-        set_overlay(True, "正在思考")
+        # 遮罩不再整轮常显：只有真的会动屏幕的工具（desktop 注入、xdotool/ydotool
+        # 一类命令、拉起可见窗口）才在屏幕最上层盖一层，给用户一个「随时点一下终止」
+        # 的入口 —— 那时候用户的手没法直接按终止。翻文件、跑后台命令、查天气这些
+        # 不需要看屏幕的活儿不再挡视线，省得连「清空回收站」都要盖住全屏。
+        # 遮罩的起落就在下面调用工具的前后（见 tools.touches_screen），这里不再常开。
         if not llm.configured:
             reply = "还没有配置模型。点右上角「设置」填好 API 地址和 Key 就能开始对话。"
         elif pending_action and tools.is_confirm(text):
@@ -2035,9 +2069,9 @@ def set_overlay(show: bool, text: str = "") -> None:
         _overlay_state["text"] = text
     if not show:
         _overlay_state["since"] = 0.0
-        # 不要在这里顺手把 passthrough 清掉：模型开始写回答（set_overlay(False)）
-        # 时可能正好有一次点击注入在跑，清了之后遮罩会重新冒出来挨这一下点击，
-        # 于是又被当成「用户终止」。passthrough 只由 set_overlay_passthrough 收
+        # 不要在这里顺手把 passthrough 清掉：可能正好有一次点击注入在跑，清了之后
+        # 遮罩会重新冒出来挨这一下点击，于是又被当成「用户终止」。passthrough 只由
+        # set_overlay_passthrough 收
         # 遮罩收起：不再需要为它压着电源抑制（命令还在跑的话那条原因仍在，
         # 计数归零才真的释放，见 power.AwakeKeeper）
         power.keeper.release("overlay")
@@ -2060,8 +2094,8 @@ _OVERLAY_MAX_HOLD = 300.0
 def _overlay_watchdog() -> None:
     """兜底线程：遮罩亮着太久就强制收起，别让它一直挡住屏幕。
 
-    遮罩在整轮思考期间常显，正常结束时 handle_chat 的 finally 会收掉；
-    取消、异常、工具执行到一半被终止，任一环节漏掉 set_overlay(False)，
+    遮罩在「会动屏幕」的工具执行期间常显（见 tools.touches_screen），正常收尾由
+    调用方 set_overlay(False)；取消、异常、工具执行到一半被终止，任一环节漏掉，
     遮罩就会一直盖在那儿。这里按 _OVERLAY_MAX_HOLD 兜一个上限。
     """
     while True:
@@ -2281,8 +2315,8 @@ async def run_agent(events: list[dict], extra_system: str = "",
         stream_text.append(text)
         if not streaming:
             streaming = True
-            # 模型开始写正式回答 = 不再操作桌面，收起遮罩把屏幕还给用户
-            # （整轮常显的遮罩从这里结束，见 handle_chat 里的 set_overlay(True)）
+            # 模型开始写正式回答 = 不再操作桌面。若刚才那一步动屏的遮罩还亮着
+            # （正常情况工具收尾就收掉了），这里再兜一次，把屏幕还给用户
             set_overlay(False)
             await manager.broadcast({"type": "stream_start", "ts": time.time(), **_turn_tag()})
         # 增量落盘（此函数是 async 的，前端不会感知到这点磁盘开销）
@@ -2433,9 +2467,18 @@ async def run_agent(events: list[dict], extra_system: str = "",
                     event["path"] = str(args.get("path", ""))
                 activity = f"正在{label}：{summary}" if summary else f"正在{label}"
                 await manager.broadcast({"type": "tool_activity", "text": activity, "ts": time.time(), **_turn_tag()})
-                # 遮罩在整轮里保持常显（见 handle_chat），这里只更新卡片上的说明文字
-                set_overlay(True, activity)
-                result = await tools.execute(name, args)
+                # 遮罩只在真的要动屏幕的这一步亮起（见上面 handle_chat 里的说明）。
+                # 放在真正执行前才 set_overlay(True)：鼠标注入期间 tools 会让遮罩
+                # 穿透（set_overlay_passthrough），否则那一下点击会点在遮罩上
+                # 被当成「用户终止」
+                on_screen = tools.touches_screen(name, args)
+                if on_screen:
+                    set_overlay(True, activity)
+                try:
+                    result = await tools.execute(name, args)
+                finally:
+                    if on_screen:
+                        set_overlay(False)
                 # 终端输出截断后随事件展示（网页端显示为终端块）
                 event["output"] = result[:1500] + ("\n…（截断）" if len(result) > 1500 else "")
                 if name in ("write_file", "edit_file") and tools.LAST_DIFF:

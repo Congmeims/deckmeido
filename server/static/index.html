@@ -383,6 +383,26 @@
     outline: none;
   }
   .msg img.chat-img { display: block; max-width: 100%; border-radius: 8px; margin: 6px 0; }
+  /* 生成文件的气泡卡片：图标 + 文件名 + 大小，右侧独立下载按钮 */
+  .file-card {
+    display: flex; align-items: center; gap: 10px;
+    margin: 6px 0; padding: 9px 10px 9px 12px;
+    background: var(--surface-2); border: 1px solid var(--line);
+    border-radius: 10px; max-width: 100%;
+  }
+  .file-card .fc-icon { flex: 0 0 auto; font-size: 19px; line-height: 1; }
+  .file-card .fc-meta { flex: 1; min-width: 0; }
+  .file-card .fc-name {
+    display: block; font-size: 13px; color: var(--text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .file-card .fc-size { display: block; font-size: 11px; color: var(--muted); margin-top: 1px; }
+  .file-card .fc-dl {
+    flex: 0 0 auto; border: 1px solid var(--line); background: var(--surface);
+    color: var(--text); font-size: 12px; font-family: inherit;
+    padding: 5px 10px; border-radius: 8px; cursor: pointer;
+  }
+  .file-card .fc-dl:hover { border-color: var(--brand); color: var(--brand); }
   /* 附件菜单 / 文件选择弹层 */
   /* 弹层贴输入框左上方展开，左边距与下边距保持同一间距 */
   #plusMenu, #fileList {
@@ -727,7 +747,11 @@
   .bar { height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
   .fill { height: 100%; width: 0%; border-radius: 3px; background: var(--brand); transition: width .4s; }
   .fill.hot { background: var(--danger); }
+  .fill.warn { background: #e6b422; }
   .sys-val { font-size: 10.5px; font-family: ui-monospace, monospace; text-align: right; white-space: nowrap; }
+  /* 上下文行：窄屏时顶栏徽章被隐藏，改由这一行显示；宽屏有徽章就不重复占地方 */
+  #ctxRow { display: none; }
+  @media (max-width: 560px) { #ctxRow { display: grid; } }
   .sys-sub { margin-top: 9px; font-size: 11px; color: var(--muted); line-height: 1.5; text-align: center; }
   /* 拖拽附件时盖住整屏的提示层 */
   #dropHint {
@@ -783,7 +807,7 @@
     .status-text { max-width: 4em; }
     .hdr-right { gap: 5px; flex: 0 1 auto; min-width: 0; flex-wrap: nowrap; }
     .badge { padding: 3px 8px; font-size: 11px; }
-    /* 手机竖屏只保留模式徽章，电量与上下文移到侧栏状态卡 */
+    /* 手机竖屏顶栏只保留模式徽章：上下文用量移进侧栏状态卡（见 #ctxRow） */
     #ctxBadge, #modeBadge { display: none !important; }
     .hdr-right:empty { display: none; }
 
@@ -874,6 +898,7 @@
     <div class="sys-row"><span class="sys-name">RAM</span><div class="bar"><div class="fill" id="memFill"></div></div><span class="sys-val" id="memVal">–</span></div>
     <div class="sys-row"><span class="sys-name">SSD</span><div class="bar"><div class="fill" id="ssdFill"></div></div><span class="sys-val" id="ssdVal">–</span></div>
     <div class="sys-row" id="sdRow" hidden><span class="sys-name">TF</span><div class="bar"><div class="fill" id="sdFill"></div></div><span class="sys-val" id="sdVal">–</span></div>
+    <div class="sys-row" id="ctxRow" hidden><span class="sys-name">上下文</span><div class="bar"><div class="fill" id="ctxFill"></div></div><span class="sys-val" id="ctxVal">–</span></div>
     <div class="sys-sub" id="sysSub"></div>
   </div>
   <div class="sb-sess-head"><span>会话</span><button id="btnNewSess" title="新会话">＋</button></div>
@@ -1111,7 +1136,62 @@
   }
 
   function escapeHtml(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;');
+  }
+
+  // ---------- 生成文件的下载卡片 ----------
+  // 模型给文件的格式是 [名字](/files/<相对工作区的路径>)。以前只渲染成一条裸链接，
+  // 主人得右键另存；现在按扩展名配图标、带上大小，右侧一个独立下载按钮。
+  var FILE_ICONS = {
+    pdf: '📕', doc: '📘', docx: '📘', xls: '📗', xlsx: '📗', csv: '📗',
+    ppt: '📙', pptx: '📙', zip: '🗜️', '7z': '🗜️', tar: '🗜️', gz: '🗜️',
+    png: '🖼️', jpg: '🖼️', jpeg: '🖼️', gif: '🖼️', webp: '🖼️', svg: '🖼️',
+    mp3: '🎵', wav: '🎵', flac: '🎵', mp4: '🎬', mkv: '🎬', webm: '🎬',
+    py: '📜', js: '📜', ts: '📜', sh: '📜', json: '📜', md: '📝', txt: '📄'
+  };
+  function fmtSize(n) {
+    if (n == null) return '';
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+    return (n / 1073741824).toFixed(1) + ' GB';
+  }
+  function fileCardHtml(label, path) {
+    var name = label || path.split('/').pop() || path;
+    var ext = (name.split('.').pop() || '').toLowerCase();
+    var url = '/files/' + path.split('/').map(encodeURIComponent).join('/');
+    // 下载走 GET，只能靠查询参数带上令牌（浏览器不会给 <a> 加自定义头）
+    var href = url + (token ? '?token=' + encodeURIComponent(token) : '');
+    // 卡片带文件路径属性，挂载后再去问大小（列表渲染是同步的，不能在里面 await）
+    return '<div class="file-card" data-path="' + escapeHtml(path) + '">'
+         + '<span class="fc-icon">' + (FILE_ICONS[ext] || '📄') + '</span>'
+         + '<span class="fc-meta"><span class="fc-name">' + escapeHtml(name) + '</span>'
+         + '<span class="fc-size"></span></span>'
+         + '<a class="fc-dl" href="' + href + '" download="' + escapeHtml(name) + '">下载</a>'
+         + '</div>';
+  }
+  // 卡片渲染进 DOM 之后补大小；走 JSON 接口，token 不用拼进链接
+  function fillFileSizes(root) {
+    var cards = (root || document).querySelectorAll('.file-card');
+    Array.prototype.forEach.call(cards, function (card) {
+      if (card.dataset.sized) return;
+      card.dataset.sized = '1';
+      var path = card.dataset.path;
+      if (!path) return;
+      fetch('/api/file_stat?token=' + encodeURIComponent(token), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: path })
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (!d || d.size == null) return;
+          var el = card.querySelector('.fc-size');
+          if (el) el.textContent = fmtSize(d.size);
+        })
+        .catch(function () {});
+    });
   }
 
   // 轻量 markdown 渲染（代码块/行内码/加粗/标题/列表/链接）
@@ -1130,6 +1210,10 @@
       return p + '<ul>' + items + '</ul>';
     });
     s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    // 工作区里的文件：渲染成下载卡片（必须在普通链接替换之后，否则先被吃掉）
+    s = s.replace(/\[([^\]\n]*)\]\((\/files\/[^)\s]+)\)/g, function (m, label, href) {
+      return fileCardHtml(label, href.slice('/files/'.length).split('?')[0]);
+    });
     s = s.replace(/!\[([^\]]*)\]\((\/uploads\/[^)\s]+)\)/g, '<img class="chat-img" src="$2">');
     s = s.replace(/\n{2,}/g, '<br><br>').replace(/\n/g, '<br>');
     // 行首缩进用不换行空格占位，避免连续半角空格被浏览器折叠/当作换行
@@ -1150,6 +1234,7 @@
       // 一轮的尾巴：正文接在它真正说完的那个位置之后
       box.appendChild(makeTextBubble(text, true, ts));
       messages.appendChild(box);
+      fillFileSizes(box);
       scrollBottomSafe();
       return;
     }
@@ -1173,6 +1258,7 @@
       el.appendChild(t);
     }
     messages.appendChild(el);
+    fillFileSizes(el);
     scrollBottomSafe();
   }
 
@@ -1373,6 +1459,7 @@
     box.className = 'events';
     events.forEach(function (ev) { renderEvent(ev, box); });
     messages.appendChild(box);
+    fillFileSizes(box);
     scrollBottomSafe();
   }
 
@@ -1673,6 +1760,7 @@
             if (msg.text) {
               var fb = streamEl.querySelector('.stream-body');
               if (fb) fb.innerHTML = renderMd(msg.text);
+              fillFileSizes(streamEl);
               if (msg.ts) streamEl.dataset.ts = String(msg.ts);
               addMsgFoot(streamEl, msg.ts, 'assistant');
               promoted = true;
@@ -1968,13 +2056,18 @@
       modeBadge.textContent = s.mode === 'gaming' ? '游戏模式' : '桌面模式';
     }
     if (s.context) {
-      ctxBadge.hidden = false;
       var c = s.context;
       var pct = c.percent || 0;
-      ctxBadge.textContent = '上下文 ' + pct + '%' + (c.used ? (' · ' + fmtTokens(c.used) + '/' + fmtTokens(c.window)) : '');
-      ctxBadge.title = '模型窗口 ' + (c.window || 0).toLocaleString() + ' tokens'
+      // 窄屏顶栏把徽章藏了，同一份用量改在侧栏状态卡里显示（见 #ctxRow）
+      var ctxRow = document.getElementById('ctxRow');
+      ctxRow.hidden = false;
+      setCtxBar(pct, pct + '%' + (c.used ? ' · ' + fmtTokens(c.used) : ''));
+      ctxRow.title = '模型窗口 ' + (c.window || 0).toLocaleString() + ' tokens'
         + (c.used ? ('\n当前约 ' + c.used.toLocaleString() + ' tokens') : '')
         + '\n达到 ' + c.compact_at + '% 时自动压缩';
+      ctxBadge.hidden = false;
+      ctxBadge.textContent = '上下文 ' + pct + '%' + (c.used ? (' · ' + fmtTokens(c.used) + '/' + fmtTokens(c.window)) : '');
+      ctxBadge.title = ctxRow.title;
       // 用量越接近上限越醒目：85% 起变黄，95% 变红
       ctxBadge.classList.toggle('warn', pct >= 85 && pct < 95);
       ctxBadge.classList.toggle('danger', pct >= 95);
@@ -2943,6 +3036,14 @@
     fillEl.style.width = Math.min(pct, 100) + '%';
     fillEl.classList.toggle('hot', pct >= 85);
     valEl.textContent = text;
+  }
+  // 侧栏上下文行：85% 起变黄，95% 变红，与顶栏徽章同一套阈值（见 .fill.warn）
+  function setCtxBar(pct, text) {
+    var fill = document.getElementById('ctxFill');
+    fill.style.width = Math.min(pct, 100) + '%';
+    fill.classList.toggle('warn', pct >= 85 && pct < 95);
+    fill.classList.toggle('hot', pct >= 95);
+    document.getElementById('ctxVal').textContent = text;
   }
   function pollSys() {
     if (!token) return;

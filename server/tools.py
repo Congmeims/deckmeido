@@ -262,6 +262,47 @@ TOOLS: list[dict] = [
 # 危险操作：任何权限模式下都需确认
 DANGEROUS = {"install_game"}
 
+
+def touches_screen(name: str, args: dict) -> bool:
+    """这次工具调用会不会真的动屏幕（注入鼠标/键盘、改焦点、翻窗口）。
+
+    遮罩只该盖在「手没法去点终止」的时候；跑命令、翻文件、查天气这类
+    纯后台动作不挡视线。desktop 的 where 只读光标和焦点，不动屏幕。
+    """
+    if name == "desktop":
+        return str(args.get("action", "")) != "where"
+    if name == "run_command":
+        return bool(_screen_command(str(args.get("command", ""))))
+    return False
+
+
+# run_command 里能干出「动屏幕」这件事的命令：输入注入、窗口切换、弹出可见窗口/通知
+_SCREEN_CMDS = ("xdotool", "ydotool", "dotool", "kdotool", "wtype",
+                "wmctrl", "notify-send", "zenity", "kdialog")
+_SCREEN_LAUNCHERS = ("xdg-open", "steam", "chromium", "google-chrome", "firefox")
+
+
+def _screen_command(cmd: str) -> list[str]:
+    """拆开命令行，找出会动屏幕的那些程序名（只认命令位置上的词）"""
+    hits: list[str] = []
+    for seg in re.split(r"&&|\|\||[;|\n]", cmd):
+        for tok in _shlex_words(seg):
+            if re.fullmatch(r"[A-Za-z_]\w*=\S*", tok):
+                continue  # 环境变量前缀，跳过
+            base = os.path.basename(tok)
+            if base in _SCREEN_CMDS or base in _SCREEN_LAUNCHERS:
+                hits.append(base)
+            break  # 一条子命令只看头一个词
+    return hits
+
+
+def _shlex_words(seg: str) -> list[str]:
+    try:
+        return shlex.split(seg, comments=False, posix=True)
+    except ValueError:
+        return seg.split()
+
+
 # 真正会注入输入的子命令（xdotool / ydotool / dotool 同名）
 _XDOTOOL_INPUT_SUBS = {
     "click", "mousedown", "mouseup",
