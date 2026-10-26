@@ -85,30 +85,118 @@ async def check() -> dict:
     }
 
 
-def apply(restart_service: bool = True) -> dict:
-    """拉取最新代码并（可选）重启服务；返回给调用方的说明文字"""
+def _git(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(INSTALL_DIR), *args],
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def _append_log(path: Path, text: str) -> None:
+    try:
+        with open(path, "ab") as f:
+            f.write(text.encode())
+    except OSError:
+        pass
+
+
+def apply(restart_service: bool = True, tag: str = "") -> dict:
+    """切换到指定版本并（可选）重启服务；返回给调用方的说明文字
+
+    tag 为空时按 latest release 的 tag 切换。以前这里是 `git pull --ff-only`，
+    要求安装目录是干净仓库：用户只要在安装目录里改过一个字（哪怕只是调试），
+    pull 就直接失败，界面只剩一句「升级失败」，还得自己去终端处理。
+    现在改成「stash 本地改动 → fetch --tags → checkout <tag>」，
+    失败一律回滚到原 commit，并把回滚命令写进日志。
+    """
     if not (INSTALL_DIR / ".git").exists():
         raise RuntimeError("当前不是 git 安装，无法自动升级。请重新运行 install.sh")
 
-    pull = subprocess.run(
-        ["git", "-C", str(INSTALL_DIR), "pull", "--ff-only"],
-        capture_output=True, text=True, timeout=120,
-    )
-    if pull.returncode != 0:
-        raise RuntimeError(f"git pull 失败：{(pull.stderr or pull.stdout).strip()[:400]}")
+    log_path = INSTALL_DIR / "update.log"
+    target = (tag or "").lstrip("v")
+    if not target:
+        # 没传版本就查一次最新 release
+        target = (latest_release().get("tag") or "").lstrip("v")
+    if not target:
+        raise RuntimeError("没有可用的版本号：GitHub 上还没有发布任何 release")
+
+    before = _git("rev-parse", "HEAD", timeout=10)
+    prev = (before.stdout or "").strip()
+    if before.returncode != 0:
+        raise RuntimeError(f"读取当前版本失败：{(before.stderr or '').strip()[:300]}")
+    _append_log(log_path, f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                          f"升级：{current_version()} → {target}（原 {prev[:8]}）====\n")
+
+    # 有本地改动先 stash：直接 checkout 会报「local changes would be overwritten」
+    dirty = _git("status", "--porcelain", timeout=30).stdout.strip()
+    stashed = False
+    if dirty:
+        st = _git("stash", "push", "--include-untracked", "-m",
+                  f"deckmeido-autoupdate-{time.strftime('%Y%m%d%H%M%S')}")
+        if st.returncode != 0:
+            raise RuntimeError(f"暂存本地改动失败：{(st.stderr or '').strip()[:300]}")
+        stashed = True
+        _append_log(log_path, f"已暂存本地改动（git stash pop 可恢复）\n")
+
+    def _rollback(reason: str) -> None:
+        _git("checkout", prev, timeout=60)
+        msg = (f"{reason}\n已回滚到升级前的版本（{prev[:8]}）。"
+               f"手动回滚命令：git -C {INSTALL_DIR} checkout {prev}")
+        if stashed:
+            pop = _git("stash", "pop", timeout=60)
+            if pop.returncode == 0:
+                msg += "\n本地改动已恢复。"
+            else:
+                msg += "\n本地改动仍保存在 git stash 里（git stash pop 手动恢复）。"
+        _append_log(log_path, msg + "\n")
+        raise RuntimeError(msg)
+
+    fetch = _git("fetch", "--tags", "--force", "origin", timeout=180)
+    if fetch.returncode != 0:
+        _rollback(f"git fetch 失败：{(fetch.stderr or fetch.stdout).strip()[:300]}")
+
+    # 优先按 tag 切换；tag 不存在时退回对应的 origin/main
+    co = _git("checkout", "--force", f"v{target}", timeout=120)
+    if co.returncode != 0:
+        co = _git("checkout", "--force", f"{target}", timeout=120)
+    if co.returncode != 0:
+        _rollback(f"切换到 {target} 失败：{(co.stderr or co.stdout).strip()[:300]}")
+
+    after = (_git("rev-parse", "--short", "HEAD", timeout=10).stdout or "").strip()
+    _append_log(log_path, f"已切换到 {target}（{after}）\n")
 
     if not restart_service:
-        note = "代码已更新，重启程序后生效"
-        return {"ok": True, "restarted": False, "message": note}
+        note = f"代码已更新到 {target}，重启程序后生效"
+        return {"ok": True, "restarted": False, "version": target, "message": note}
 
-    # 日志留在安装目录，升级后服务重启也能查
-    log_path = INSTALL_DIR / "update.log"
-    log = open(log_path, "ab")
-    log.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} 升级到最新版本 ====\n".encode())
-    subprocess.Popen(
-        ["bash", str(INSTALL_DIR / "install.sh"), "upgrade"],
-        cwd=str(INSTALL_DIR), stdout=log, stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL, start_new_session=True,
-    )
-    return {"ok": True, "restarted": True, "log": str(log_path),
-            "message": "升级已开始，服务重启后会自动回到新版"}
+    # 日志已在上面的 _append_log 里落过盘，这里只负责拉起升级流程
+    with open(log_path, "ab") as log:
+        subprocess.Popen(
+            ["bash", str(INSTALL_DIR / "install.sh"), "upgrade"],
+            cwd=str(INSTALL_DIR), stdout=log, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+    return {"ok": True, "restarted": True, "version": target, "log": str(log_path),
+            "message": f"已更新到 {target}，服务重启后生效"}
+
+
+async def verify(expected: str, timeout: float = 60.0) -> dict:
+    """升级后自检：等 /api/version 报出新版本才算成功
+
+    升级流程是异步拉起的（install.sh 会先停客户端再重启），调用方拿不到
+    它的退出码，只能轮询自己：新进程起来之后报的版本对得上就说明成功。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:18765/api/version", headers={"User-Agent": "DeckMeido"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            got = str(data.get("version") or "").lstrip("v")
+            if not expected or got == expected.lstrip("v"):
+                return {"ok": True, "version": got}
+        except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
+            pass
+        await asyncio.sleep(1.5)
+    return {"ok": False, "version": current_version(), "expected": expected.lstrip("v")}

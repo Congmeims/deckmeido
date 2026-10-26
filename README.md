@@ -132,32 +132,43 @@ git clone https://github.com/Congmeims/deckmeido.git && cd deckmeido && bash ins
 
 **不要用 `sudo` / root 执行。** 程序装到当前用户家目录（默认 `~/deckmeido`），用 root 装会落到 `/root` 下，桌面会话里起不来。脚本检测到 root 会直接退出。
 
-不想用 git 的话，直接下载 Release 里的包：
+不想用 git 的话，直接下载 Release 里的包。链接里写 `latest` 就会取最新版，换成具体版本号（如 `deckmeido-0.2.0.tar.gz`）则可以装指定版本：
 
 ```bash
-wget https://github.com/Congmeims/deckmeido/releases/latest/download/deckmeido-0.1.0.tar.gz && tar -xzf deckmeido-0.1.0.tar.gz && cd deckmeido-0.1.0 && bash install.sh
+curl -fLO https://github.com/Congmeims/deckmeido/releases/latest/download/deckmeido-0.2.0.tar.gz
+tar -xzf deckmeido-0.2.0.tar.gz && cd deckmeido-0.2.0 && bash install.sh
 ```
+
+也可以用同一页面上的 `SHA256SUMS` 先核对包是否完整：
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+包里的 `RELEASE-NOTES.md` 是这一版相对上一版改了什么。
 
 ```bash
 bash install.sh upgrade      # 升级：同步代码 + 依赖，保留配置与会话
 bash install.sh check        # 自检：逐个实测控制类控件是否真的能用
-bash ~/deckmeido/uninstall.sh        # 卸载：停服务、删快捷方式，保留配置与工作区
+bash ~/deckmeido/uninstall.sh        # 卸载：先取消正在跑的任务，停服务、删快捷方式，保留配置与工作区
 bash ~/deckmeido/uninstall.sh --purge   # 连配置与工作区一起删
 ```
 
-安装脚本会在程序目录留一个 `uninstall.sh`，不用记 `install.sh` 的路径和参数。等价的原始写法是 `bash install.sh uninstall [--purge]`。
+安装脚本会在程序目录留一个 `uninstall.sh`，不用记 `install.sh` 的路径和参数。它只是转调 `install.sh uninstall [--purge]`，逻辑只有一份；只有在 `install.sh` 已经被删掉时，它才走自带的兜底分支。等价的原始写法是 `bash install.sh uninstall [--purge]`。
 
 ### 版本与升级
 
 设置页底部显示当前版本号（安装时由 `install.sh` 写入安装目录的 `VERSION`），旁边有「检查更新」：
 
 - **检查更新**：向 GitHub 查询最新 release，比当前版本新就提示，并出现「立即升级」
-- **立即升级**：先在安装目录 `git pull --ff-only`，再后台执行 `install.sh upgrade`（同步代码、装依赖、重启后端）。配置、会话、工作区都会保留；日志写在安装目录的 `update.log`
+- **立即升级**：先把本地改动 `git stash`，再 `git fetch --tags` + `git checkout <tag>` 切到新版，然后后台执行 `install.sh upgrade`（同步代码、装依赖、重启后端）。任何一步失败都会自动回滚到升级前的 commit，并把回滚命令写进 `update.log`。配置、会话、工作区都会保留
 
-通过 release tar 包安装的目录没有 `.git`，`git pull` 用不了，升级按钮会提示不适用：重新下载新包覆盖，或改用 `git clone` 方式安装。也可以在终端里手动升级：
+升级前会先关掉客户端再停后端，避免旧客户端在升级过程中把旧后端拉回来；升级后新进程的 `/api/version` 报出新版本号才算成功。
+
+通过 release tar 包安装的目录没有 `.git`，上面的自动升级用不了，升级按钮会提示不适用：重新下载新包覆盖安装即可（`bash install.sh` 会清理新版本里已不存在的旧文件，配置、会话、工作区不受影响）。也可以在终端里手动升级：
 
 ```bash
-cd ~/deckmeido && git pull && bash install.sh upgrade
+cd ~/deckmeido && git fetch --tags && git checkout v0.2.0 && bash install.sh upgrade
 ```
 
 自定义位置与端口：`DECKMEIDO_DIR=~/apps/deckmeido DECKMEIDO_PORT=18765 bash install.sh`

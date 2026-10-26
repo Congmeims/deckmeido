@@ -622,7 +622,9 @@ async def _spawn_detached(command: str, env: dict) -> str:
     )
     out, _ = await proc.communicate()
     pid = (out or b"").decode("utf-8", "replace").strip()
-    await asyncio.sleep(1.5)
+    # 与 _run_command 里的 launch_wait 保持一致：慢一点的启动器也要有机会
+    # 把报错吐出来，不然会当成「已常驻」放过
+    await asyncio.sleep(3.0)
     text = ""
     try:
         text = out_path.read_text(encoding="utf-8", errors="replace").strip()
@@ -673,9 +675,10 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
     )
     _LIVE_PROCS.add(proc)
     launcher = group_file is not None
-    # 启动类命令只等这么久：正常程序 1~2 秒内就出窗口或报错，
-    # 等太久只会让用户盯着遮罩干等（以前是 3 秒，加上每条命令都要挂遮罩，体感很长）
-    launch_wait = 2.0
+    # 启动类命令只等这么久：正常程序 1~2 秒内就出窗口或报错。
+    # 给到 3 秒是为了让慢一点的启动器（flatpak、走 D-Bus 激活的）也有机会
+    # 把报错吐出来，而不是被当成「已常驻」放过
+    launch_wait = 3.0
     # 真·超时（命令卡死）要杀掉；启动器等满 launch_wait 只是「它在常驻运行」，不能杀
     try:
         if launcher:

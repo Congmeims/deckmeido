@@ -77,6 +77,49 @@ PY
   need_cmd systemctl || warn "没有 systemctl，将不会注册开机自启服务"
 }
 
+# 装前预检：提前把「装到一半才炸」的情况暴露出来，而不是等 venv 建好、
+# 依赖下完之后才因为磁盘满/端口被占而失败
+preflight() {
+  local problems=0
+  # 1. 磁盘空间：PySide6 解包后约 700MB，venv 最坏按 1.5G 留余量
+  local need_mb=1500 avail_mb=""
+  avail_mb=$(df -Pm "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')
+  if [ -n "$avail_mb" ] && [ "$avail_mb" -lt "$need_mb" ]; then
+    warn "家目录剩余 ${avail_mb}MB，安装建议至少 ${need_mb}MB（PySide6 体积较大）"
+    problems=1
+  else
+    dim "磁盘空间：剩余 ${avail_mb:-未知}MB"
+  fi
+
+  # 2. 端口占用：只看是不是别人占着。已经被 DeckMeido 自己占着是正常情况
+  #    （升级时后端就在跑），不能因此拦住安装
+  if need_cmd ss; then
+    local holder
+    holder=$(ss -ltnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p {print $6; exit}')
+    if [ -n "$holder" ]; then
+      if printf '%s' "$holder" | grep -qi "$APP\|python"; then
+        dim "端口 $PORT 由 DeckMeido 自己在用（升级时正常）"
+      else
+        warn "端口 $PORT 被别的进程占用：$holder"
+        dim "先关掉它，或换端口：DECKMEIDO_PORT=18766 bash install.sh"
+        problems=1
+      fi
+    else
+      dim "端口 $PORT 空闲"
+    fi
+  fi
+
+  # 3. 图形会话：客户端要靠它把窗口开出来，缺了就只能从桌面手动启动
+  if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "${XDG_RUNTIME_DIR:-}" ]; then
+    warn "XDG_RUNTIME_DIR 不存在，装完后请从桌面图标启动客户端"
+    problems=1
+  fi
+  [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || \
+    warn "当前环境没有 DISPLAY / WAYLAND_DISPLAY，装完不会自动打开界面"
+
+  [ "$problems" = 1 ] || dim "预检通过"
+}
+
 system_notes() {
   local miss=()
   need_cmd espeak-ng || miss+=("espeak-ng（语音播报回复）")
@@ -179,9 +222,15 @@ install_pacman_deps() {
     warn "以下包记录在但命令找不到（镜像更新冲掉了 /usr），重装：${reinstall[*]}"
   fi
   [ ${#todo[@]} -gt 0 ] && info "用 pacman 安装：${todo[*]}"
-  # SteamOS 的根分区是只读的，装包前要先关掉只读保护
+  # SteamOS 的根分区是只读的，装包前要先关掉只读保护。
+  # 以前这里是 `|| true` 静默吞掉，结果 pacman 报一个跟只读毫无关系的错，
+  # 用户完全看不出真正原因。现在失败就直接说清楚。
   if [ -f /etc/steamos-readonly.conf ] || need_cmd steamos-readonly; then
-    sudo steamos-readonly disable 2>/dev/null || true
+    if ! sudo steamos-readonly disable 2>/dev/null; then
+      warn "关闭 SteamOS 只读保护失败，系统包无法安装"
+      dim "手动执行：sudo steamos-readonly disable   然后再重跑本次命令"
+      return 1
+    fi
   fi
   # 先装缺的（--needed）；再对「记录在、文件没了」的强制重装（不能带 --needed，
   # 否则 pacman 会认为已装而直接跳过）。-Sy 而不 -Syu，避免顺带滚系统
@@ -496,17 +545,55 @@ install_deps() {
 }
 
 # ---------- 代码同步 ----------
-# 从 tar.gz/解压目录安装时，把需要的文件复制进安装目录（不覆盖已有配置与会话）
+# 清单式同步：rsync 只管「源里有 → 目标也要有」，源里已经删掉的文件会
+# 永远留在安装目录里。升级几次之后目录里堆满早已废弃的模块，最坑的是
+# 那些文件名还在、但早就没人 import 的旧文件，排查时很容易看错。
+#
+# 这里反向再走一遍：安装目录里存在、源码目录里已不存在的代码文件，删掉。
+# 只处理下面这些已知代码目录，用户数据（config.toml / sessions / uploads /
+# shots / *.log / VERSION）一概不碰。
+CODE_DIRS=(server client assets deploy tools)
+USER_DATA_RE='(^|/)(config\.toml|sessions|uploads|shots)(/|$)|\.log$|(^|/)VERSION$|(^|/)__pycache__(/|$)'
+
+prune_stale() {
+  [ -d "$INSTALL_DIR" ] || return 0
+  local removed=0 rel d
+  for d in "${CODE_DIRS[@]}"; do
+    [ -d "$INSTALL_DIR/$d" ] || continue
+    # 只在安装目录里扫，逐个比对源码里是否有同名文件
+    while IFS= read -r rel; do
+      [ -n "$rel" ] || continue
+      printf '%s' "$rel" | grep -Eq "$USER_DATA_RE" && continue
+      [ -e "$HERE/$rel" ] && continue
+      rm -f "$INSTALL_DIR/$rel" && removed=$((removed + 1))
+    done < <(cd "$INSTALL_DIR" && find "$d" -type f 2>/dev/null)
+  done
+  # 删完之后可能留下空目录，一并收掉（只收代码目录内的）
+  for d in "${CODE_DIRS[@]}"; do
+    [ -d "$INSTALL_DIR/$d" ] || continue
+    find "$INSTALL_DIR/$d" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+  done
+  [ "$removed" -gt 0 ] && dim "清理了 $removed 个新版本中已不存在的旧文件"
+  return 0
+}
+
 sync_files() {
+  [ -f "$HERE/install.sh" ] || die "当前目录不像 DeckMeido 源码目录（缺 install.sh）"
   if [ "$HERE" = "$(cd "$INSTALL_DIR" 2>/dev/null && pwd -P)" ]; then
     info "已在使用目录 $INSTALL_DIR"
     write_version_file
     return
   fi
-  [ -f "$HERE/install.sh" ] || die "当前目录不像 DeckMeido 源码目录（缺 install.sh）"
-  info "同步代码到 $INSTALL_DIR"
+  if [ -d "$INSTALL_DIR" ]; then
+    info "同步代码到 $INSTALL_DIR"
+    prune_stale
+  else
+    info "安装到 $INSTALL_DIR"
+  fi
   mkdir -p "$INSTALL_DIR"
   local items=(server client assets deploy tools requirements.txt README.md install.sh)
+  # RELEASE-NOTES.md 只在发布包里存在，有就一起带上，方便用户在安装目录里查更新内容
+  [ -f "$HERE/RELEASE-NOTES.md" ] && items+=(RELEASE-NOTES.md)
   for it in "${items[@]}"; do
     [ -e "$HERE/$it" ] || continue
     if [ -d "$HERE/$it" ]; then
@@ -594,7 +681,8 @@ install_desktop() {
   dim "快捷方式已放到应用菜单和桌面（游戏模式下可加到非 Steam 游戏）"
 }
 
-# 在安装目录留一个卸载入口，用户不必记住 install.sh 的路径和参数
+# 在安装目录留一个卸载入口，用户不必记住 install.sh 的路径和参数。
+# 逻辑只有 do_uninstall 一份，这里只做转发；install.sh 被删了才走兜底分支。
 install_uninstaller() {
   cat > "$INSTALL_DIR/uninstall.sh" <<'EOS'
 #!/usr/bin/env bash
@@ -603,26 +691,43 @@ install_uninstaller() {
 #   bash uninstall.sh --purge    连配置、会话、工作区一起删
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -x "$HERE/install.sh" ]; then
+if [ -f "$HERE/install.sh" ]; then
   exec bash "$HERE/install.sh" uninstall "${1:-}"
 fi
-# 源码里的 install.sh 被删掉时的兜底：自己动手，逻辑与 install.sh 一致
+# ---- 兜底：install.sh 已经不在了，只能自己动手 ----
 APP=deckmeido
+PORT="${DECKMEIDO_PORT:-18765}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 DESKTOP_DIR="$HOME/.local/share/applications"
 DESKTOP_FOLDER="$(command -v xdg-user-dir >/dev/null 2>&1 && xdg-user-dir DESKTOP 2>/dev/null || true)"
 [ -n "$DESKTOP_FOLDER" ] && [ "$DESKTOP_FOLDER" != "$HOME" ] || DESKTOP_FOLDER="$HOME/Desktop"
 [ "$(id -u)" = "0" ] && { echo "不要用 sudo 运行"; exit 1; }
+
+# 先取消正在跑的任务，再关进程
+if command -v curl >/dev/null 2>&1 && [ -f "$HERE/server/config.toml" ]; then
+  TOK="$(grep -oP '^token\s*=\s*"\K[^"]*' "$HERE/server/config.toml" 2>/dev/null | head -n1 || true)"
+  curl -fsS -m 2 -X POST -H "X-Token: $TOK" "http://127.0.0.1:$PORT/api/cancel" >/dev/null 2>&1 || true
+fi
+pkill -f "$HERE/client/main.py" 2>/dev/null || true
 if command -v systemctl >/dev/null 2>&1; then
   systemctl --user disable --now deckmeido.service >/dev/null 2>&1 || true
   rm -f "$UNIT_DIR/deckmeido.service"
   systemctl --user daemon-reload || true
 fi
+pkill -f "$HERE/server/main.py" 2>/dev/null || true
+pkill -f "$HERE/server/overlay.py" 2>/dev/null || true
 rm -f "$DESKTOP_DIR/DeckMeido.desktop" "$DESKTOP_FOLDER/DeckMeido.desktop"
+command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
 if [ "${1:-}" = "--purge" ]; then
-  rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/$APP" "${DECKMEIDO_WORKSPACE:-$HOME/${APP}_workspace}"
+  WS="$(grep -oP '^\s*workspace\s*=\s*"\K[^"]*' "$HERE/server/config.toml" 2>/dev/null | head -n1 || true)"
+  [ -n "$WS" ] || WS="${DECKMEIDO_WORKSPACE:-$HOME/${APP}_workspace}"
+  case "$WS" in "~"/*) WS="$HOME/${WS#\~/}" ;; /*) ;; *) WS="$HOME/$WS" ;; esac
+  rm -rf "$CONFIG_DIR"
+  case "$WS" in ""|"/"|"$HOME") echo "工作区路径异常（$WS），跳过删除" ;; *) rm -rf "$WS" ;; esac
 fi
 rm -rf "$HERE/.venv" "$HERE/server/sessions" "$HERE/server/static/shots" "$HERE/server/uploads"
+rm -f "$HERE/VERSION" "$HERE/update.log"
 echo "卸载完成。代码仍在 $HERE，完全删除：rm -rf \"$HERE\""
 EOS
   chmod +x "$INSTALL_DIR/uninstall.sh"
@@ -630,10 +735,17 @@ EOS
 
 # 版本号写进安装目录，网页设置页与升级检查都读它
 write_version_file() {
-  local ver
-  ver=$(git -C "$INSTALL_DIR" describe --tags --always 2>/dev/null || true)
+  # 发布包里带一份 VERSION（make_release.sh 按 tag 写入），tar 安装时没有
+  # git 仓库，只能靠它；git 安装则用 describe，能反映「比 tag 多几个提交」
+  local ver=""
+  if [ -f "$HERE/VERSION" ]; then
+    ver=$(head -n1 "$HERE/VERSION" 2>/dev/null || true)
+  fi
+  if [ -z "$ver" ]; then
+    ver=$(git -C "$INSTALL_DIR" describe --tags --always 2>/dev/null || true)
+  fi
   [ -n "$ver" ] || ver=$(git -C "$HERE" describe --tags --always 2>/dev/null || true)
-  [ -n "$ver" ] || ver="0.1.0"
+  [ -n "$ver" ] || ver="0.0.0"
   printf '%s\n' "${ver#v}" > "$INSTALL_DIR/VERSION"
   dim "版本：$(cat "$INSTALL_DIR/VERSION")"
 }
@@ -729,6 +841,7 @@ do_install() {
   local deps="${1:-}"
   check_prereq
   info "安装目录：$INSTALL_DIR"
+  preflight
   sync_files
   venv_install
   prepare_config
@@ -756,12 +869,27 @@ do_install() {
   fi
 }
 
+# 停掉客户端：客户端是后端的父进程，还会在 watchdog 里自动补拉后端。
+# 升级过程中它要是还活着，会一边同步代码一边被重新拉起旧后端，
+# 端口和内存里的历史都对不上。升级完成后由 launch_client 重新开。
+stop_client() {
+  pgrep -f "$INSTALL_DIR/client/main.py" >/dev/null 2>&1 || return 0
+  dim "关闭客户端（升级后自动重开）"
+  pkill -f "$INSTALL_DIR/client/main.py" 2>/dev/null || true
+  local i
+  for i in $(seq 1 20); do
+    pgrep -f "$INSTALL_DIR/client/main.py" >/dev/null 2>&1 || return 0
+    sleep 0.2
+  done
+  pkill -9 -f "$INSTALL_DIR/client/main.py" 2>/dev/null || true
+}
+
 do_upgrade() {
   local deps="${1:-}"
   [ -d "$INSTALL_DIR" ] || die "$INSTALL_DIR 不存在，请先执行安装"
   check_prereq
-  # 先停服务：网页里点「立即升级」时，本进程就是那个服务，重启前先停掉；
-  # 由 systemd 托管时停完会由后续 restart 重新拉起
+  # 顺序要紧：先停客户端（否则它的 watchdog 会把旧后端拉回来），再停服务
+  stop_client
   stop_service
   sync_files
   venv_install
@@ -783,29 +911,83 @@ do_upgrade() {
   fi
 }
 
+# 正在跑的任务要先取消：卸载时把后端直接杀掉，正在执行的命令会变成孤儿进程
+cancel_running_turn() {
+  local token
+  token=$(read_token)
+  need_cmd curl || return 0
+  curl -fsS -m 2 -X POST -H "X-Token: $token" \
+    "http://127.0.0.1:$PORT/api/cancel" >/dev/null 2>&1 || true
+}
+
+# 工作区真实路径：优先读配置里的 workspace，删不到才退回默认目录。
+# 以前直接删 $HOME/deckmeido_workspace，而配置里指到别处的工作区根本删不到。
+workspace_dir() {
+  local cfg="$INSTALL_DIR/server/config.toml" ws=""
+  if [ -f "$cfg" ]; then
+    ws=$(grep -oP '^\s*workspace\s*=\s*"\K[^"]*' "$cfg" 2>/dev/null | head -n1)
+  fi
+  [ -n "$ws" ] || ws="${DECKMEIDO_WORKSPACE:-$HOME/${APP}_workspace}"
+  # 配置里可能写的是相对路径或 ~，统一展开
+  case "$ws" in
+    "~"/*) ws="$HOME/${ws#\~/}" ;;
+    /*) ;;
+    *) ws="$HOME/$ws" ;;
+  esac
+  printf '%s\n' "$ws"
+}
+
 do_uninstall() {
   local purge=0
   [ "${1:-}" = "--purge" ] && purge=1
   check_user
+  info "卸载 DeckMeido"
+  # 先取消正在执行的任务，再停客户端和后端，避免留下跑了一半的命令
+  cancel_running_turn
+  # 客户端是后端的父进程，先让它退出，后端会跟着收走
+  if pgrep -f "$INSTALL_DIR/client/main.py" >/dev/null 2>&1; then
+    dim "关闭客户端"
+    pkill -f "$INSTALL_DIR/client/main.py" 2>/dev/null || true
+    sleep 1
+    pkill -9 -f "$INSTALL_DIR/client/main.py" 2>/dev/null || true
+  fi
   stop_service
   if need_cmd systemctl; then
-    info "停止并移除用户服务"
+    dim "移除用户服务"
     systemctl --user disable --now "$UNIT" >/dev/null 2>&1 || true
     rm -f "$UNIT_DIR/$UNIT"
     systemctl --user daemon-reload || true
   fi
+  # 兜底：后端被独立拉起时（旧版本装过 systemd 单元）也要收掉，否则卸载后
+  # 它还在 18765 上跑，下次安装会撞端口
+  pkill -f "$INSTALL_DIR/server/main.py" 2>/dev/null || true
+  pkill -f "$INSTALL_DIR/server/overlay.py" 2>/dev/null || true
+  sleep 1
+
   rm -f "$DESKTOP_DIR/DeckMeido.desktop"
   rm -f "$DESKTOP_FOLDER/DeckMeido.desktop"
+  need_cmd update-desktop-database && update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+  # 桌面文件被删后，KDE 的图标缓存里还会留着入口，通知它刷新一次
+  need_cmd kbuildsycoca6 && kbuildsycoca6 >/dev/null 2>&1 || true
+  need_cmd kbuildsycoca5 && kbuildsycoca5 >/dev/null 2>&1 || true
+
   if [ "$purge" = 1 ]; then
-    warn "删除配置与工作区（不可恢复）"
+    local ws; ws="$(workspace_dir)"
+    warn "删除配置、会话与工作区（不可恢复）"
+    dim "配置：$CONFIG_DIR"
+    dim "工作区：$ws"
     rm -rf "$CONFIG_DIR"
-    rm -rf "${DECKMEIDO_WORKSPACE:-$HOME/deckmeido_workspace}"
+    case "$ws" in
+      ""|"/"|"$HOME") warn "工作区路径异常（$ws），跳过删除" ;;
+      *) rm -rf "$ws" ;;
+    esac
   fi
   # 只删本仓库自带的运行产物，避免误删用户数据
   rm -rf "$INSTALL_DIR/server/sessions" "$INSTALL_DIR/server/static/shots" \
          "$INSTALL_DIR/server/uploads" "$INSTALL_DIR/.venv"
+  rm -f "$INSTALL_DIR/VERSION" "$INSTALL_DIR/update.log" "$INSTALL_DIR/uninstall.sh"
   info "卸载完成"
-  dim "代码与配置仍保留在 $INSTALL_DIR；完全删除：rm -rf $INSTALL_DIR"
+  dim "代码仍保留在 $INSTALL_DIR；完全删除：rm -rf $INSTALL_DIR"
 }
 
 case "${1:-install}" in
