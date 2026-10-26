@@ -33,6 +33,9 @@ uninstall.sh
 # 上传的图片（运行时产物）
 server/static/uploads/
 
+# 多 agent 协作通道（本地信箱，不入库；见 _comms/README.md）
+_comms/
+
 # 编辑过程中的临时备份（*.bak-*、*.bak-时间戳、_backup_*/）
 *.bak-*
 *.bak
