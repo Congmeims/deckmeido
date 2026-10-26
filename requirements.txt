@@ -13,5 +13,5 @@ qrcode        # 设置页扫码连接（/api/qrcode）
 PySide6
 PySide6-WebEngine
 
-# 可选：联网搜索工具
-# ddgs
+# 联网搜索工具（web_search 依赖；不需要联网搜索可注释掉，工具会返回报错而不是静默失败）
+ddgs

@@ -48,12 +48,12 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 | 模拟器 | 扫描 EmuDeck 标准目录 `~/Emulation/roms`，按机型统计 |
 | 系统 | SteamOS 更新检查、系统信息 |
 | 文件 | 目录浏览、按行读取、整体写入、精确替换（改代码优先用 `edit_file`） |
-| 网络 | 联网搜索、天气查询（联网搜索需 `pip install ddgs`） |
+| 网络 | 联网搜索、天气查询（联网搜索默认安装，`ddgs` 未装时会返回报错而不是静默失败） |
 
 ### 交互细节
 
-- **操作遮罩**：真正控制设备时才在屏幕上显示半透明遮罩，可点击终止；联网搜索、截图这类只读操作不弹
-- **权限三档**：`manual` 每条命令都审批 / `auto` 只读自动、危险操作需确认 / `full` 完全放行
+- **操作遮罩**：agent 开始干活（思考、跑命令、点鼠标）就整轮常显半透明遮罩，随时可点击终止；注入鼠标/键盘的那几百毫秒内自动透明穿透，避免点击被遮罩吃掉；截图时自动收起
+- **权限三档**（作用于 `run_command`）：`manual` 每条命令都审批 / `auto` 只读自动、命中危险特征才确认 / `full` 完全放行。`write_file` / `edit_file` 不受此开关约束，任何模式下都直接落盘；`install_game` 与 `self_update upgrade` 无论模式如何都强制确认
 - **语音播报**：调用 Deck 内置 TTS，在掌机扬声器上念出回复
 - **图片上传**：拖拽或点击上传，服务端按类型分类存储
 - **分享为图片**：多选任意回合，勾选后生成长图，自动剔除思维链
@@ -94,7 +94,7 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 
 ### 几个关键设计
 
-**遮罩只在必要时出现。** 早先所有工具调用都会弹遮罩，联网搜索时也糊一层，纯属干扰。现在只有真正会改动屏幕内容的操作才显示：`desktop` 的 `click` / `move` / `type`（`focus` 只切换窗口，不弹），以及 `run_command` 中被识别为输入类的命令；截图是只读采集，而且遮罩会被拍进截图里，所以不弹。
+**遮罩是整轮常显的。** 从这一轮开始处理时（`handle_chat` 里第一句 `set_overlay(True, "正在思考")`）遮罩就亮，之后每次工具调用只更新卡片上的说明文字，直到模型开始输出正式回答才关。之所以不按工具逐个判定：遮罩的真正用途是给用户一个「随时点一下终止」的入口，而 agent 操作桌面时用户的手没法去按终止；反过来，真正注入鼠标的那几百毫秒里遮罩会切成透明穿透（`set_overlay_passthrough`），否则点击会打在遮罩上被当成「用户终止」。
 
 **截图和遮罩的协同。** 遮罩会盖住整个桌面。截图前，后端把 `lift` 状态置为 `true`，遮罩进程以 25ms 间隔快速轮询，看到后立刻隐藏并回报 ack；后端最多等 200ms 确认它真的收起了，然后才按快门，拍完马上恢复。同时工具描述里写明"截图会自动收起遮罩，不需要等待"，避免模型自己加 `sleep`。
 
@@ -132,10 +132,10 @@ git clone https://github.com/Congmeims/deckmeido.git && cd deckmeido && bash ins
 
 **不要用 `sudo` / root 执行。** 程序装到当前用户家目录（默认 `~/deckmeido`），用 root 装会落到 `/root` 下，桌面会话里起不来。脚本检测到 root 会直接退出。
 
-不想用 git 的话，直接下载 Release 里的包。链接里写 `latest` 就会取最新版，换成具体版本号（如 `deckmeido-0.2.0.tar.gz`）则可以装指定版本：
+不想用 git 的话，直接下载 Release 里的包。资产文件名带版本号，所以链接里必须写具体版本号，换版本就要改文件名（`releases/latest/download/...` 里同样得写带版本的文件名，写错会 404）：
 
 ```bash
-curl -fLO https://github.com/Congmeims/deckmeido/releases/latest/download/deckmeido-0.2.0.tar.gz
+curl -fLO https://github.com/Congmeims/deckmeido/releases/download/v0.2.0/deckmeido-0.2.0.tar.gz
 tar -xzf deckmeido-0.2.0.tar.gz && cd deckmeido-0.2.0 && bash install.sh
 ```
 
@@ -257,9 +257,10 @@ deckmeido/
 
 ## 已知限制
 
-- `desktop` 工具的文字输入依赖 `ydotool type`，只支持英文、数字与符号，中文请改用命令或文件；窗口聚焦依赖 `kdotool`
+- `desktop` 的文字输入中英文都支持：优先走 klipper 剪贴板（`org.kde.klipper.setClipboardContents` + `Ctrl+V`），klipper 不可用时才退回 `ydotool type`，此时只支持英文、数字与符号；窗口聚焦依赖 `kdotool`
+- `write_file` / `edit_file` / `list_dir` 的路径只做 `expanduser` + `resolve`，没有工作区边界校验，也能写到工作区外；相对路径相对于后端进程的 cwd（`~/deckmeido`），不是工作区。文件写入也不受 `permission_mode` 约束
 - 部分 Wayland 原生窗口无法直接截取，桌面模式需依赖 `spectacle`
-- 联网搜索依赖 `ddgs`，`requirements.txt` 里默认注释掉了，需要时手动 `.venv/bin/pip install ddgs`
+- 联网搜索依赖 `ddgs`，已列入 `requirements.txt` 默认安装；环境里没有它时搜索工具会直接返回「No module named 'ddgs'」，不会静默降级
 - 会话历史保存在本机 `server/sessions/`，不含云端同步
 
 ---
