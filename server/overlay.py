@@ -644,8 +644,6 @@ class Mask(QWidget):
         if scr:
             self.setGeometry(scr.geometry())
         # 显示之后才真正套用「不接输入」：窗口标志要在原生窗口存在时才生效
-        if self._passthrough:
-            self._apply_input_transparency(True)
         self.show()
         self.raise_()
         self._sync_volume_grab()
