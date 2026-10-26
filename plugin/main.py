@@ -797,7 +797,7 @@ class Plugin:
         _ACC = ""
         _LAST_REPLY = ""
         _FINAL_EVENT.clear()
-        payload = {"type": "chat", "text": text}
+        payload = {"type": "chat", "text": text, "client": "qam"}
         if image:
             payload["image"] = image
             payload["image_prompt"] = "（这是当前游戏画面，结合画面回答用户的问题）"

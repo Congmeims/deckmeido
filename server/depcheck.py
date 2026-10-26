@@ -86,11 +86,21 @@ def _probe_ydotool() -> tuple[bool, str]:
 def _probe_kdotool() -> tuple[bool, str]:
     if not shutil.which("kdotool"):
         return False, "未安装"
+    # 游戏模式跑在 gamescope 里，没有 KWin，kdotool 要连的 D-Bus
+    # 名字根本不存在（The name is not activatable）。这不是装坏了，
+    # 是环境压根不提供，所以不算故障、不点红灯。
+    if _in_gamescope():
+        return None, "游戏模式下不适用（没有 KWin）"
     # kdotool 需要知道会话是 Plasma 6，非 KDE 会话下会直接报错
     rc, out = _run(["kdotool", "getactivewindow"], env={"KDE_SESSION_VERSION": "6"})
     if rc == 0:
         return True, ""
     return False, f"调用失败（{out.splitlines()[0][:60] if out else '无输出'}）"
+
+
+def _in_gamescope() -> bool:
+    """当前是不是在游戏模式（gamescope 会话）里"""
+    return _run(["pgrep", "-x", "gamescope"], timeout=2.0)[0] == 0
 
 
 def _probe_wtype() -> tuple[bool, str]:
@@ -179,15 +189,20 @@ def _collect() -> dict:
             ok, detail = False, f"探测异常：{exc}"
         items.append({
             "key": key, "label": label, "ok": ok,
+            # ok=None 表示「当前环境下不适用」，既不计入通过也不计入故障，
+            # 前端据此渲染成灰色「不适用」而不是红灯
+            "na": ok is None,
             "critical": critical, "detail": detail,
         })
 
-    ok_count = sum(1 for i in items if i["ok"])
-    total = len(items)
+    # 灯色只看真正需要工作的控件：不适用的既不拉低绿灯，也不触发红灯
+    live = [i for i in items if not i["na"]]
+    ok_count = sum(1 for i in live if i["ok"])
+    total = len(live)
     # 灯色：全绿 / 有坏但还能干活（黄） / 关键控件坏了（红）
     if ok_count == total:
         level = "ok"
-    elif any(not i["ok"] and i["critical"] for i in items):
+    elif any(not i["ok"] and i["critical"] for i in live):
         level = "danger"
     else:
         level = "warn"
@@ -196,6 +211,7 @@ def _collect() -> dict:
         "items": items,
         "ok": ok_count,
         "total": total,
+        "na": sum(1 for i in items if i["na"]),
         "level": level,
         "ydotoold": _systemd_state(),
         # 一键修复要 sudo 装系统包，需要用户在终端里敲密码；

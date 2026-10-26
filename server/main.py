@@ -1466,7 +1466,8 @@ async def api_retry():
 async def handle_chat(text: str, announce: bool = True,
                       image: str | None = None,
                       image_prompt: str = "（这是当前游戏画面，结合画面回答用户的问题）",
-                      workspace: Path | None = None) -> dict:
+                      workspace: Path | None = None,
+                      client: str | None = None) -> dict:
     global pending_action, _ctx_used
     # 本轮归属快照：整轮全程只认这份 sid/epoch，中途别的端新建/切换会话也不影响它
     turn_sid = current_sid
@@ -1491,12 +1492,16 @@ async def handle_chat(text: str, announce: bool = True,
     # 前端删除消息时靠这个 ts 找回后端对应的那条：两处各自 time.time() 会差几毫秒，
     # 按 ts 精确匹配就永远对不上，删除按钮会退化成「删最后一条同角色消息」
     user_ts = time.time()
+    # 来源标记：网页/手机/桌面客户端/QAM 插件各标各的，同一条对话里混着来
+    # 也能看清谁说的。只挂在 user 消息上，且为空时不写字段，老数据零影响
+    src_tag = {"client": client} if client else {}
     if announce:
-        await manager.broadcast({"type": "user_message", "text": text, "ts": user_ts, **sid_tag})
+        await manager.broadcast({"type": "user_message", "text": text, "ts": user_ts,
+                                 **sid_tag, **src_tag})
         feed_push("user_message", text=text)
     # @{文件} 展开为内容；图片标记在 run_agent 里转成多模态 content
     hist.append({"role": "user", "content": text, "llm": _expand_context(text, workspace),
-                 "ts": user_ts})
+                 "ts": user_ts, **src_tag})
     # 随本轮附带的画面（Decky 插件截的游戏画面）：单独补一条多模态消息，
     # 而不是塞进上面那条的 llm 字段，这样历史里那条 user 消息仍然只有文字，
     # 网页端回放时不会出现一张找不到来源的图
@@ -2653,6 +2658,10 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
         await ws.close(code=4401)
         return
     await manager.connect(ws)
+    # 来源：优先信调用方显式声明的 client（插件标 qam，桌面客户端标 client），
+    # 没声明就按 UA 猜——手机浏览器自动算 mobile，其余算 web
+    ua = ws.headers.get("user-agent", "")
+    ua_client = "mobile" if ("Mobile" in ua or "Android" in ua) else "web"
     try:
         # 新连接同步历史（带上 sid，前端才能建立会话代次基线，
         # 否则 currentSid 一直是空值，代次过滤整条失效）
@@ -2672,6 +2681,7 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
                         image_prompt=data.get("image_prompt")
                         or "（这是当前游戏画面，结合画面回答用户的问题）",
                         workspace=Path(ws_root).expanduser() if ws_root else None,
+                        client=str(data.get("client") or ua_client),
                     )
                 except asyncio.CancelledError:
                     pass  # 用户点了终止，保持 ws 连接

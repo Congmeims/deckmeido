@@ -143,6 +143,18 @@
     padding: 2px 8px;
   }
   .msg .time { display: block; margin-top: 4px; font-size: 11px; opacity: .55; }
+  /* 来源角标：只在用户气泡上显示，用来区分 QAM 插件 / 网页 / 手机 / 客户端。
+     自己发的标「本端」，别人发的标具体来源，跨端接着聊时一眼看清谁说的 */
+  .msg-src {
+    display: inline-block;
+    font-size: 10px;
+    line-height: 1;
+    padding: 2px 6px;
+    margin-bottom: 5px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, .18);
+    opacity: .8;
+  }
   /* 气泡底部：操作按钮在左，时间在右。
      默认隐藏，鼠标移到这条消息上才出现——一排「重试 分享 删除 时间」
      常驻显示太抢眼，压过了对话本身。
@@ -861,6 +873,8 @@
   }
   .ctrl-row.ok .lamp { background: #2ecc71; }
   .ctrl-row.bad .lamp { background: #e04a4a; }
+  /* 不适用：灰色空心灯，明确区别于「坏了的红灯」 */
+  .ctrl-row.na .lamp { background: transparent; box-shadow: 0 0 0 1.5px var(--muted) inset; }
   .ctrl-row .nm { flex: 0 0 auto; min-width: 62px; }
   .ctrl-row .ds { flex: 1; min-width: 0; color: var(--muted); font-size: 12.5px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1223,7 +1237,16 @@
     return s;
   }
 
-  function addMsg(role, text, ts, events) {
+  // 本端来源标识：后端按 UA 也能猜，但桌面客户端内嵌的也是这个页面，
+  // 光看 UA 分不出「电脑浏览器」和「客户端」，所以由前端自己声明
+  function myClient() {
+    if (IS_NATIVE) return 'client';
+    return /Mobile|Android/.test(navigator.userAgent) ? 'mobile' : 'web';
+  }
+
+  var CLIENT_LABEL = { web: '网页', mobile: '手机', client: '客户端', qam: 'QAM' };
+
+  function addMsg(role, text, ts, events, client) {
     // 历史回放：事件与正文按「屏幕上出现过的顺序」串成一条时间线。
     // 旧版把事件块整体摆在正文上方，于是「思考→说话→执行」的顺序被打乱成
     // 「思考全在上、说话在中、命令在最下」；现在 order 里有序，按序摆放即可
@@ -1241,6 +1264,14 @@
     var el = document.createElement('div');
     el.className = 'msg ' + role;
     if (ts) el.dataset.ts = String(ts);
+    if (role === 'user' && CLIENT_LABEL[client]) {
+      // 来源角标：老数据没有 client 字段，就不显示
+      var src = document.createElement('span');
+      src.className = 'msg-src';
+      src.textContent = client === myClient() ? '本端' : CLIENT_LABEL[client];
+      src.title = '发起来源：' + CLIENT_LABEL[client];
+      el.appendChild(src);
+    }
     if (role === 'assistant' || role === 'user') {
       var body = document.createElement('div');
       body.innerHTML = renderMd(text);
@@ -1598,7 +1629,7 @@
           (msg.messages || []).forEach(function (m) {
             // 用户消息不落时间戳，助手消息带上事件（截屏图/搜索/终端输出），刷新后才不会丢
             addMsg(m.role === 'user' ? 'user' : 'assistant', m.content, m.ts,
-                   m.role === 'assistant' ? m.events : null);
+                   m.role === 'assistant' ? m.events : null, m.client);
           });
           // 崩溃补丁：后端被杀时最后一条正文可能只发到浏览器、没来得及写盘。
           // 本地缓存里若有一条服务端历史里没有的回复，补在末尾，避免「我的回复凭空消失」
@@ -1651,7 +1682,7 @@
           setBusy(true);          // 别的端发起的任务，这边也要能一键叫停
           turnCacheReset();       // 新一轮开始，本地屏幕缓存清零
           if (msg.sid) turnCache.sid = msg.sid;
-          addMsg('user', msg.text, msg.ts);
+          addMsg('user', msg.text, msg.ts, null, msg.client);
           liveBox = document.createElement('div');
           liveBox.className = 'events';
           messages.appendChild(liveBox);
@@ -1910,7 +1941,10 @@
     // 悬停看明细（桌面端）；触屏点开面板看同样的内容
     var lines = ['控制类控件 ' + c.ok + '/' + c.total + ' 可用（点击查看明细）'];
     (c.items || []).forEach(function (it) {
-      lines.push((it.ok ? '✓ ' : '✗ ') + it.label + (it.ok ? '' : '：' + (it.detail || '不可用')));
+      var mark = it.na ? '－ ' : (it.ok ? '✓ ' : '✗ ');
+      var tail = it.na ? '：' + (it.detail || '当前环境不适用')
+                       : (it.ok ? '' : '：' + (it.detail || '不可用'));
+      lines.push(mark + it.label + tail);
     });
     var yd = c.ydotoold;
     if (yd) {
@@ -1931,15 +1965,17 @@
   var lastControls = null;
 
   function fillCtrlPanel(c) {
-    if (!c || !c.total) return;
+    if (!c || !c.items) return;
     ctrlList.replaceChildren();
     (c.items || []).forEach(function (it) {
       var row = document.createElement('div');
-      row.className = 'ctrl-row ' + (it.ok ? 'ok' : 'bad');
+      // 三态：可用（绿）/ 不可用（红）/ 环境不适用（灰，比如游戏模式下没有 KWin）
+      row.className = 'ctrl-row ' + (it.na ? 'na' : (it.ok ? 'ok' : 'bad'));
       var lamp = document.createElement('span'); lamp.className = 'lamp';
       var nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = it.label;
       var ds = document.createElement('span'); ds.className = 'ds';
-      ds.textContent = it.ok ? '可用' : (it.detail || '不可用');
+      ds.textContent = it.na ? (it.detail || '当前环境不适用')
+                             : (it.ok ? '可用' : (it.detail || '不可用'));
       if (!it.ok && it.detail) ds.title = it.detail;
       row.append(lamp, nm, ds);
       ctrlList.appendChild(row);
@@ -2325,7 +2361,7 @@
       return;
     }
     queuedNoticeShown = false;
-    ws.send(JSON.stringify({ type: 'chat', text: text }));
+    ws.send(JSON.stringify({ type: 'chat', text: text, client: myClient() }));
     lastSendAt = Date.now();   // 自愈逻辑据此判断「刚发出去，服务端可能还在建 task」
     setBusy(true);
   }
@@ -2999,7 +3035,8 @@
   document.getElementById('pmShot').addEventListener('click', function () {
     plusMenu.classList.remove('show');
     if (ws && ws.readyState === 1 && !busy) {
-      ws.send(JSON.stringify({ type: 'chat', text: '截屏，把当前桌面画面展示给我' }));
+      ws.send(JSON.stringify({ type: 'chat', text: '截屏，把当前桌面画面展示给我',
+                               client: myClient() }));
       setBusy(true);
     }
   });
