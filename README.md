@@ -278,8 +278,9 @@ deckmeido/
 
 ### 工具能力
 
-- **`desktop` 补齐手势** — `action` 目前只有 `focus` / `click` / `move` / `type` / `where`，滚动与拖拽只能靠 `run_command` 手拼 `ydotool`，慢且易错。目标：新增 `scroll`（dx/dy）与 `drag`（起止点、中间插值），把常见点击 / 拖动 / 滚动做成预设
-- **模拟 Steam Deck 触摸板** — 掌机触摸板是双向滑动 + 轻点，和鼠标滚轮不是一回事。目标：能模拟触摸板 swipe 与双指滚动，供游戏模式或需要精细纵向滚动的场景使用
+- ~~**`desktop` 补齐手势**~~ — 已做：`action` 新增 `scroll`（`dx` / `dy`，按截图像素给，内部按 `WHEEL_PX_PER_STEP` 换成 ydotool 的格数，省掉 `x`/`y` 时沿用当前光标）与 `drag`（`x,y` → `x2,y2`，按下后按距离插值 2~80 步再松开，滑块/拖选这类按位移判断的逻辑才认得出是「拖」）
+- ~~**模拟 Steam Deck 触摸板**~~ — 已做：新增 `action=swipe`（`dx` / `dy` 为屏幕像素），按 20ms 间隔拆成连续小格滚轮，目标程序会当成一次连续手势。`ydotool` 造不出真正的触摸板事件，这里是「手感接近」的近似实现，双指滚动直接用 `scroll` 即可
+  - 顺带修了这类动作被遮罩吃掉的问题：新增 `tools.pointer_action()` 与后端状态 `_overlay_state["pointer"]`，`run_agent` 在 `set_overlay(True)` **之前**置上，遮罩进程看到就以 25ms 快轮询、显示后立刻 `hide()` 并回报，agent 的点击才落得到下面的窗口
 
 ### 界面与交互
 

@@ -201,8 +201,49 @@ def _build_llm_msgs(hist: list[dict], sys_prompt: str, sid: str = "") -> list[di
         if m["role"] == "user":
             content = _to_vision_content(content) if isinstance(content, str) else content
         # 历史里还存了 ts / events 供界面回放，发给模型时只保留 role 和 content
-        msgs.append({"role": m["role"], "content": content})
-    return msgs
+        msgs.append({"role": m["role"], "content": content,
+                     "tool_calls": m.get("tool_calls"),
+                     "tool_call_id": m.get("tool_call_id")})
+    return _drop_orphan_tools(msgs)
+
+
+def _drop_orphan_tools(msgs: list[dict]) -> list[dict]:
+    """去掉没有配对的 tool 消息与 tool_calls，保证发出去的消息能通过接口校验
+
+    OpenAI / DeepSeek 都要求：role=tool 的消息必须紧跟在带 tool_calls 的
+    assistant 之后，且每个 tool_call_id 都要有对应的结果；反过来 assistant
+    的 tool_calls 也必须有结果跟上。压缩游标恰好切在这一对中间，或者某条
+    结果没落盘，就会留下半截 —— 接口直接 400，之后整段会话都发不出去。
+    宁可丢掉这几条（摘要里还留着结论），也不能让整轮对话失败。
+    """
+    ids_with_result = {m.get("tool_call_id") for m in msgs if m["role"] == "tool"}
+    out: list[dict] = []
+    for m in msgs:
+        if m["role"] == "tool":
+            # 上一句不是你请求的这次调用（中间被压缩/被插话），结果无处安放
+            prev = out[-1] if out else None
+            called = {tc.get("id") for tc in (prev or {}).get("tool_calls") or []}
+            if m.get("tool_call_id") not in called:
+                continue
+            m = {"role": "tool", "tool_call_id": m["tool_call_id"], "content": m["content"]}
+            out.append(m)
+            continue
+        calls = m.get("tool_calls")
+        if calls:
+            # 只保留真有结果的调用；一个都不剩就把这条 assistant 降级成普通回复，
+            # 否则它挂着空的 tool_calls，接口同样不认
+            kept = [tc for tc in calls if tc.get("id") in ids_with_result]
+            if not kept:
+                if not str(m.get("content") or "").strip():
+                    continue
+                m = {"role": m["role"], "content": m["content"]}
+            else:
+                m = {**m, "tool_calls": kept}
+        else:
+            m = {"role": m["role"], "content": m["content"]}
+        out.append(m)
+    return out
+
 
 
 def _estimate_tokens(msgs: list[dict]) -> int:
@@ -225,7 +266,8 @@ def _split_usage(usage: dict) -> int:
 
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(workspace: Path | None = None) -> str:
+    root = workspace or tools.WORKSPACE
     name = PERSONA.get("name", "DeckMeido")
     traits = PERSONA.get("traits", "")
     extra = PERSONA.get("extra", "")
@@ -240,7 +282,7 @@ def build_system_prompt() -> str:
         "文件管理、进程控制、桌面操作、截屏、Steam 控制、软件安装等，"
         "遇到任务先想 Shell 方案。另外还有便捷工具：查天气、搜索网页、查看已安装游戏、"
         "商店搜游戏、扫描模拟器 ROM、检查系统更新、安装游戏。\n"
-        "编程能力：你有自己的工作区（当前：" + str(tools.WORKSPACE) + "）。写代码/改文件用专用工具："
+        "编程能力：你有自己的工作区（当前：" + str(root) + "）。写代码/改文件用专用工具："
         "list_dir 看结构、read_file 读文件（带行号）、write_file 创建、edit_file 精确替换；"
         "运行测试/脚本再用 run_command。用户让做项目时，先规划再逐步实施，像一个编程搭档。\n"
         "screenshot 工具可截取当前桌面画面展示给用户：排查问题、确认状态或用户要求看屏幕时主动使用"
@@ -936,17 +978,56 @@ async def _no_cache_html(request, call_next):
 
 class ChatRequest(BaseModel):
     message: str
+    # 可选的附带图片（data URL 或纯 base64），供 Decky 插件把游戏画面直接塞进这一轮
+    image: str | None = None
+    image_prompt: str = "（这是当前游戏画面，结合画面回答用户的问题）"
 
 
 _CTX_RE = re.compile(r"@\{([^}]+)\}")
 
 
-def _expand_context(text: str) -> str:
-    """把 @{路径} 引用展开为文件内容（每个最多 6000 字符）"""
+def _image_part(data: str, prompt: str) -> dict | None:
+    """把 data URL / 裸 base64 转成一条多模态 user 消息；解析不出图片返回 None
+
+    data URL 形如 data:image/png;base64,xxxx；裸 base64 按 PNG 处理。
+    MIME 是唯一的判断依据：宁可返回 None 让调用方报错，也不能把一段
+    解析失败的字符串当成图片发给模型，那会变成一条纯粹的空提问。
+    """
+    import base64
+    raw = (data or "").strip()
+    if not raw:
+        return None
+    mime = "image/png"
+    if raw.startswith("data:"):
+        head, _, raw = raw.partition(",")
+        meta = head[5:]
+        mime = (meta.split(";")[0] or mime).lower()
+        if not meta.lower().endswith(";base64"):
+            raw = base64.b64encode(raw.encode()).decode()
+    if mime not in ("image/png", "image/jpeg", "image/webp"):
+        return None
+    try:
+        base64.b64decode(raw, validate=True)
+    except Exception:
+        return None
+    return {"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{raw}"}},
+        {"type": "text", "text": prompt},
+    ]}
+
+
+def _expand_context(text: str, workspace: Path | None = None) -> str:
+    """把 @{路径} 引用展开为文件内容（每个最多 6000 字符）
+
+    workspace 只在解析相对路径时用：Decky 插件以 root 身份跑，Path.home()
+    是 /root，不显式指定的话插件发来的 @{文件} 会全部读不到。
+    """
+    root = workspace or tools.WORKSPACE
+
     def repl(m):
         p = Path(m.group(1)).expanduser()
         if not p.is_absolute():
-            p = tools.WORKSPACE / p
+            p = root / p
         try:
             body = p.read_text(encoding="utf-8", errors="replace")[:6000]
             return f"\n[文件 {p} 的内容]：\n```\n{body}\n```\n"
@@ -1096,21 +1177,30 @@ async def api_feed(after: int = Query(default=0)):
 
 
 @app.post("/api/chat", dependencies=[Depends(check_token)])
-async def api_chat(req: ChatRequest):
+async def api_chat(req: ChatRequest, workspace: str | None = Query(default=None)):
     text = req.message.strip()
     if not text:
         raise HTTPException(status_code=400, detail="empty message")
-    return await start_chat(text)
+    # workspace：Decky 插件以 root 身份跑，Path.home() 是 /root，必须由它把
+    # 真实工作区（/home/deck/...）传进来，否则 @{文件} 引用全部读不到
+    root = Path(workspace).expanduser() if workspace else None
+    if root is not None and not root.is_dir():
+        root = None
+    return await start_chat(text, image=req.image, image_prompt=req.image_prompt,
+                            workspace=root)
 
 
 # 当前正在处理的对话任务（用于终止按钮）
 current_task: asyncio.Task | None = None
 
 
-async def start_chat(text: str, announce: bool = True):
-    """把一轮对话放到可取消的任务里执行。announce=False 时不重复广播用户消息（重试用）"""
+async def start_chat(text: str, announce: bool = True, **kwargs):
+    """把一轮对话放到可取消的任务里执行。announce=False 时不重复广播用户消息（重试用）
+
+    **kwargs 原样转给 handle_chat（图片、工作区根），插件那条路要用。
+    """
     global current_task
-    current_task = asyncio.create_task(handle_chat(text, announce))
+    current_task = asyncio.create_task(handle_chat(text, announce, **kwargs))
     try:
         return await current_task
     except asyncio.CancelledError:
@@ -1373,7 +1463,10 @@ async def api_retry():
     return await start_chat(text, announce=False)
 
 
-async def handle_chat(text: str, announce: bool = True) -> dict:
+async def handle_chat(text: str, announce: bool = True,
+                      image: str | None = None,
+                      image_prompt: str = "（这是当前游戏画面，结合画面回答用户的问题）",
+                      workspace: Path | None = None) -> dict:
     global pending_action, _ctx_used
     # 本轮归属快照：整轮全程只认这份 sid/epoch，中途别的端新建/切换会话也不影响它
     turn_sid = current_sid
@@ -1389,6 +1482,11 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
     # 所以这里拿到的引用在被切走之后依然只属于这一轮
     hist = history
     sid_tag = {"sid": turn_sid}
+    # 图片解析失败不能静默丢掉：用户以为「发了张图」，模型却只收到了文字
+    image_part = _image_part(image, image_prompt) if image else None
+    if image and not image_part:
+        return {"reply": "附带的画面没能解析成图片（只支持 PNG / JPEG / WebP），这一轮没有发送。",
+                "events": []}
     # 同一次调用取一个时间戳，同时用于「广播给界面的 ts」和「历史里的 ts」。
     # 前端删除消息时靠这个 ts 找回后端对应的那条：两处各自 time.time() 会差几毫秒，
     # 按 ts 精确匹配就永远对不上，删除按钮会退化成「删最后一条同角色消息」
@@ -1397,8 +1495,13 @@ async def handle_chat(text: str, announce: bool = True) -> dict:
         await manager.broadcast({"type": "user_message", "text": text, "ts": user_ts, **sid_tag})
         feed_push("user_message", text=text)
     # @{文件} 展开为内容；图片标记在 run_agent 里转成多模态 content
-    hist.append({"role": "user", "content": text, "llm": _expand_context(text),
+    hist.append({"role": "user", "content": text, "llm": _expand_context(text, workspace),
                  "ts": user_ts})
+    # 随本轮附带的画面（Decky 插件截的游戏画面）：单独补一条多模态消息，
+    # 而不是塞进上面那条的 llm 字段，这样历史里那条 user 消息仍然只有文字，
+    # 网页端回放时不会出现一张找不到来源的图
+    if image_part:
+        hist.append(image_part)
     events: list[dict] = []
     # 标题取自第一条用户消息，所以用户一发出就落盘并刷新侧栏，不必等整轮回答结束
     save_session_snapshot(turn_sid, hist)
@@ -1524,7 +1627,15 @@ def _compact_end(hist: list[dict], start: int) -> int:
         if acc > budget:
             break
         end = i
-    return max(end, start + 1)
+    end = max(end, start + 1)
+    # 游标不能落在一次工具调用中间：assistant(tool_calls) 被压进摘要、它的
+    # tool 结果还留在原文（或反过来），发出去的 messages 就是半截配对，接口 400。
+    # 一路往后挪到「不是 tool 结果、也没有 tool_calls」那条消息上，整对一起压掉
+    while start < end < total and (hist[end].get("role") == "tool"
+                                   or hist[end].get("tool_calls")):
+        end += 1
+    return min(end, total)
+
 
 
 async def compact_history(auto: bool = False, hist: list[dict] | None = None,
@@ -1922,7 +2033,7 @@ async def api_qrcode():
 # agent 真正操作设备时，桌面上盖一层半透明遮罩；用户点一下遮罩即终止当前操作
 
 _overlay_proc = None
-_overlay_state = {"show": False, "text": "", "passthrough": False, "lift": False}
+_overlay_state = {"show": False, "text": "", "passthrough": False, "lift": False, "pointer": False}
 _overlay_ack = {"passthrough": False, "lift": False}  # 遮罩进程确认已让开鼠标 / 已抬高
 
 
@@ -2137,6 +2248,17 @@ async def set_overlay_passthrough(on: bool) -> None:
 tools.ON_OVERLAY_PASSTHROUGH = set_overlay_passthrough
 
 
+def set_overlay_pointer(on: bool) -> None:
+    """预告「下一步会按下鼠标键」，让遮罩别抢这一下点击。
+
+    遮罩是 XWayland 窗口，非穿透状态下会把点击吃掉（=用户终止）。而
+    set_overlay_passthrough 在遮罩还没显示时什么都不做，工具内部自己去调也来
+    不及。所以这里把意图做成后端状态，遮罩进程看到 pointer 立刻转 25ms 快轮询，
+    显示后马上 hide 并回报，agent 随后注入的点击就落在下面的窗口上。
+    """
+    _overlay_state["pointer"] = bool(on)
+
+
 async def set_overlay_lift(on: bool) -> None:
     """截图期间把遮罩收起来，拍完再放回来。
 
@@ -2208,10 +2330,13 @@ async def api_overlay_state(ack: int = 0, hidden: int = 1):
     # hidden 是它自报的「当前窗口是否已隐藏」：要求让开时只有真的藏了才算确认，
     # 否则 agent 那一下点击仍可能打在还显示着的遮罩上，被当成用户终止
     if ack:
-        if _overlay_state["passthrough"] and not _overlay_state["lift"]:
+        # pointer 期间遮罩按「让开」处理，但它由后端先置、遮罩后看到，所以
+        # 要不要等同样看它有没有真的藏：两个标志任一为真都按穿透算
+        want = _overlay_state["passthrough"] or _overlay_state["pointer"]
+        if want and not _overlay_state["lift"]:
             _overlay_ack["passthrough"] = bool(hidden)
         else:
-            _overlay_ack["passthrough"] = _overlay_state["passthrough"]
+            _overlay_ack["passthrough"] = want
         _overlay_ack["lift"] = _overlay_state["lift"]
     return _overlay_state
 
@@ -2470,8 +2595,13 @@ async def run_agent(events: list[dict], extra_system: str = "",
                 # 遮罩只在真的要动屏幕的这一步亮起（见上面 handle_chat 里的说明）。
                 # 放在真正执行前才 set_overlay(True)：鼠标注入期间 tools 会让遮罩
                 # 穿透（set_overlay_passthrough），否则那一下点击会点在遮罩上
-                # 被当成「用户终止」
+                # 被当成「用户终止」。
+                # pointer：这一步会不会按下鼠标键（点击/滚动/拖拽/滑动）。之前在 tools
+                # 内部自己开穿透，而穿透在遮罩还没显示时什么都不做，于是遮罩随后
+                # 才冒出来，正好接住那一下点击 —— 这里必须先让遮罩就位再看这个标志
                 on_screen = tools.touches_screen(name, args)
+                pointer = on_screen and tools.pointer_action(name, args)
+                set_overlay_pointer(pointer)
                 if on_screen:
                     set_overlay(True, activity)
                 try:
@@ -2479,6 +2609,7 @@ async def run_agent(events: list[dict], extra_system: str = "",
                 finally:
                     if on_screen:
                         set_overlay(False)
+                    set_overlay_pointer(False)
                 # 终端输出截断后随事件展示（网页端显示为终端块）
                 event["output"] = result[:1500] + ("\n…（截断）" if len(result) > 1500 else "")
                 if name in ("write_file", "edit_file") and tools.LAST_DIFF:

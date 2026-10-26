@@ -154,7 +154,12 @@ TOOLS: list[dict] = [
         "function": {
             "name": "desktop",
             "description": ("操作桌面窗口（Wayland 原生程序也能点）。action=focus 切窗口到前台；"
-                            "click 在屏幕坐标处左键单击；move 移动光标；type 在当前窗口打字（中英文都支持）；"
+                            "click 在屏幕坐标处左键单击；move 移动光标；"
+                            "scroll 在 (x,y) 处滚动（dx 正数向右、dy 正数向下，一格约 120）；"
+                            "drag 从 (x,y) 按住左键拖到 (x2,y2)，中间自动插值，可用来拖滑块/拖文件/拖选中；"
+                            "swipe 模拟触摸板滑动（dx/dy 填屏幕像素，内部按步换算成滚轮格数）——"
+                            "steam 界面、浏览器等横向翻页用它，纵向滚动用 scroll 更精确；"
+                            "type 在当前窗口打字（中英文都支持）；"
                             "where 查光标和焦点窗口。"
                             "坐标从 screenshot 画面上读，左上角为 0,0。"
                             "找不到窗口时先怀疑程序缩进了系统托盘（托盘项 kdotool 搜不到也激活不了），"
@@ -162,11 +167,16 @@ TOOLS: list[dict] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["focus", "click", "move", "type", "where"],
+                    "action": {"type": "string",
+                               "enum": ["focus", "click", "move", "scroll", "drag", "swipe", "type", "where"],
                                "description": "要做的动作"},
                     "target": {"type": "string", "description": "focus 时填窗口标题关键词（如 Kazumi）"},
-                    "x": {"type": "integer", "description": "click/move 的屏幕横坐标"},
-                    "y": {"type": "integer", "description": "click/move 的屏幕纵坐标"},
+                    "x": {"type": "integer", "description": "click/move/scroll 的起点、drag/swipe 的起点的屏幕横坐标"},
+                    "y": {"type": "integer", "description": "click/move/scroll 的起点、drag/swipe 的起点的屏幕纵坐标"},
+                    "x2": {"type": "integer", "description": "drag 的终点横坐标"},
+                    "y2": {"type": "integer", "description": "drag 的终点纵坐标"},
+                    "dx": {"type": "integer", "description": "scroll 的横向格数（正右负左）；swipe 的横向像素（正右负左）"},
+                    "dy": {"type": "integer", "description": "scroll 的纵向格数（正下负上）；swipe 的纵向像素（正下负上）"},
                     "text": {"type": "string", "description": "type 时要输入的文本，中英文均可（走 KDE 剪贴板粘贴）"},
                 },
                 "required": ["action"],
@@ -274,6 +284,23 @@ def touches_screen(name: str, args: dict) -> bool:
     if name == "run_command":
         return bool(_screen_command(str(args.get("command", ""))))
     return False
+
+
+def pointer_action(name: str, args: dict) -> bool:
+    """这次调用会不会按下鼠标键（点击 / 拖拽 / 滚轮）。
+
+    这类动作执行期间遮罩必须整块让开：遮罩是 XWayland 窗口，Wayland 合成器
+    做命中测试时看不见 X11 的 input shape，窗口还在就一定会把点击吃掉。
+    """
+    if name == "desktop":
+        return str(args.get("action", "")) in _POINTER_ACTIONS
+    if name == "run_command":
+        return _pointer_click(str(args.get("command", "")))
+    return False
+
+
+# desktop 里会按下鼠标键的动作（move 只挪光标，不按键）
+_POINTER_ACTIONS = {"click", "scroll", "drag", "swipe"}
 
 
 # run_command 里能干出「动屏幕」这件事的命令：输入注入、窗口切换、弹出可见窗口/通知
@@ -454,23 +481,10 @@ def _input_invoked(cmd: str) -> bool:
 
 
 def _pointer_click(cmd: str) -> bool:
-    """这条命令会不会按下鼠标左/中/右键"""
+    """这条命令会不会按下鼠标键（含滚轮；滚轮同样算一次按键注入）"""
     for _tool, subs, _args in _invocations(cmd):
         if any(s in _POINTER_CLICK_SUBS for s in subs):
             return True
-    return False
-
-
-def needs_overlay(name: str, args: dict) -> bool:
-    """这次工具调用会不会动光标/敲键盘
-
-    遮罩本身现在是整轮常显（见 main.handle_chat），不再靠这个函数决定亮不亮；
-    保留它是为了「哪些命令属于操作桌面」这一判断本身仍有单一出处。
-    """
-    if name == "desktop":
-        return str(args.get("action", "")) in {"click", "move", "type"}
-    if name == "run_command":
-        return _input_invoked(str(args.get("command", "")))
     return False
 
 # 智能审批（auto）模式下的危险命令特征：命中则需要用户确认
@@ -845,6 +859,13 @@ def summarize_tool(name: str, args: dict) -> str:
             return f"点击 ({args.get('x', 0)}, {args.get('y', 0)})"
         if act == "move":
             return f"移动光标到 ({args.get('x', 0)}, {args.get('y', 0)})"
+        if act == "scroll":
+            return f"滚动 dx={args.get('dx', 0)} dy={args.get('dy', 0)}"
+        if act == "drag":
+            return (f"从 ({args.get('x', 0)}, {args.get('y', 0)}) 拖到 "
+                    f"({args.get('x2', 0)}, {args.get('y2', 0)})")
+        if act == "swipe":
+            return f"触摸板滑动 dx={args.get('dx', 0)} dy={args.get('dy', 0)}"
         if act == "type":
             t = str(args.get("text", ""))
             return f"输入「{t[:40]}」"
@@ -1310,8 +1331,41 @@ async def _app_running(keyword: str) -> bool:
         return False
 
 
-async def _desktop(action: str, target: str = "", x: int = 0, y: int = 0, text: str = "") -> str:
-    """桌面窗口操作：切焦点 / 点击 / 移动 / 打字。命中点击时自动打开遮罩穿透"""
+# 滚轮一格约等于 120 像素的视线位移；模型给的是截图上的像素，
+# 这里统一换算成 ydotool 的格数，避免各调用点各写一套系数
+WHEEL_PX_PER_STEP = 120
+# 触摸板滑动的格间间隔：太密目标程序会并成一格，太疏又不像一次手势
+_SWIPE_INTERVAL = 0.02
+# 拖拽最多插这么多步：全程每步都要读一次光标，几十步就够平滑了，
+# 上千像素的长拖按 80 步切，单步位移大一点也仍然像「拖」而不是「瞬移」
+_DRAG_MAX_STEPS = 80
+
+
+def _wheel_steps(dx: int, dy: int) -> tuple[int, int]:
+    """像素位移 → 滚轮格数。不足一格的按一格算，非零方向不能丢"""
+    def conv(v: int) -> int:
+        v = int(v or 0)
+        if not v:
+            return 0
+        n = int(round(abs(v) / WHEEL_PX_PER_STEP))
+        return (1 if v > 0 else -1) * max(1, n)
+    return conv(dx), conv(dy)
+
+
+def _drag_steps(x: int, y: int, x2: int, y2: int) -> list[tuple[int, int]]:
+    """起点到终点的插值路径（不含起点本身）"""
+    dist = max(abs(x2 - x), abs(y2 - y), 1)
+    n = max(2, min(_DRAG_MAX_STEPS, dist // 8 or 2))
+    return [(x + (x2 - x) * i // n, y + (y2 - y) * i // n) for i in range(1, n + 1)]
+
+
+async def _desktop(action: str, target: str = "", x: int = 0, y: int = 0, text: str = "",
+                   x2: int = 0, y2: int = 0, dx: int = 0, dy: int = 0) -> str:
+    """桌面窗口操作：切焦点 / 点击 / 移动 / 滚动 / 拖拽 / 触摸板滑动 / 打字
+
+    按下鼠标键的动作（点击、滚动、拖拽、滑动）执行前都会先让遮罩整块让开，
+    否则那一下会打在遮罩上被当成「用户终止」。
+    """
     if action == "focus":
         if not target:
             return "focus 需要提供 target（窗口标题关键词）"
@@ -1349,6 +1403,81 @@ async def _desktop(action: str, target: str = "", x: int = 0, y: int = 0, text: 
                 return f"已点击 ({cx}, {cy})，当前焦点窗口：{focus}"
             cx, cy = await _cursor()
             return f"光标已移到 ({cx}, {cy})"
+        finally:
+            await _set_overlay_passthrough(False)
+
+    if action == "scroll":
+        # ydotool 的滚动是按格数（一把 0x40 横向、0x41 纵向，值带符号），
+        # 而模型看截图给的是像素，换算见 _wheel_steps
+        nx, ny = _wheel_steps(dx, dy)
+        if not nx and not ny:
+            return "scroll 需要提供非零的 dx 或 dy"
+        await _set_overlay_passthrough(True)
+        try:
+            # x/y 省掉时沿用当前光标位置，省得模型每次都要先 where 一下
+            if x or y:
+                await _move_to(x, y)
+                await asyncio.sleep(0.1)
+            if ny:
+                await _ydotool("click", f"0x41:{ny}")
+            if nx:
+                await _ydotool("click", f"0x40:{nx}")
+            cx, cy = await _cursor()
+            return (f"已在 ({cx}, {cy}) 滚动：横向 {nx} 格、纵向 {ny} 格"
+                    f"（原始位移 dx={dx}, dy={dy}）")
+        finally:
+            await _set_overlay_passthrough(False)
+
+    if action == "drag":
+        if (x, y) == (x2, y2):
+            return "drag 的起点和终点相同，拖不出效果；请提供不同的 x2/y2"
+        steps = _drag_steps(x, y, x2, y2)
+        await _set_overlay_passthrough(True)
+        try:
+            await _move_to(x, y)
+            await asyncio.sleep(0.1)
+            # 按下 → 分步移动 → 松开。中间不插值的话目标程序只看到一次跳跃，
+            # 滑块/列表拖选这类按位移判断的逻辑会当成「没拖」
+            await _ydotool("click", "0x40:1")
+            for px, py in steps:
+                await _move_to(px, py)
+                await asyncio.sleep(0.02)
+            await asyncio.sleep(0.05)
+            await _ydotool("click", "0x40:0")
+            cx, cy = await _cursor()
+            return f"已从 ({x}, {y}) 拖到 ({cx}, {cy})，共 {len(steps)} 步"
+        finally:
+            await _set_overlay_passthrough(False)
+
+    if action == "swipe":
+        if not dx and not dy:
+            return "swipe 需要提供非零的 dx 或 dy（单位是屏幕像素）"
+        await _set_overlay_passthrough(True)
+        try:
+            # 触摸板滑动本质是「连续的小幅滚轮」：按步长切成若干格，
+            # 每格之间留一点间隔，目标程序才会把它当成一次连续手势
+            total_x, total_y = _wheel_steps(dx, dy)
+            px = x
+            py = y
+            if px or py:
+                await _move_to(px, py)
+            per_x = -1 if total_x < 0 else 1
+            per_y = -1 if total_y < 0 else 1
+            left_x, left_y = abs(total_x), abs(total_y)
+            sent = 0
+            while left_x or left_y:
+                one_x = per_x if left_x else 0
+                one_y = per_y if left_y else 0
+                if one_x:
+                    await _ydotool("click", f"0x40:{one_x}")
+                    left_x -= 1
+                if one_y:
+                    await _ydotool("click", f"0x41:{one_y}")
+                    left_y -= 1
+                sent += 1
+                await asyncio.sleep(_SWIPE_INTERVAL)
+            return (f"已模拟触摸板滑动：dx={dx}, dy={dy} 像素"
+                    f"（换算成 {abs(total_x)} 格横向、{abs(total_y)} 格纵向，分 {sent} 步）")
         finally:
             await _set_overlay_passthrough(False)
 

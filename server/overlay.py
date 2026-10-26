@@ -39,8 +39,7 @@ API = os.environ.get("DECKMEIDO_API", "http://127.0.0.1:18765")
 TOKEN = os.environ.get("DECKMEIDO_TOKEN", "")
 
 POLL_MS = 100          # 向后端询问「是否在操作」的常规间隔
-URGENT_MS = 25         # 穿透期间的快速轮询间隔（后端马上要点，等不起）
-LIFT_MS = 25           # 截图期间抬高遮罩时的轮询间隔
+URGENT_MS = 25         # 快速轮询间隔：遮罩显示中 / 要让开 / 要抬高 / agent 马上要按键
 MIN_SHOW_MS = 700      # 最短显示时长，避免确认类动作（点一下就完）闪一下就消失
 
 # 遮罩进程不读 KDE 字体配置。优先等宽字体：它的空格宽度明确，
@@ -186,6 +185,9 @@ class Mask(QWidget):
         self._shown_at = 0.0
         self._cancelled = False
         self._passthrough = False
+        # 后端预告「下一步会按鼠标键」：和 passthrough 一样要让开，区别是它由
+        # 后端在显示遮罩之前就置上，本进程一看到就要立刻藏（见 _poll）
+        self._pointer = False
         self._input_transparent = False
         self._lifted = False
         self._show_wanted = False
@@ -300,11 +302,20 @@ class Mask(QWidget):
         self._set_text(state.get("text") or "")
         now = time.monotonic()
         # agent 发送鼠标点击期间后端会打开穿透，否则那一下会点在遮罩上变成「用户终止」
-        self._set_passthrough(bool(state.get("passthrough")))
+        self._pointer = bool(state.get("pointer"))
+        self._set_passthrough(bool(state.get("passthrough")) or self._pointer)
         # 截图期间后端要求把遮罩藏起来，免得挡住要拍的画面
         self._set_lifted(bool(state.get("lift")))
         # 正在显示、刚要求穿透、或刚要求抬高遮罩时，切到快速轮询
         self._urgent = bool(show or self._passthrough or self._lifted)
+
+        if self._pointer:
+            # pointer 是「马上要按下去」，只认「现在没显示」：刚播完一轮遮罩
+            # 还在最短显示时间里也要立刻藏，否则这一下点会被吃掉
+            if self.isVisible():
+                self.hide()
+            self._ack_state()
+            return
         # 显示条件里不能再排除 passthrough：那只是「暂时藏起来」，
         # 注入结束、show 还没变 false 时要能把遮罩放回去
         if show:
