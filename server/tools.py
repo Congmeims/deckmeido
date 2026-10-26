@@ -30,6 +30,7 @@ TOOL_CN: dict[str, str] = {
     "list_emulator_roms": "扫描模拟器游戏",
     "run_command": "执行命令",
     "desktop": "操作桌面",
+    "gamepad": "操作手柄",
     "screenshot": "截取屏幕",
     "list_dir": "查看目录",
     "read_file": "读取文件",
@@ -194,6 +195,39 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "gamepad",
+            "description": ("模拟手柄按键（写 /dev/uinput 虚拟手柄，游戏模式里唯一能被游戏认到的注入方式；"
+                            "desktop 那套鼠标键盘在游戏里没用）。"
+                            "action=press 按一下某个键；hold 按住某个键若干毫秒（跑动这类需要长按）；"
+                            "stick 把左摇杆推到 (x,y) 并保持；release 摇杆回中。"
+                            "玩游戏、过对话、菜单导航时用。一次只能动一个键，"
+                            "需要连续操作就多次调用"),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string",
+                               "enum": ["press", "hold", "stick", "release"],
+                               "description": "要做的动作"},
+                    "button": {"type": "string",
+                               "enum": ["a", "b", "x", "y", "up", "down", "left", "right",
+                                        "lb", "rb", "start", "select"],
+                               "description": ("press/hold 的键位。a 通常是确认/跳跃，"
+                                               "b 取消，x/y 视游戏而定；方向键是十字键不是摇杆，"
+                                               "需要模拟摇杆用 stick")},
+                    "ms": {"type": "integer",
+                           "description": "hold 按住多久（毫秒，默认 500，上限 5000）；press 默认 80"},
+                    "x": {"type": "number",
+                          "description": "stick 的横向，-1 最左、1 最右，0 居中"},
+                    "y": {"type": "number",
+                          "description": "stick 的纵向，-1 最上、1 最下，0 居中"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_dir",
             "description": "列出目录内容（编程/文件任务先看结构）。默认列出工作区（家目录下的 deckmeido_workspace）",
             "parameters": {
@@ -281,6 +315,9 @@ def touches_screen(name: str, args: dict) -> bool:
     """
     if name == "desktop":
         return str(args.get("action", "")) != "where"
+    # 手柄注入也是「真的在操作游戏」：按下去游戏就在动，遮罩该盖就盖
+    if name == "gamepad":
+        return True
     if name == "run_command":
         return bool(_screen_command(str(args.get("command", ""))))
     return False
@@ -873,6 +910,16 @@ def summarize_tool(name: str, args: dict) -> str:
     if name in ("read_file", "write_file", "edit_file", "list_dir"):
         path = str(args.get("path", ""))
         return path.split("/")[-1] or path
+    if name == "gamepad":
+        act = str(args.get("action", ""))
+        if act == "stick":
+            return f"推摇杆 ({args.get('x', 0)}, {args.get('y', 0)})"
+        if act == "release":
+            return "摇杆回中"
+        btn = str(args.get("button", "")).upper()
+        if act == "hold":
+            return f"按住 {btn} {args.get('ms', 500)}ms"
+        return f"按 {btn}"
     # 无需参数的简单操作：不显示多余说明
     if name in ("screenshot", "list_installed_games", "check_system_updates", "list_emulator_roms"):
         return ""
@@ -1152,6 +1199,187 @@ async def _screenshot_gamescope(path: Path) -> bool:
         return False
     finally:
         raw.unlink(missing_ok=True)
+
+
+# ---------- 虚拟手柄（uinput） ----------
+#
+# 游戏模式下 XTest / Wayland 虚拟键盘都进不了 gamescope，能进游戏的只有
+# /dev/uinput 虚拟设备（Steam Input、Sunshine 走的都是这条）。这里直接建一个
+# 带 EV_KEY + EV_ABS 的手柄设备：键盘设备扛不了摇杆（ABS 是绝对值轴），
+# 手柄设备也发不出键盘字符，两类设备分工不同。
+#
+# 与 plugin/main.py 里的 _Gamepad 是同一套实现，但那份只服务 QAM 面板，
+# 后端跑在服务进程里拿不到它，所以这边必须自带一份。
+
+_UI_DEV_CREATE = 0x5501
+_UI_DEV_DESTROY = 0x5502
+_UI_SET_EVBIT = 0x40045564
+_UI_SET_KEYBIT = 0x40045565
+_UI_SET_ABSBIT = 0x40045567
+_UI_DEV_SETUP = 0x405C5503
+_UI_ABS_SETUP = 0x401C5504
+
+_EV_SYN, _EV_KEY, _EV_ABS = 0x00, 0x01, 0x03
+_ABS_X, _ABS_Y = 0x00, 0x01
+_STICK_MAX = 32767
+
+# 面板/工具里用的名字 → 键位。ABXY 按 Xbox 布局。
+_PAD_KEYS = {
+    "a": 0x130, "b": 0x131, "x": 0x133, "y": 0x134,
+    "lb": 0x136, "rb": 0x137,
+    "up": 0x220, "down": 0x221, "left": 0x222, "right": 0x223,
+    "start": 0x13B, "select": 0x13A,
+}
+
+# 当前摇杆位置，用来判断 release 时要不要真的发一帧
+_PAD_STICK = [0, 0]
+
+
+class _VirtualPad:
+    """一个懒创建、闲置自动销毁的虚拟手柄。
+
+    一直挂着设备会让 Steam 认为接了手柄（可能强制切成手柄导航），
+    所以闲置 _IDLE 秒后销毁。
+    """
+
+    _IDLE = 90.0
+
+    def __init__(self):
+        self._fd: int | None = None
+        self._lock = asyncio.Lock()
+        self._idle: asyncio.Task | None = None
+
+    def _emit(self, typ: int, code: int, value: int):
+        # input_event 的 timeval 两个字段都是 64 位 long，所以用 qq 不用 ll
+        import struct
+
+        os.write(self._fd, struct.pack("qqHHi", 0, 0, typ, code, value))
+
+    def _syn(self):
+        self._emit(_EV_SYN, 0, 0)
+
+    def _create(self):
+        import fcntl
+        import struct
+
+        fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            fcntl.ioctl(fd, _UI_SET_EVBIT, _EV_KEY)
+            fcntl.ioctl(fd, _UI_SET_EVBIT, _EV_SYN)
+            fcntl.ioctl(fd, _UI_SET_EVBIT, _EV_ABS)
+            for code in _PAD_KEYS.values():
+                fcntl.ioctl(fd, _UI_SET_KEYBIT, code)
+            for code in (_ABS_X, _ABS_Y):
+                fcntl.ioctl(fd, _UI_SET_ABSBIT, code)
+                # uinput_abs_setup：code(2)+pad(2)+absinfo{value,min,max,fuzz,flat,resolution}
+                fcntl.ioctl(
+                    fd, _UI_ABS_SETUP,
+                    struct.pack("HHiiiiii", code, 0, 0, -_STICK_MAX, _STICK_MAX, 0, 0, 0),
+                )
+            # uinput_setup：id{bus,vendor,product,version} + name(80) + ff_effects_max
+            fcntl.ioctl(
+                fd, _UI_DEV_SETUP,
+                struct.pack("HHHH80sI", 0x03, 0x045E, 0x02FD, 0x0001, b"DeckMeido Gamepad", 0),
+            )
+            fcntl.ioctl(fd, _UI_DEV_CREATE)
+        except Exception:
+            os.close(fd)
+            raise
+        self._fd = fd
+
+    def _destroy(self):
+        if self._fd is None:
+            return
+        try:
+            import fcntl
+
+            fcntl.ioctl(self._fd, _UI_DEV_DESTROY)
+        except Exception:
+            pass
+        try:
+            os.close(self._fd)
+        except Exception:
+            pass
+        self._fd = None
+        _PAD_STICK[0] = _PAD_STICK[1] = 0
+
+    def _touch(self):
+        if self._idle is not None:
+            self._idle.cancel()
+        self._idle = asyncio.create_task(self._close_later())
+
+    async def _close_later(self):
+        try:
+            await asyncio.sleep(self._IDLE)
+        except asyncio.CancelledError:
+            return
+        async with self._lock:
+            self._destroy()
+
+    async def _ensure(self):
+        if self._fd is None:
+            self._create()
+            # 设备刚创建时内核还没生成节点，游戏侧要一点时间才枚举到
+            await asyncio.sleep(0.15)
+
+    async def key(self, name: str, hold_ms: int = 80) -> str:
+        code = _PAD_KEYS.get(name)
+        if code is None:
+            return f"不认识的手柄键：{name}（可用：{'、'.join(_PAD_KEYS)}）"
+        async with self._lock:
+            try:
+                await self._ensure()
+                self._emit(_EV_KEY, code, 1)
+                self._syn()
+                await asyncio.sleep(max(30, min(hold_ms, 5000)) / 1000)
+                self._emit(_EV_KEY, code, 0)
+                self._syn()
+            except FileNotFoundError:
+                return "手柄注入失败：没有 /dev/uinput，uinput 内核模块未加载"
+            except PermissionError:
+                return "手柄注入失败：没有写 /dev/uinput 的权限（需要 root）"
+            self._touch()
+        return f"已按下手柄键 {name}（{max(30, min(hold_ms, 5000))}ms）"
+
+    async def stick(self, x: float, y: float) -> str:
+        vx = int(max(-1.0, min(1.0, x)) * _STICK_MAX)
+        vy = int(max(-1.0, min(1.0, y)) * _STICK_MAX)
+        async with self._lock:
+            try:
+                await self._ensure()
+                self._emit(_EV_ABS, _ABS_X, vx)
+                self._emit(_EV_ABS, _ABS_Y, vy)
+                self._syn()
+            except FileNotFoundError:
+                return "摇杆注入失败：没有 /dev/uinput，uinput 内核模块未加载"
+            except PermissionError:
+                return "摇杆注入失败：没有写 /dev/uinput 的权限（需要 root）"
+            _PAD_STICK[0], _PAD_STICK[1] = vx, vy
+            self._touch()
+        return f"左摇杆已推到 ({x:.2f}, {y:.2f})"
+
+
+_PAD = _VirtualPad()
+
+
+async def _gamepad(action: str, button: str = "", ms: int = 0,
+                   x: float = 0.0, y: float = 0.0) -> str:
+    """模拟手柄。press/hold 按键，stick 推左摇杆，release 摇杆回中"""
+    act = str(action or "").strip().lower()
+    if act in ("press", "hold"):
+        name = str(button or "").strip().lower()
+        if not name:
+            return "press/hold 需要填 button"
+        default = 80 if act == "press" else 500
+        return await _PAD.key(name, int(ms or default))
+    if act == "stick":
+        try:
+            return await _PAD.stick(float(x), float(y))
+        except (TypeError, ValueError):
+            return "stick 的 x/y 要填 -1..1 的数字"
+    if act == "release":
+        return await _PAD.stick(0.0, 0.0)
+    return f"不认识的 action：{action}（可用：press / hold / stick / release）"
 
 
 async def _screenshot() -> str:
@@ -1580,6 +1808,7 @@ EXECUTORS = {
     "list_emulator_roms": _list_emulator_roms,
     "run_command": _run_command,
     "desktop": _desktop,
+    "gamepad": _gamepad,
     "screenshot": _screenshot,
     "list_dir": _list_dir,
     "read_file": _read_file,
