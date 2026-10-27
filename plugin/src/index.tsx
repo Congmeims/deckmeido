@@ -257,7 +257,7 @@ export default definePlugin(() => ({
   name: "DeckMeido",
   titleView: <div>DeckMeido</div>,
   content: <Content />,
-  icon: <GiTeapot />,
+  icon: <GiTeapot size={24} />,
 }));
 
 function Content() {
