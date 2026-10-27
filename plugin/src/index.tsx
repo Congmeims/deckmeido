@@ -257,7 +257,12 @@ export default definePlugin(() => ({
   name: "DeckMeido",
   titleView: <div>DeckMeido</div>,
   content: <Content />,
-  icon: <GiTeapot size={24} />,
+  // 图标外框占位与其它插件保持一致，只把墨迹放大，避免把标题推歪
+  icon: (
+    <div style={{ width: "18px", height: "18px", display: "flex", alignItems: "center", justifyContent: "center", flex: "none" }}>
+      <GiTeapot size={20} style={{ transform: "scale(1.15)", transformOrigin: "center" }} />
+    </div>
+  ),
 }));
 
 function Content() {
