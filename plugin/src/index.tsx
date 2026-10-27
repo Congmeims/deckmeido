@@ -260,15 +260,20 @@ function Content() {
       if (!st.unlocked || !ticket) throw new Error("插件未解锁，先输入访问令牌");
 
       let image: string | null = null;
+      let game: { appid?: string; name?: string } | null = null;
       if (grab) {
         // 先收面板：CloseSideMenus 走的是 Steam 的 MenuStore，等于替用户按了
         // 一次「关闭侧栏」，和按 B 不是一回事（B 在菜单里是「回上一级」）
         if (hideQam) Navigation.CloseSideMenus();
-        const shot = (await call<[string, boolean], { ok: boolean; image?: string; error?: string }>(
-          "screenshot",
-          ticket,
-          hideQam
-        )) as { ok: boolean; image?: string; error?: string };
+        const shot = (await call<
+          [string, boolean],
+          { ok: boolean; image?: string; error?: string; game?: { appid?: string; name?: string } }
+        >("screenshot", ticket, hideQam)) as {
+          ok: boolean;
+          image?: string;
+          error?: string;
+          game?: { appid?: string; name?: string };
+        };
         // 抓完立刻把 QAM 弹回来：后面还有几十秒的生成时间，用户不该盯着一片游戏画面
         if (hideQam) Navigation.OpenQuickAccessMenu();
         if (shot.ok && shot.image) {
@@ -277,11 +282,21 @@ function Content() {
           // 截图失败不阻断提问：这一轮退回纯文字，并在界面上说清楚原因
           setError(`截图失败，这轮只发文字：${shot.error ?? "未知原因"}`);
         }
+        game = shot.game ?? null;
+      }
+
+      // 游戏名从 Steam 侧拿到就直接写进问题里，免得模型看画面认错游戏、
+      // 搜回来一堆别的游戏的攻略
+      let body = text;
+      const gname = game?.name ?? "";
+      if (gname) {
+        const aid = game?.appid ? `（appid ${game.appid}）` : "";
+        body = `当前游戏：《${gname}》${aid}。\n${text}`;
       }
 
       const res = (await call<[string, string | null, string], { ok: boolean; error?: string }>(
         "start_turn",
-        text,
+        body,
         image,
         ticket
       )) as { ok: boolean; error?: string };
@@ -313,11 +328,13 @@ function Content() {
    * 一键查攻略：语音/打字都不方便时，直接拿当前画面去问。
    * 提示词写死「先搜再总结」，是因为攻略类问题答案更新快，
    * 单靠模型记忆容易给出过期的打法或道具位置。
+   * 游戏名由后端从 Steam（运行中 appid + 库里改过的名字）取，取不到才让模型自己认。
    */
   const guide = async () => {
     if (busyRef.current) return;
     await runTurn(
-      "看这个游戏画面，判断我在哪个游戏、卡在什么位置，然后先联网搜索最新攻略，再总结成几条可以直接照做的步骤（控制在 200 字内）。",
+      "看我卡在哪一步，先联网搜这个游戏当前场景的最新攻略（中文搜不到就用英文关键词再搜），" +
+        "再总结成几条可以直接照做的步骤，200 字以内。",
       true,
       true
     );

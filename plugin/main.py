@@ -19,6 +19,7 @@ import itertools
 import hmac
 import json
 import os
+import re
 import secrets
 import shutil
 import time
@@ -210,6 +211,108 @@ def _too_many_fails() -> int:
     if len(_fails) < _MAX_FAILS:
         return 0
     return int(_FAIL_COOLDOWN - (now - _fails[0])) + 1
+
+
+# ---------- 当前在玩的游戏 ----------
+#
+# 查攻略时「哪个游戏」比画面本身还关键：认错了游戏，搜回来的攻略全废。
+# 所以不靠模型猜，按可靠度从高到低自己找：
+# 1. 运行中进程的 SteamAppId 环境变量 —— Steam 启动游戏时会注入，最准
+# 2. localconfig.vdf 里该 appid 的 name —— 用户在库里改过的名字（备注）也在这个字段
+# 3. 都拿不到就交给模型看画面
+
+
+def _read_vdf_apps(path: Path) -> dict[str, str]:
+    """从 localconfig.vdf 里抽出 apps { appid: name }
+
+    VDF 是嵌套的花括号结构，app 段里还夹着 cloud 之类的小块，
+    所以不能按「遇到第一个 } 就算完」来切，得做括号配对。
+    """
+    try:
+        text = path.read_text(errors="ignore")
+    except Exception:
+        return {}
+    apps: dict[str, str] = {}
+
+    head = re.search(r'"apps"\s*\{', text)
+    if not head:
+        return apps
+    depth, i = 1, head.end()
+    while i < len(text) and depth:
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+        i += 1
+    seg = text[head.end():i - 1]
+
+    for km in re.finditer(r'"(\d{2,10})"\s*\{', seg):
+        j, d = km.end(), 1
+        while j < len(seg) and d:
+            if seg[j] == "{":
+                d += 1
+            elif seg[j] == "}":
+                d -= 1
+            j += 1
+        nm = re.search(r'"name"\s+"((?:[^"\\]|\\.)*)"', seg[km.end():j - 1])
+        if nm:
+            apps[km.group(1)] = nm.group(1)
+    return apps
+
+
+def _app_names() -> dict[str, str]:
+    """汇总所有 Steam 账号 localconfig 里的 appid → 名字"""
+    home = INSTALL_DIR.parent
+    out: dict[str, str] = {}
+    base = home / ".steam/steam/userdata"
+    if not base.is_dir():
+        base = home / ".local/share/Steam/userdata"
+    if not base.is_dir():
+        return out
+    for cfg in base.glob("*/config/localconfig.vdf"):
+        for k, v in _read_vdf_apps(cfg).items():
+            out.setdefault(k, v)
+    return out
+
+
+def _running_app_ids() -> list[str]:
+    """扫 /proc 找 SteamAppId，排除 Steam 自己和 gamescope
+
+    只读 environ，不读 cmdline：命令行里常带 store 页面之类的 appid，会把结果带偏。
+    """
+    ids: list[str] = []
+    me = os.getpid()
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except Exception:
+        return ids
+    for pid in pids:
+        if int(pid) == me:
+            continue
+        try:
+            env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        except Exception:
+            continue
+        for kv in env:
+            if not kv.startswith(b"SteamAppId="):
+                continue
+            val = kv.split(b"=", 1)[1].decode(errors="ignore").strip()
+            if val and val != "0":
+                ids.append(val)
+    return ids
+
+
+def _current_game() -> dict:
+    """返回 {appid, name}，找不到就 name 为空"""
+    ids = _running_app_ids()
+    if not ids:
+        return {"appid": "", "name": ""}
+    names = _app_names()
+    # 同一个游戏会有好几个子进程，环境变量一致；取第一个能查到名字的
+    for appid in ids:
+        if names.get(appid):
+            return {"appid": appid, "name": names[appid]}
+    return {"appid": ids[0], "name": ""}
 
 
 # ---------- 身份与运行目录 ----------
@@ -994,10 +1097,13 @@ class Plugin:
         _require(ticket, "screenshot")
         if hide:
             await asyncio.sleep(0.45)
+        # 和抓帧一起把当前游戏的 appid/名字带回去：查攻略时要拼进提示词，
+        # 单独再开一次接口既慢又容易和画面错位
+        game = await asyncio.to_thread(_current_game)
         ok, payload = await grab_screenshot()
         if ok:
-            return {"ok": True, "image": payload}
-        return {"ok": False, "error": payload}
+            return {"ok": True, "image": payload, "game": game}
+        return {"ok": False, "error": payload, "game": game}
 
     async def gamepad_press(self, key: str, ms: int = 80, ticket: str = "") -> dict:
         """模拟按一下手柄键：a/b/x/y/lb/rb/up/down/left/right/start/select/guide/l3/r3/share"""

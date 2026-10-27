@@ -339,7 +339,9 @@ deckmeido/
 - ~~**Decky 插件联动查攻略**~~ — 已做：QAM 面板加「查攻略（看当前画面）」一键按钮，不用打字。点下去 → `Navigation.CloseSideMenus()` 收起 QAM → 450ms 后抓帧 → 抓完立刻 `Navigation.OpenQuickAccessMenu()` 弹回面板 → 画面连同固定提示词发给后端。后端据画面认游戏与场景，`web_search` 现搜（中文没结果就换英文关键词）再总结成可照做的步骤，回答在 QAM 流式显示，同一条 `ws` 广播也会同步到网页/手机
   - 收起菜单用的是 Steam 的 `MenuStore`（`@decky/ui` 的 `Navigation` 直接调窗口实例），不是模拟按键：QAM 里按 B 是「回上一级标签页」，按几次都不保证关面板
   - 抓帧参数 `screenshot(ticket, hide=True)`：`pipewiresrc` 抓的是 gamescope 合成后的画面，QAM 本身也在里面，不收起来只能拍到半屏游戏
-  - 系统提示词补了「带画面问攻略」的规范：先认场景 → 先搜再总结 → 中文不行换英文 → 只给步骤不编打法
+  - 游戏名不靠模型认：插件扫 `/proc/*/environ` 里的 `SteamAppId`（Steam 启动游戏时注入）拿到运行中 appid，再去 `userdata/*/config/localconfig.vdf` 的 `apps` 段取 `name`——用户在库里改过的名字（备注）就写在这个字段。拿到后拼成「当前游戏：《xxx》」放在问题开头，模型直接拿它搜；取不到才退回看画面判断
+  - `localconfig.vdf` 用括号配对解析（app 块里夹着 `cloud` 等子块，按第一个 `}` 切会漏）
+  - 系统提示词补了「带画面问攻略」的规范：先认场景 → 先搜再总结 → 中文不行换英文 → 只给步骤不编打法；并声明「当前游戏：《xxx》」是准确名字，别自己重新猜
   - 未做：全局热键（会与 Steam 输入争抢）、独立截图按钮、输入框开关
 
 ### 依赖
