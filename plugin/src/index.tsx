@@ -580,6 +580,8 @@ function Content() {
       /* 断开本身已经够用，取消失败不再打扰用户 */
     }
     setError("这一轮已中断");
+    // 中断多半发生在「面板收着、等抓帧」的这段时间，不把面板拉回来用户会以为插件死了
+    restoreQam();
   };
 
   // 未解锁：面板只留解锁框，提问一律不显示，避免用户点了才发现没权限
@@ -639,11 +641,20 @@ function Content() {
         </div>
       </PanelSectionRow>
 
+      {/* 放在按钮上面：抓帧那一分钟面板是收着的，回来第一眼就该看见进度和取消 */}
       <PanelSectionRow>
         <ButtonItem layout="below" onClick={busy ? cancel : shotAsk}>
           {busy ? `中断（${elapsed}s）` : "截屏询问"}
         </ButtonItem>
       </PanelSectionRow>
+
+      {error && (
+        <PanelSectionRow>
+          <div style={{ ...CARD, color: ERR_COLOR, background: "rgba(224,108,117,.1)" }}>
+            {error}
+          </div>
+        </PanelSectionRow>
+      )}
 
       {shot && (
         <PanelSectionRow>
@@ -655,14 +666,6 @@ function Content() {
               style={{ display: "block", width: "100%", height: "auto" }}
             />
             <div style={{ padding: "4px 8px", fontSize: 10, color: DIM }}>本轮发给 AI 的画面</div>
-          </div>
-        </PanelSectionRow>
-      )}
-
-      {error && (
-        <PanelSectionRow>
-          <div style={{ ...CARD, color: ERR_COLOR, background: "rgba(224,108,117,.1)" }}>
-            {error}
           </div>
         </PanelSectionRow>
       )}

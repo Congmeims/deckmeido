@@ -1053,6 +1053,8 @@ class _Backend:
         self.url = url
         self._impl = None
         self._send_lock = asyncio.Lock()
+        # 本端这一轮的 sid：history 回来时填上，之后靠它认出哪些 δ 是自己的
+        self.sid = ""
 
     async def open(self):
         # 后端用 UA 判断「这条连接是网页还是手机」，插件不声明就会被当成一个
