@@ -1414,9 +1414,10 @@ class Plugin:
             "gamepad": os.access("/dev/uinput", os.W_OK) if os.path.exists("/dev/uinput") else False,
             # 本机鉴权状态：false 时前端只显示解锁框
             "unlocked": _unlocked(),
-            # 令牌是否还是默认值：是的话前端给「一键解锁」按钮，
-            # 换过令牌就只留手输框，别把主人设的门给绕过去
-            "default_token": _token() == DEFAULT_PLUGIN_TOKEN,
+            # 后端记着的那张票据。前端把它当成「本机已解锁」的凭据接回来：
+            # QAM 面板一关一开组件会重挂载、useState 归零，不补回来的话
+            # 「截屏询问」先收面板再展开时就成了「明明解锁了却报未解锁」
+            "ticket": _SESSION_TICKET if _unlocked() else "",
         }
 
     async def session_open(self, ticket: str = "") -> dict:
@@ -1446,25 +1447,12 @@ class Plugin:
     async def unlock(self, token: str) -> dict:
         """用访问令牌解锁插件能力，成功后拿到票据，之后的调用都要带上
 
-        传空串表示「一键解锁」：令牌本来就在本机（环境变量 / plugin.toml /
-        默认值），插件自己就读得到，没必要让主人在游戏模式下用屏幕键盘敲。
-
         连续错 _MAX_FAILS 次会冷却 _FAIL_COOLDOWN 秒：QAM 上的输入框是唯一入口，
         不设限的话可以脚本化穷举 4 位令牌。
         """
         wait = _too_many_fails()
         if wait:
             return {"ok": False, "error": f"错误次数太多，{wait} 秒后再试"}
-        if not str(token or "").strip():
-            # 一键解锁只在令牌还是默认值时才给：主人在环境变量或 plugin.toml
-            # 里特意换过令牌，就是想要一道门，这时必须手输，不能被按钮绕过去
-            if _token() != DEFAULT_PLUGIN_TOKEN:
-                return {"ok": False, "error": "已自定义令牌，请手动输入"}
-            _fails.clear()
-            ticket = secrets.token_urlsafe(24)
-            _save_ticket(ticket)
-            decky.logger.info("QAM 已解锁（本机令牌）")
-            return {"ok": True, "ticket": ticket}
         if _same(str(token or "").strip().lower(), _token()):
             _fails.clear()
             ticket = secrets.token_urlsafe(24)

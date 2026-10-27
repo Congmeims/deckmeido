@@ -30,8 +30,10 @@ type Status = {
   version: string;
   // 本机鉴权：false 时面板只显示解锁框
   unlocked: boolean;
-  // 令牌是否还是默认值：是才给「一键解锁」，换过就得手输
-  default_token: boolean;
+  // 后端记着的那张票据（没解锁时是空串）。
+  // QAM 面板一关一开，React 组件会重新挂载、useState 归零；靠这个把票据接回来，
+  // 否则「截屏询问」先收面板再展开时票据就丢了，明明解锁了还报未解锁
+  ticket: string;
 };
 
 // 面板展示的一条对话（所有端的提问和回复都在这）
@@ -288,9 +290,9 @@ function Content() {
       const st = (await call<[], Status>("get_status")) as Status;
       setStatus(st);
       setTts(!!st.tts);
-      // 后端说没解锁就把本地票据丢掉：插件可能重启过，旧票据已经作废，
-      // 留着只会让每次调用都报「票据不对」
-      if (!st.unlocked) setTicket("");
+      // 票据以后端为准：面板重挂载后本地是空的，这里补回来；
+      // 后端说没解锁（插件重启过、票据过期）就把本地那张丢掉
+      setTicket(st.ticket || "");
       return st;
     } catch (e) {
       setError(`插件后端未就绪：${e}`);
@@ -298,7 +300,7 @@ function Content() {
     }
   };
 
-  // 拿票据的公共动作：手动输入和「一键解锁」都走这里
+  // 拿票据：手动输入令牌后换取票据
   const applyTicket = async (tk: string) => {
     const r = (await call<[string], { ok: boolean; ticket?: string; error?: string }>(
       "unlock",
@@ -319,15 +321,6 @@ function Content() {
     if (!tk) return;
     try {
       await applyTicket(tk);
-    } catch (e: any) {
-      setError(String(e?.message ?? e));
-    }
-  };
-
-  // 一键解锁：不传令牌，让插件后端用它自己从 config.toml 读到的那个
-  const unlockWithLocalToken = async () => {
-    try {
-      await applyTicket("");
     } catch (e: any) {
       setError(String(e?.message ?? e));
     }
@@ -438,11 +431,13 @@ function Content() {
     setBusyBoth(true);
 
     try {
-      const st = status ?? (await refreshStatus());
+      // 每次都重新问一次：面板重挂载后本地 ticket 是空的，靠这次拿回来
+      const st = await refreshStatus();
       if (!st) throw new Error("插件后端未就绪");
       if (!st.config_ok) throw new Error(`找不到配置：${st.install_dir}/server/config.toml`);
       if (!st.token_ok) throw new Error("后端配置里的 token 是空的，先在网页设置页生成一个");
-      if (!st.unlocked || !ticket) throw new Error("插件未解锁，先输入访问令牌");
+      if (!st.unlocked || !st.ticket) throw new Error("插件未解锁，先输入访问令牌");
+      const tk = st.ticket;
 
       let image: string | null = null;
       let game: { appid?: string; name?: string } | null = null;
@@ -453,7 +448,7 @@ function Content() {
         const shot = (await call<
           [string, boolean],
           { ok: boolean; image?: string; error?: string; game?: { appid?: string; name?: string } }
-        >("screenshot", ticket, hideQam)) as {
+        >("screenshot", tk, hideQam)) as {
           ok: boolean;
           image?: string;
           error?: string;
@@ -483,7 +478,7 @@ function Content() {
         "start_turn",
         body,
         image,
-        ticket
+        tk
       )) as { ok: boolean; error?: string };
       if (!res.ok) throw new Error(res.error ?? "发不出去");
 
@@ -491,7 +486,7 @@ function Content() {
       const fin = (await call<[number, string], { ok: boolean; text?: string; error?: string }>(
         "wait_final",
         900,
-        ticket
+        tk
       )) as { ok: boolean; text?: string; error?: string };
       if (busyRef.current) {
         if (fin.ok && fin.text) {
@@ -558,18 +553,9 @@ function Content() {
       <PanelSection title="DeckMeido">
         <PanelSectionRow>
           <div style={{ fontSize: 10, color: DIM, lineHeight: 1.5 }}>
-            插件以 root 运行，需要先解锁才能对话
+            插件以 root 运行，需要先输入访问令牌解锁（默认 meido）
           </div>
         </PanelSectionRow>
-        {status.default_token && (
-          <PanelSectionRow>
-            {/* 一键解锁：令牌就在本机（插件自己的 qam_token，默认 meido），
-                没必要让主人在游戏模式下用屏幕键盘一个字一个字敲 */}
-            <ButtonItem layout="below" onClick={unlockWithLocalToken}>
-              一键解锁
-            </ButtonItem>
-          </PanelSectionRow>
-        )}
         <PanelSectionRow>
           <TextField
             label="访问令牌"
