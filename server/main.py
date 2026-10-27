@@ -144,7 +144,11 @@ llm = LLMClient(
 )
 
 PERSONA = CFG.get("persona", {})
-MAX_TOOL_ROUNDS = int(CFG["agent"].get("max_tool_rounds", 0))
+# 单轮最多几轮工具往返。以前默认 0 = 不限，模型一旦陷进「截图 → 没看懂 → 再截图」
+# 这种循环就会一直跑下去，只能靠用户点终止。给一个够用的上限，
+# 到顶时按既有逻辑补一句「到了单轮上限」，把控制权交回用户。
+DEFAULT_MAX_TOOL_ROUNDS = 12
+MAX_TOOL_ROUNDS = int(CFG["agent"].get("max_tool_rounds", 0)) or DEFAULT_MAX_TOOL_ROUNDS
 
 # 上下文窗口（真实模型支持的总 token 数）。配 0 表示自动按模型名推断。
 # 用量优先取服务商返回的 usage.prompt_tokens，拿不到再按字符估算。
@@ -230,11 +234,36 @@ def _build_llm_msgs(hist: list[dict], sys_prompt: str, sid: str = "") -> list[di
         content = m.get("llm") or m.get("content", "")
         if m["role"] == "user":
             content = _to_vision_content(content) if isinstance(content, str) else content
+        # 历史里存下来的画面若过大（旧版截的是无损 PNG，一张 12MB），换成占位符。
+        # 网关对请求体有上限，超了会被上游截断并返回 503，整轮提问跟着失败；
+        # 这些图只是当时那一轮的参考，用一句说明代替即可
+        content = _shrink_oversized_images(content)
         # 历史里还存了 ts / events 供界面回放，发给模型时只保留 role 和 content
         msgs.append({"role": m["role"], "content": content,
                      "tool_calls": m.get("tool_calls"),
                      "tool_call_id": m.get("tool_call_id")})
     return _drop_orphan_tools(msgs)
+
+
+# 单张图 base64 的上限。网关实测 1600 万字符必挂；给到 200 万字符（约 1.5MB 原图）
+# 已经远超正常截图，留足余量的同时保证单个请求体不会把链路撑爆
+_MAX_IMG_CHARS = 2_000_000
+
+
+def _shrink_oversized_images(content):
+    """把超大的图片部分替换成文字说明，其余部分原样返回"""
+    if not isinstance(content, list):
+        return content
+    out, changed = [], False
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "image_url":
+            url = str((part.get("image_url") or {}).get("url") or "")
+            if len(url) > _MAX_IMG_CHARS:
+                out.append({"type": "text", "text": "（这张图太大无法重新发送，已略过）"})
+                changed = True
+                continue
+        out.append(part)
+    return out if changed else content
 
 
 def _drop_orphan_tools(msgs: list[dict]) -> list[dict]:
@@ -280,7 +309,25 @@ def _estimate_tokens(msgs: list[dict]) -> int:
     """粗估 token：中文约 1 字 1 token，英文约 4 字符 1 token，另加每条消息的固定开销"""
     total = 0
     for m in msgs:
-        text = str(m.get("content") or "") + str(m.get("reasoning_content") or "")
+        content = m.get("content")
+        # 多模态消息的 content 是 list，图片以 base64 形式挂在里面。直接 str()
+        # 会把整串 base64 当文本数：一张 1280x800 的 PNG 有 1600 万字符，
+        # 估出来四百多万 token，于是每轮都判定「该压缩了」，上来就把对话压成摘要。
+        # 图片按固定额度计：主流模型对一张普通图收 800~1600 token 左右。
+        if isinstance(content, list):
+            text_parts, images = [], 0
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "image_url":
+                    images += 1
+                elif part.get("type") == "text":
+                    text_parts.append(str(part.get("text") or ""))
+            total += images * 1500
+            text = "".join(text_parts)
+        else:
+            text = str(content or "")
+        text += str(m.get("reasoning_content") or "")
         cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
         total += cjk + (len(text) - cjk) // 4 + 8
         for tc in m.get("tool_calls") or []:
@@ -356,7 +403,10 @@ def build_system_prompt(workspace: Path | None = None) -> str:
         "press/hold 相当于一踩到底），l3/r3 是左右摇杆按下（跑步/蹲/近战常见），"
         "右摇杆用 stick 的 side=right 推（转视角），share 是 Xbox Series 的分享键"
         "（部分游戏不认）。一次只能动一个键/轴，连续操作要多次调用；"
-        "推完摇杆或压住扳机后记得 release，否则会一直保持。\n"
+        "推完摇杆或压住扳机后记得 release，否则会一直保持。"
+        "每次 gamepad 调用都会先向用户申请确认（它直接操作设备，用户不在旁边时不该自己动），"
+        "所以不要为了「先试试」而随手按键：只在用户明确要求操作时才调用，"
+        "并且在申请前说清楚你要按什么、为什么。\n"
         "呼出 Steam 的快速访问菜单（QAM，音量/亮度/TDP/性能覆盖/蓝牙）和 Steam 主菜单"
         "是系统层拦物理 Steam 键实现的，虚拟手柄做不到，需要时请用户自己按 Steam 键。\n"
         "- 桌面模式（Desktop Mode，KDE Plasma + Wayland）：用 desktop 工具点按输入，"
@@ -426,7 +476,8 @@ def apply_config(cfg: dict):
     CFG = cfg
     PERSONA = cfg.get("persona", {})
     TOKEN = (cfg["server"].get("token") or TOKEN).strip().lower()
-    MAX_TOOL_ROUNDS = int(cfg.get("agent", {}).get("max_tool_rounds", 0))
+    MAX_TOOL_ROUNDS = (int(cfg.get("agent", {}).get("max_tool_rounds", 0))
+                       or DEFAULT_MAX_TOOL_ROUNDS)
     c = cfg["llm"]
     llm.base_url = c["base_url"].rstrip("/")
     llm.api_key = c["api_key"]
@@ -1098,13 +1149,56 @@ def _image_part(data: str, prompt: str) -> dict | None:
     if mime not in ("image/png", "image/jpeg", "image/webp"):
         return None
     try:
-        base64.b64decode(raw, validate=True)
+        blob = base64.b64decode(raw, validate=True)
     except Exception:
         return None
+    # 裸 base64 没法从字符串本身看出格式，只能认文件头。插件现在发的是 JPEG
+    # （PNG 有 12MB，超过 LLM 网关的请求体上限），按 PNG 标上去会让模型收错格式
+    if not raw.startswith("data:"):
+        if blob[:3] == b"\xff\xd8\xff":
+            mime = "image/jpeg"
+        elif blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
+            mime = "image/webp"
     return {"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{raw}"}},
         {"type": "text", "text": prompt},
     ]}
+
+
+def _save_incoming_shot(data: str) -> dict | None:
+    """把随提问附带的画面落成文件，返回一条截图事件
+
+    和模型自己截图（tools.screenshot）用同一个目录、同一个 /shots/ 前缀，
+    前端不需要为两种来源写两套渲染。存不下来只影响「看不看得到图」，
+    不影响这一轮问答，所以失败就返回 None。
+    """
+    import base64
+    raw = (data or "").strip()
+    if raw.startswith("data:"):
+        _, _, raw = raw.partition(",")
+    try:
+        blob = base64.b64decode(raw, validate=True)
+    except Exception:
+        return None
+    ext = ".png"
+    if blob[:3] == b"\xff\xd8\xff":
+        ext = ".jpg"
+    elif blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
+        ext = ".webp"
+    shots_dir = Path(__file__).resolve().parent / "static" / "shots"
+    try:
+        shots_dir.mkdir(exist_ok=True)
+        # 只留最近 40 张：这些是纯展示用的副本，模型那边用的是内联 base64，
+        # 删掉不影响任何历史对话的上下文
+        old = sorted(shots_dir.glob("ask_*.*"), key=lambda p: p.stat().st_mtime)
+        for p in old[:-40]:
+            p.unlink(missing_ok=True)
+        name = f"ask_{int(time.time() * 1000)}{ext}"
+        (shots_dir / name).write_bytes(blob)
+    except Exception:
+        return None
+    return {"type": "screenshot", "name": "screenshot",
+            "summary": "截屏询问时附带的画面", "image": f"/shots/{name}"}
 
 
 def _expand_context(text: str, workspace: Path | None = None) -> str:
@@ -1599,7 +1693,8 @@ async def handle_chat(text: str, announce: bool = True,
                       image: str | None = None,
                       image_prompt: str = "（这是当前游戏画面，结合画面回答用户的问题）",
                       workspace: Path | None = None,
-                      client: str | None = None) -> dict:
+                      client: str | None = None,
+                      device: str | None = None) -> dict:
     global pending_action, _ctx_used
     # 本轮归属快照：整轮全程只认这份 sid/epoch，中途别的端新建/切换会话也不影响它
     turn_sid = current_sid
@@ -1625,18 +1720,29 @@ async def handle_chat(text: str, announce: bool = True,
     # 按 ts 精确匹配就永远对不上，删除按钮会退化成「删最后一条同角色消息」
     user_ts = time.time()
     # 来源标记：网页/手机/桌面客户端/QAM 插件各标各的，同一条对话里混着来
-    # 也能看清谁说的。只挂在 user 消息上，且为空时不写字段，老数据零影响
+    # 也能看清谁说的。只挂在 user 消息上，且为空时不写字段，老数据零影响。
+    # device 是每台浏览器各自的身份：client 只说「哪种浏览器」，两台电脑都是 web，
+    # 分不清「这条是不是我这台发的」，所以「本端」角标要靠 device 比对
     src_tag = {"client": client} if client else {}
+    if device:
+        src_tag["device"] = device
+    # 随本轮附带的画面（Decky 插件截的游戏画面）先落成文件：各端回放历史时会跳过
+    # 「content 是数组」的消息（那是给模型看图的素材），只靠内联 base64 的话
+    # 屏幕上永远没有图，表现就是「答得头头是道，却不知道它看的是什么」
+    shot_event = _save_incoming_shot(image) if image_part else None
     if announce:
+        # 画面要先落盘再广播：各端收到 user_message 时如果没带图，
+        # 这一轮的画面就一直空着，只有刷新历史才补得回来
         await manager.broadcast({"type": "user_message", "text": text, "ts": user_ts,
-                                 **sid_tag, **src_tag})
+                                 **sid_tag, **src_tag,
+                                 **({"events": [shot_event]} if shot_event else {})})
         feed_push("user_message", text=text)
     # @{文件} 展开为内容；图片标记在 run_agent 里转成多模态 content
     hist.append({"role": "user", "content": text, "llm": _expand_context(text, workspace),
-                 "ts": user_ts, **src_tag})
-    # 随本轮附带的画面（Decky 插件截的游戏画面）：单独补一条多模态消息，
-    # 而不是塞进上面那条的 llm 字段，这样历史里那条 user 消息仍然只有文字，
-    # 网页端回放时不会出现一张找不到来源的图
+                 "ts": user_ts, **src_tag,
+                 **({"events": [shot_event]} if shot_event else {})})
+    # 随本轮附带的画面：单独补一条多模态消息，而不是塞进上面那条的 llm 字段，
+    # 这样历史里那条 user 消息仍然只有文字，图上挂的路径供界面显示
     if image_part:
         hist.append(image_part)
     events: list[dict] = []
@@ -2177,18 +2283,36 @@ _overlay_state = {"show": False, "text": "", "passthrough": False, "lift": False
 _overlay_ack = {"passthrough": False, "lift": False}  # 遮罩进程确认已让开鼠标 / 已抬高
 
 
+def _xauthority() -> str:
+    """当前可用的 X 授权文件
+
+    Xwayland 每次会话都会换一个 xauth_XXXXXX 文件，后端进程环境里那份
+    早晚会失效。这里先认环境里的路径（存在才算数），否则按修改时间取
+    最新的一份；用 setdefault 是不够的——环境里留着旧路径时新文件永远
+    不会被找到，遮罩会一直报 "Authorization required"。
+    """
+    cur = os.environ.get("XAUTHORITY", "")
+    if cur and Path(cur).exists():
+        return cur
+    cands = glob.glob(f"/run/user/{os.getuid()}/xauth_*")
+    cands = [c for c in cands if Path(c).exists()]
+    if cands:
+        return max(cands, key=lambda p: Path(p).stat().st_mtime)
+    home = Path.home() / ".Xauthority"
+    return str(home) if home.exists() else ""
+
+
 def _overlay_env() -> dict:
     """桌面会话环境：systemd 用户服务里默认没有 DISPLAY / XAUTHORITY"""
     env = os.environ.copy()
     env.setdefault("DISPLAY", ":0")
     env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{os.getuid()}/bus")
-    if not env.get("XAUTHORITY"):
-        cands = sorted(glob.glob(f"/run/user/{os.getuid()}/xauth_*"))
-        if cands:
-            env["XAUTHORITY"] = cands[0]
-        elif (Path.home() / ".Xauthority").exists():
-            env["XAUTHORITY"] = str(Path.home() / ".Xauthority")
+    auth = _xauthority()
+    if auth:
+        env["XAUTHORITY"] = auth
+    else:
+        env.pop("XAUTHORITY", None)
     env["DECKMEIDO_API"] = f"http://127.0.0.1:{CFG['server'].get('port', 18765)}"
     env["DECKMEIDO_TOKEN"] = str(CFG["server"].get("token", ""))
     # 走 Xwayland（xcb）：Wayland 原生窗口没有「不进任务栏」的协议，遮罩必须走 X11 才能隐藏
@@ -2652,6 +2776,8 @@ async def run_agent(events: list[dict], extra_system: str = "",
 
     try:
         round_no = 0
+        # 本轮是否已经往对话里塞过一张截图（塞过就不再塞第二张）
+        turn_shot_seen = False
         while MAX_TOOL_ROUNDS <= 0 or round_no < MAX_TOOL_ROUNDS:
             round_no += 1
             # 单轮里工具往返也会堆积上下文，超过阈值就先压缩再继续。
@@ -2799,17 +2925,25 @@ async def run_agent(events: list[dict], extra_system: str = "",
                 events.append(event)
                 await manager.broadcast({"type": "tool_done", "event": event, "ts": time.time(), **_turn_tag()})
                 msgs.append({"role": "tool", "tool_call_id": call["id"], "content": result})
-                # 截图后把画面注入对话，多模态模型可直接看图回答
+                # 截图后把画面注入对话，多模态模型可直接看图回答。
+                # 同一轮里连着截第二张时复用上一张：模型反复截图通常不是画面变了，
+                # 而是它没「看到」上面那张。再截一张只会让上下文里堆图，
+                # 顺手还把模型推回同样的困惑里绕圈（曾经连截五次停不下来）。
                 if name == "screenshot" and tools.LAST_VISION:
-                    try:
-                        import base64
-                        b64 = base64.b64encode(Path(tools.LAST_VISION).read_bytes()).decode()
-                        msgs.append({"role": "user", "content": [
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                            {"type": "text", "text": "（这是刚才截取的当前桌面画面，根据画面回答用户的问题）"},
-                        ]})
-                    except Exception:
-                        pass
+                    if turn_shot_seen:
+                        msgs.append({"role": "user", "content":
+                                     "（本轮已经截过图，画面就在上面，直接看图回答，不要重复截图）"})
+                    else:
+                        turn_shot_seen = True
+                        try:
+                            import base64
+                            b64 = base64.b64encode(Path(tools.LAST_VISION).read_bytes()).decode()
+                            msgs.append({"role": "user", "content": [
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                                {"type": "text", "text": "（这是刚才截取的当前桌面画面，根据画面回答用户的问题）"},
+                            ]})
+                        except Exception:
+                            pass
         # 工具轮数用尽：最后再不给工具地问一次，让它基于已有结果收尾回答
         msg = await llm.chat_with_tools_stream(msgs, [], on_delta, max_tokens=_output_budget(msgs))
         if msg.get("reasoning_content"):
@@ -2863,6 +2997,7 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
                         or "（这是当前游戏画面，结合画面回答用户的问题）",
                         workspace=Path(ws_root).expanduser() if ws_root else None,
                         client=str(data.get("client") or ua_client),
+                        device=str(data.get("device") or "").strip() or None,
                     )
                 except asyncio.CancelledError:
                     pass  # 用户点了终止，保持 ws 连接
