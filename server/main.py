@@ -250,6 +250,10 @@ def _build_llm_msgs(hist: list[dict], sys_prompt: str, sid: str = "") -> list[di
 _MAX_IMG_CHARS = 2_000_000
 # 原图字节数的对应上限（base64 大约是原图的 1.37 倍）
 _MAX_IMG_BYTES = int(_MAX_IMG_CHARS / 1.37 * 0.9)
+# 收图时的压缩门槛，比上限低得多：插件用 gst 抓的是 1280x800 JPEG q90，
+# 一张游戏画面就有 1.8MB（base64 之后 240 万字符），稳稳越过上限被换成占位符。
+# 而压到 1024 宽 q75 只有 160KB，看图问答根本看不出差别，所以统一在这里压一遍
+_IMG_SOFT_BYTES = 300_000
 
 
 def _shrink_oversized_images(content):
@@ -1133,14 +1137,24 @@ _CTX_RE = re.compile(r"@\{([^}]+)\}")
 def _image_part(data: str, prompt: str) -> dict | None:
     """把 data URL / 裸 base64 转成一条多模态 user 消息；解析不出图片返回 None
 
-    data URL 形如 data:image/png;base64,xxxx；裸 base64 按 PNG 处理。
+    data URL 形如 data:image/png;base64,xxxx；裸 base64 按文件头认格式。
     MIME 是唯一的判断依据：宁可返回 None 让调用方报错，也不能把一段
     解析失败的字符串当成图片发给模型，那会变成一条纯粹的空提问。
+    """
+    part, _ = _pack_image(data, prompt)
+    return part
+
+
+def _pack_image(data: str, prompt: str) -> tuple[dict | None, bytes | None]:
+    """解析并压缩一张图，返回 (多模态消息, 压缩后的字节)
+
+    字节那份是给 _save_incoming_shot 落盘用的：各处显示和模型看到的必须是同一张，
+    否则会出现「界面上一张、模型看到的另一张」。
     """
     import base64
     raw = (data or "").strip()
     if not raw:
-        return None
+        return None, None
     mime = "image/png"
     if raw.startswith("data:"):
         head, _, raw = raw.partition(",")
@@ -1149,11 +1163,11 @@ def _image_part(data: str, prompt: str) -> dict | None:
         if not meta.lower().endswith(";base64"):
             raw = base64.b64encode(raw.encode()).decode()
     if mime not in ("image/png", "image/jpeg", "image/webp"):
-        return None
+        return None, None
     try:
         blob = base64.b64decode(raw, validate=True)
     except Exception:
-        return None
+        return None, None
     # 裸 base64 没法从字符串本身看出格式，只能认文件头。插件现在发的是 JPEG
     # （PNG 有 12MB，超过 LLM 网关的请求体上限），按 PNG 标上去会让模型收错格式
     if not raw.startswith("data:"):
@@ -1161,18 +1175,19 @@ def _image_part(data: str, prompt: str) -> dict | None:
             mime = "image/jpeg"
         elif blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
             mime = "image/webp"
-    # 大图在这里就压成 JPEG：不然 base64 越过 _MAX_IMG_CHARS 之后，
-    # 重发历史时会被替换成「图片过大」的说明，模型从来就没看到过这张图
-    big = len(blob) > _MAX_IMG_BYTES or len(raw) > _MAX_IMG_CHARS * 0.7
-    if big:
+    # 超过软门槛就压成 JPEG：插件那张 q90 的 1.8MB 截图 base64 有 240 万字符，
+    # 越过 _MAX_IMG_CHARS 之后，重发历史时会被替换成「图片太大已略过」的占位符，
+    # 模型从来没看到过这张图 —— 这就是「插件截的图传不上来」的真正原因
+    if len(blob) > _IMG_SOFT_BYTES:
         packed = _jpeg_for_llm(blob)
         if packed is not blob:
             blob, mime = packed, "image/jpeg"
             raw = base64.b64encode(blob).decode()
-    return {"role": "user", "content": [
+    part = {"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{raw}"}},
         {"type": "text", "text": prompt},
     ]}
+    return part, blob
 
 
 def _shot_caption(seq: int) -> str:
@@ -1189,15 +1204,14 @@ def _shot_caption(seq: int) -> str:
             "前面的画面都是更早的提问，已经过时；请只依据这一张回答）")
 
 
-def _jpeg_for_llm(blob: bytes, max_side: int = 1280, quality: int = 72) -> bytes:
+def _jpeg_for_llm(blob: bytes, max_side: int = 1024, quality: int = 75) -> bytes:
     """把一张图压成适合发给模型的 JPEG
 
-    插件截的是 1280x800 全屏 JPEG q90，一张两百多 KB，base64 之后三十多万字符，
-    这是正常量级；但别的端（PC 网页、手机）随手拖进来的截图动辄几 MB 的 PNG，
-    base64 之后会越过 _MAX_IMG_CHARS，被 _shrink_oversized_images 换成一句
-    「这张图太大无法重新发送」—— 表现就是模型说「我这边只收到图片过大的提示，
-    画面内容看不到」。既然历史上重发时一定会被压掉，不如收进来的那一刻就压好：
-    模型看到的是同一张画面，界面上留的也是压过的那份（还省磁盘）。
+    插件截的是 1280x800 全屏 JPEG q90，一张游戏画面就有 1.8MB，base64 之后
+    240 万字符，越过 _MAX_IMG_CHARS 就会被 _shrink_oversized_images 换成
+    「图片太大已略过」—— 模型只看到这句话，于是让用户重发，用户看到的就是
+    「插件截的图传不上来」。而 PC 网页上传的小图没这个问题，所以只有插件中招。
+    压到 1024 宽 q75 只有 160KB，看图问答看不出差别，重发历史也安全。
     压不动就原样返回，交给原来的保护逻辑兜底。
     """
     try:
@@ -1206,32 +1220,24 @@ def _jpeg_for_llm(blob: bytes, max_side: int = 1280, quality: int = 72) -> bytes
         from PIL import Image
         img = Image.open(BytesIO(blob))
         img.load()
-        if max(img.size) > max_side:
-            img.thumbnail((max_side, max_side))
+        img.thumbnail((max_side, max_side))
         buf = BytesIO()
         img.convert("RGB").save(buf, "JPEG", quality=quality, optimize=True)
         out = buf.getvalue()
-        # 小图（已经在限额内的 PNG）压完反而更大时，优先小的那份
-        return out if len(out) < len(blob) or max(img.size) > max_side else blob
+        # 压完反而更大（本来就小的图）就保留原样
+        return out if len(out) < len(blob) else blob
     except Exception:
         return blob
 
 
-def _save_incoming_shot(data: str) -> dict | None:
+def _save_incoming_shot(blob: bytes) -> dict | None:
     """把随提问附带的画面落成文件，返回一条截图事件
 
     和模型自己截图（tools.screenshot）用同一个目录、同一个 /shots/ 前缀，
     前端不需要为两种来源写两套渲染。存不下来只影响「看不看得到图」，
     不影响这一轮问答，所以失败就返回 None。
+    blob 传的是 _pack_image 压过的那份，界面显示的和模型看到的才是同一张。
     """
-    import base64
-    raw = (data or "").strip()
-    if raw.startswith("data:"):
-        _, _, raw = raw.partition(",")
-    try:
-        blob = base64.b64decode(raw, validate=True)
-    except Exception:
-        return None
     ext = ".png"
     if blob[:3] == b"\xff\xd8\xff":
         ext = ".jpg"
@@ -1767,7 +1773,7 @@ async def handle_chat(text: str, announce: bool = True,
     hist = history
     sid_tag = {"sid": turn_sid}
     # 图片解析失败不能静默丢掉：用户以为「发了张图」，模型却只收到了文字
-    image_part = _image_part(image, image_prompt) if image else None
+    image_part, image_blob = _pack_image(image, image_prompt) if image else (None, None)
     if image and not image_part:
         return {"reply": "附带的画面没能解析成图片（只支持 PNG / JPEG / WebP），这一轮没有发送。",
                 "events": []}
@@ -1799,7 +1805,7 @@ async def handle_chat(text: str, announce: bool = True,
     # 随本轮附带的画面（Decky 插件截的游戏画面）先落成文件：各端回放历史时会跳过
     # 「content 是数组」的消息（那是给模型看图的素材），只靠内联 base64 的话
     # 屏幕上永远没有图，表现就是「答得头头是道，却不知道它看的是什么」
-    shot_event = _save_incoming_shot(image) if image_part else None
+    shot_event = _save_incoming_shot(image_blob) if image_blob else None
     if announce:
         # 画面要先落盘再广播：各端收到 user_message 时如果没带图，
         # 这一轮的画面就一直空着，只有刷新历史才补得回来
