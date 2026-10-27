@@ -1071,7 +1071,7 @@ def read_first(path: str) -> str:
         return ""
 
 
-def get_status() -> dict:
+def get_status(gaming: bool | None = None) -> dict:
     battery = read_first("/sys/class/power_supply/BAT1/capacity")
     charging = read_first("/sys/class/power_supply/BAT1/status")
     load = ""
@@ -1080,7 +1080,14 @@ def get_status() -> dict:
         load = " ".join(load)
     except OSError:
         pass
-    gaming = subprocess.run(["pgrep", "-x", "gamescope"], capture_output=True).returncode == 0
+    # 模式判据：gamescope 在 PipeWire 里有没有视频节点。以前用
+    # `pgrep -x gamescope`，但 SteamOS 上进程名带着一长串参数，comm 被截到
+    # 15 字节后反而匹配不上，pgrep 恒返回 1 —— 于是进了游戏模式还一直显示
+    # 桌面、「画面」也不可用。PipeWire 节点只在游戏模式存在，而且抓帧用的
+    # 就是这个判断，两处不会再打架。它不便宜，所以带缓存（见 tools.mode_is_gaming）。
+    # 探针会起子进程，接口层用 to_thread 算好再传进来，别卡事件循环
+    if gaming is None:
+        gaming = tools.mode_is_gaming()
     win = context_window()
     used = _ctx_used or _estimate_tokens(_build_llm_msgs(history, SYSTEM_PROMPT, current_sid))
     pct = round(min(used / win, 1.0) * 100, 1) if win else 0
@@ -1420,7 +1427,8 @@ async def api_file_stat(payload: dict):
 
 @app.get("/api/status", dependencies=[Depends(check_token)])
 async def api_status():
-    return get_status()
+    # 模式探针要起 pw-dump，放线程里跑，别阻塞事件循环（WS 也在同一个 loop 上）
+    return get_status(await asyncio.to_thread(tools.mode_is_gaming))
 
 
 @app.get("/api/feed", dependencies=[Depends(check_token)])
@@ -3137,11 +3145,11 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
     # 来源：优先信调用方显式声明的 client（插件标 qam，桌面客户端标 client），
     # 没声明就按 UA 猜——手机浏览器自动算 mobile，其余算 web。
     # ws_mode 用来记住「这条连接是在什么模式下连上的」：状态广播是全局的，
-    # 游戏模式的判定（pgrep gamescope）对所有连着的端都成立，桌面网页就会
+    # 游戏模式的判定（PipeWire 里的 gamescope 节点）对所有连着的端都成立，桌面网页就会
     # 跟着显示成「游戏模式」。所以按连接自己的会话判定，桌面网页永远是桌面
     ua = ws.headers.get("user-agent", "")
     ua_client = "mobile" if ("Mobile" in ua or "Android" in ua) else "web"
-    ws_mode = get_status()["mode"]
+    ws_mode = (await asyncio.to_thread(get_status))["mode"]
     try:
         # 新连接同步历史（带上 sid，前端才能建立会话代次基线，
         # 否则 currentSid 一直是空值，代次过滤整条失效）
@@ -3153,7 +3161,7 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
             data = await ws.receive_json()
             if data.get("type") == "chat":
                 # 开始发问就刷新：这条连接此刻在什么模式下，就是它自己的模式
-                ws_mode = get_status()["mode"]
+                ws_mode = (await asyncio.to_thread(get_status))["mode"]
                 try:
                     # 插件那条路要从 ws 直接带图和真实工作区进来：
                     # 它挂在 gamescope 上，请求和流式都在同一条连接里，

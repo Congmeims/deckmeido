@@ -19,6 +19,8 @@ import subprocess
 import threading
 import time
 
+from . import tools as tools
+
 CACHE_TTL = 60.0
 
 # 控件清单：顺序即网页上展示的顺序
@@ -99,8 +101,14 @@ def _probe_kdotool() -> tuple[bool, str]:
 
 
 def _in_gamescope() -> bool:
-    """当前是不是在游戏模式（gamescope 会话）里"""
-    return _run(["pgrep", "-x", "gamescope"], timeout=2.0)[0] == 0
+    """当前是不是在游戏模式（gamescope 会话）里
+
+    和 main.get_status 共用 tools.mode_is_gaming 这一个判据：那里的探针是
+    PipeWire 里的 gamescope 视频节点。以前这里用 `pgrep -x gamescope`，
+    SteamOS 上进程名带参数、comm 被截断，pgrep 恒失败，导致人在游戏模式里
+    却一直按桌面模式处理（kdotool 被当成坏了，灯变红）
+    """
+    return tools.mode_is_gaming()
 
 
 def _probe_wtype() -> tuple[bool, str]:

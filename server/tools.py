@@ -10,6 +10,7 @@ import shlex
 import shutil
 import signal
 import tempfile
+import time
 from pathlib import Path
 
 import httpx
@@ -1209,7 +1210,14 @@ def _session_user() -> tuple[int, str] | None:
 
 
 async def _gamescope_pw_node() -> str | None:
-    """游戏模式下找 gamescope 的 PipeWire 视频节点 id；找不到返回 None"""
+    """游戏模式下找 gamescope 的 PipeWire 视频节点 id；找不到返回 None
+
+    注意：这个函数是「当前在不在游戏模式」的唯一权威判据（main.get_status、
+    depcheck 都复用它）。不能用 pgrep -x gamescope 代替——SteamOS 上进程名
+    带参数时 comm 会被截断成 "gamescope"（15 字节上限）反而匹配不上，
+    所以 pgrep 一度恒返回 1，桌面网页和插件就一直显示「桌面模式」，
+    实时画面也被判成不可用。
+    """
     sess = _session_user()
     env = dict(os.environ)
     if sess:
@@ -1230,12 +1238,42 @@ async def _gamescope_pw_node() -> str | None:
     return None
 
 
-async def _raw_ok(raw: Path) -> bool:
+def _raw_ok(raw: Path) -> bool:
     """抓帧产物是否有效：存在且大于 10KB（pngenc 失败时会留下空文件）"""
     try:
         return raw.exists() and raw.stat().st_size >= 10000
     except OSError:
         return False
+
+
+# 「现在是不是游戏模式」的判据缓存：(是否游戏模式, 时间戳)。
+# 判一次要起 pw-dump 并解析整份节点树，几十毫秒起步；状态是 3 秒一拉的，
+# 不能每条都现算。切模式时最多晚 TTL 秒才反映过来，这是可接受的
+_MODE_TTL = 5.0
+_mode_cache: tuple[bool, float] = (False, 0.0)
+
+
+def mode_is_gaming() -> bool:
+    """当前是否游戏模式：PipeWire 里有 gamescope 的视频节点就是
+
+    以前用 `pgrep -x gamescope` 判断，但 SteamOS 的 gamescope 是带一大串
+    参数启动的，comm 被截断到 15 字节后反而不等于 "gamescope"，pgrep 恒返回 1，
+    于是就出现了「人在游戏模式里、界面一直显示桌面模式、灯也不对」。
+    现在统一用 _gamescope_pw_node 这一个判据：它正是抓帧/推流用的那条路径，
+    判断和实际能力不会再出现两套结论。
+    """
+    global _mode_cache
+    ok, at = _mode_cache
+    if time.monotonic() - at < _MODE_TTL:
+        return ok
+    ok = _mode_probe_sync()
+    _mode_cache = (ok, time.monotonic())
+    return ok
+
+
+def _mode_probe_sync() -> bool:
+    """同步跑一次探针，给在线程里调用的场合（接口里不要直接阻塞事件循环）"""
+    return asyncio.run(_gamescope_pw_node()) is not None
 
 
 async def _screenshot_gamescope(path: Path) -> str:
