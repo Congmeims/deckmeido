@@ -258,6 +258,10 @@ const CLIENT_LABEL: Record<string, string> = {
   qam: "插件",
 };
 
+// 截屏询问在面板上留的那句配文：真正的提示词有一百多字，
+// 长显会把整个面板撑开，用户也不用读它
+const SHOT_ASK_BRIEF = "看看这关怎么过";
+
 export default definePlugin(() => ({
   name: "DeckMeido",
   titleView: <div>DeckMeido</div>,
@@ -487,8 +491,9 @@ function Content() {
   /**
    * 发一轮对话。grab=true 时连画面一起发；hideQam=true 时先收起 QAM 再抓帧
    * （否则截到的是「QAM 半屏 + 游戏半屏」）。
+   * brief 是给界面看的一句短语，代替完整提示词留在你的那条气泡里。
    */
-  const runTurn = async (text: string, grab: boolean, hideQam = false) => {
+  const runTurn = async (text: string, grab: boolean, hideQam = false, brief = "") => {
     if (busyRef.current) return;
     setError("");
     setActivity("");
@@ -552,10 +557,11 @@ function Content() {
         body = `当前游戏：《${gname}》${aid}。\n${text}`;
       }
 
-      const res = (await call<[string, string | null, string], { ok: boolean; error?: string }>(
+      const res = (await call<[string, string | null, string, string], { ok: boolean; error?: string }>(
         "start_turn",
         body,
         shotPath,
+        brief,
         tk
       )) as { ok: boolean; error?: string };
       if (!res.ok) throw new Error(res.error ?? "发不出去");
@@ -586,6 +592,8 @@ function Content() {
    * 截屏询问：收面板 → 抓一帧当前画面 → 带图自动问 AI。
    * 提问写死「看我卡在哪一步」，是因为这个按钮就是给「现在过不去了」用的，
    * 用户不用描述场景，模型看画面更快；游戏名由后端从 Steam 取进提问里。
+   * 界面上只留一句「截图 · 看看这关怎么过」：完整提示词有一百多字，
+   * 长显会把整个面板撑开，用户也不用读它。
    */
   const shotAsk = async () => {
     if (busyRef.current) return;
@@ -593,7 +601,8 @@ function Content() {
       "看我卡在哪一步，说说现在这个画面里我该做什么，需要的话先联网查一下最新攻略，" +
         "再总结成几条可以直接照做的步骤，200 字以内。",
       true,
-      true
+      true,
+      SHOT_ASK_BRIEF
     );
   };
 

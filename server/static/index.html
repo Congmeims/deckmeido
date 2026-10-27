@@ -1819,8 +1819,10 @@
             // 「[object Object][object Object]」的气泡
             if (m.content && typeof m.content !== 'string') return;
             // 用户消息也会带事件（截屏询问那一步附带的画面），
-            // 只挂 assistant 的话，回放历史时提问里的图就丢了
-            addMsg(m.role === 'user' ? 'user' : 'assistant', m.content, m.ts,
+            // 只挂 assistant 的话，回放历史时提问里的图就丢了。
+            // brief 是界面专用的短文案：截屏询问那套提示词一百多字，
+            // 各端都只显示它，真正发出去的仍然是 content
+            addMsg(m.role === 'user' ? 'user' : 'assistant', m.brief || m.content, m.ts,
                    m.events, m.client, m.device);
           });
           // 崩溃补丁：后端被杀时最后一条正文可能只发到浏览器、没来得及写盘。
@@ -1874,7 +1876,8 @@
           setBusy(true);          // 别的端发起的任务，这边也要能一键叫停
           turnCacheReset();       // 新一轮开始，本地屏幕缓存清零
           if (msg.sid) turnCache.sid = msg.sid;
-          addMsg('user', msg.text, msg.ts, msg.events || null, msg.client, msg.device);
+          // 带 brief 的一轮（截屏询问）界面上只显示短文案，长提示词不铺满屏幕
+          addMsg('user', msg.brief || msg.text, msg.ts, msg.events || null, msg.client, msg.device);
           liveBox = document.createElement('div');
           liveBox.className = 'events';
           messages.appendChild(liveBox);

@@ -1694,7 +1694,11 @@ async def handle_chat(text: str, announce: bool = True,
                       image_prompt: str = "（这是当前游戏画面，结合画面回答用户的问题）",
                       workspace: Path | None = None,
                       client: str | None = None,
-                      device: str | None = None) -> dict:
+                      device: str | None = None,
+                      brief: str = "") -> dict:
+    """brief 是给界面看的短文案（可选）：截屏询问那套提示词有一百多字，
+   插件面板长显会把整个面板撑开。它只随消息存下来供各端显示，
+   真正发给模型、算进上下文的仍然是 text。"""
     global pending_action, _ctx_used
     # 本轮归属快照：整轮全程只认这份 sid/epoch，中途别的端新建/切换会话也不影响它
     turn_sid = current_sid
@@ -1726,6 +1730,9 @@ async def handle_chat(text: str, announce: bool = True,
     src_tag = {"client": client} if client else {}
     if device:
         src_tag["device"] = device
+    # 只给界面看的短文案：历史里留着，各端渲染时优先用它
+    if brief:
+        src_tag["brief"] = brief
     # 随本轮附带的画面（Decky 插件截的游戏画面）先落成文件：各端回放历史时会跳过
     # 「content 是数组」的消息（那是给模型看图的素材），只靠内联 base64 的话
     # 屏幕上永远没有图，表现就是「答得头头是道，却不知道它看的是什么」
@@ -2998,6 +3005,7 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
                         workspace=Path(ws_root).expanduser() if ws_root else None,
                         client=str(data.get("client") or ua_client),
                         device=str(data.get("device") or "").strip() or None,
+                        brief=str(data.get("brief") or "").strip(),
                     )
                 except asyncio.CancelledError:
                     pass  # 用户点了终止，保持 ws 连接

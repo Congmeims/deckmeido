@@ -1290,7 +1290,8 @@ def _sync_thread(hist: list):
                 break
         out.append({
             "role": m["role"],
-            "text": str(content or ""),
+            # brief 是界面专用的短文案（截屏询问那套提示词一百多字，长显会把面板撑开）
+            "text": str(m.get("brief") or content or ""),
             "client": str(m.get("client") or ""),
             "ts": float(m.get("ts") or 0),
             **({"image": image} if image else {}),
@@ -1390,7 +1391,9 @@ async def _read_loop(bk: _Backend):
         if typ == "user_message":
             item = {
                 "role": "user",
-                "text": str(msg.get("text") or ""),
+                # 带 brief 的那一轮（截屏询问）只显示短文案：
+                # 一百多字的提示词长显会把面板撑开
+                "text": str(msg.get("brief") or msg.get("text") or ""),
                 "client": str(msg.get("client") or ""),
                 "ts": float(msg.get("ts") or 0),
             }
@@ -1793,12 +1796,14 @@ class Plugin:
         return {"ok": True}
 
     async def start_turn(
-        self, text: str, shot: str | None = None, ticket: str = ""
+        self, text: str, shot: str | None = None, brief: str = "", ticket: str = ""
     ) -> dict:
         """把一轮对话发给后端。返回后流式内容通过 deckmeido_delta 推给前端
 
         shot 是 screenshot 落盘的文件路径（不是 base64）：16MB 的图片数据
         塞进 Decky 的 IPC 会让整次调用静默失败，所以图只在插件进程内部读。
+        brief 只在面板上顶替正文：截屏询问的提示词有一百多字，长显会把面板撑开，
+        发出去的仍然是 text 本身。
         """
         decky.logger.info(f"start_turn 被调用：{len(text or '')} 字，图 {shot or '(无)'}")
         _require(ticket, "start_turn")
@@ -1827,6 +1832,8 @@ class Plugin:
         _LAST_REPLY = ""
         _FINAL_EVENT.clear()
         payload = {"type": "chat", "text": text, "client": "qam"}
+        if brief:
+            payload["brief"] = str(brief).strip()
         if image:
             payload["image"] = image
             payload["image_prompt"] = "（这是当前游戏画面，结合画面回答用户的问题）"
@@ -1840,10 +1847,11 @@ class Plugin:
             return {"ok": False, "error": f"发不出去：{exc}"}
         decky.logger.info("start_turn：已发出")
         # 提问不等后端回声，先在面板上落一条：后端广播回来时会按 ts 去重，
-        # 不会出现两条一模一样的「插件端」
+        # 不会出现两条一模一样的「插件端」。
+        # 显示用 brief（截屏询问只有一句短语），空的时候才退回正文
         _push_thread({
             "role": "user",
-            "text": text,
+            "text": str(brief or "").strip() or text,
             "client": "qam",
             "ts": time.time(),
         })
