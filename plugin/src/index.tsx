@@ -73,6 +73,31 @@ const CARD: React.CSSProperties = {
   overflowWrap: "anywhere",
 };
 
+// 对话区左右内边距：滚动条会吃掉几条像素，这里让出一点免得文字被裁。
+// 竖直方向靠各条消息自己的 marginBottom 隔开，不再额外加 padding
+const THREAD_PAD = "0 2px";
+
+/**
+ * 并排小按钮的样式：QAM 里两个 ButtonItem 塞进同一 flex 行会互相压住
+ * （ButtonItem 外层固定 100% 宽、文字居中溢出），所以并排场景改用
+ * 普通 div 仿按钮，宽高、圆角、底色都对着 GamepadUI 的按钮取值。
+ * 外框固定在父级，内层撑满，这样 flex 分配多少就占多少。
+ */
+const FAKE_BTN: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  minHeight: 40,
+  padding: "0 14px",
+  borderRadius: 2,
+  background: "rgba(255,255,255,.10)",
+  color: "#dcdedf",
+  fontSize: 14,
+  whiteSpace: "nowrap",
+  boxSizing: "border-box",
+  cursor: "pointer",
+};
+
 const ERR_COLOR = "#e06c75";
 const DIM = "#8b929a";
 
@@ -798,7 +823,7 @@ function Content() {
       <PanelSectionRow>
         <Focusable
           ref={scrollRef as any}
-          style={{ maxHeight: 330, overflowY: "auto", display: "block", paddingTop: 6 }}
+          style={{ maxHeight: 330, overflowY: "auto", display: "block", padding: THREAD_PAD }}
         >
           {streaming && (
             <div style={{ display: "flex", justifyContent: "flex-start", marginBottom: 4 }}>
@@ -877,49 +902,68 @@ function Content() {
 
       {/* 隔断：上面是可滚动的对话区，下面是输入区。没有这条线时，
           消息滚到底会和「问问 Meido...」粘成一片，看不出哪块能滚。
-           上下各留 10px：紧贴着回复和输入框都显得挤 */}
+          上下各留 12px：紧贴着回复和输入框都显得挤 */}
       <div
         style={{
           height: 1,
           background: "rgba(255,255,255,.12)",
-          margin: "10px 0 10px",
+          margin: "12px 0 12px",
         }}
       />
 
+      {/* 输入框和发送并排：发送按钮单独占一行时，右边整条都是空的，
+          和上面的输入框、下面的「新会话/设置」三行宽度各不相同，看着散。
+          这里统一成同一行的两列：输入框吃满剩余宽度，发送固定窄一些 */}
       <PanelSectionRow>
-        {/* 提示语做输入框里的占位符：外面再挂一行标签会白占一行高度 */}
-        <TextField
-          value={input}
-          placeholder="问问 Meido..."
-          onChange={(e) => setInput(e.target.value)}
-        />
-      </PanelSectionRow>
-
-      <PanelSectionRow>
-        <ButtonItem layout="below" onClick={busy ? cancel : ask}>
-          {busy ? `中断（${elapsed}s）` : "发送"}
-        </ButtonItem>
+        <div style={{ display: "flex", gap: 8, width: "100%", alignItems: "stretch" }}>
+          {/* 提示语做输入框里的占位符：外面再挂一行标签会白占一行高度 */}
+          <div style={{ flex: "1 1 0", minWidth: 0 }}>
+            <TextField
+              value={input}
+              placeholder="问问 Meido..."
+              onChange={(e) => setInput(e.target.value)}
+            />
+          </div>
+          <div
+            role="button"
+            onClick={busy ? cancel : ask}
+            style={{ flex: "0 0 auto", width: 74, ...FAKE_BTN }}
+          >
+            {busy ? "中断" : "发送"}
+          </div>
+        </div>
       </PanelSectionRow>
 
       {/* 「新会话」和「设置」并排一行：两枚都是低频按钮，各占一行太浪费面板高度。
-          宽度按内容分（新会话略宽），不再写死像素：Decky 的 ButtonItem 自带
-          内边距和最小宽度，外层框一窄就会盖住文字、两枚挤在一起。
-          新会话要靠后端的 history 广播才能用，core 没连上时只留设置 */}
+          QAM 里不能把两个 ButtonItem 塞进一个 flex 行——Decky 的 ButtonItem 用
+          layout="below" 时外层是 100% 宽、自带 focus 边框，被 flex 压窄后文字居中
+          会溢出、两枚互相盖住（上一版就是这么坏的）。所以这里用一行的
+          Focusable + 普通 div 拼两枚「假按钮」，宽度由 flex 精确控制：
+          新会话占满剩余，设置按内容宽度，中间 8px 空隙 */}
       <PanelSectionRow>
         <div style={{ display: "flex", gap: 8, width: "100%" }}>
           {status?.core_ok && !busy && (
-            <div style={{ flex: "1 1 0", minWidth: 0, overflow: "hidden" }}>
-              <ButtonItem layout="below" onClick={newSession} disabled={newing}>
-                {newing ? "正在新建…" : "新会话"}
-              </ButtonItem>
+            <div
+              role="button"
+              onClick={newing ? undefined : newSession}
+              style={{
+                flex: "1 1 0",
+                minWidth: 0,
+                ...FAKE_BTN,
+                opacity: newing ? 0.5 : 1,
+              }}
+            >
+              {newing ? "正在新建…" : "新会话"}
             </div>
           )}
           {/* 文案固定为「设置」：上下三角一进一出会把按钮宽度撑得跳来跳去，
               展开与否看下面的设置项本身更直观 */}
-          <div style={{ flex: "0 0 auto", minWidth: 0 }}>
-            <ButtonItem layout="below" onClick={() => setShowSettings((v) => !v)}>
-              设置
-            </ButtonItem>
+          <div
+            role="button"
+            onClick={() => setShowSettings((v) => !v)}
+            style={{ flex: "0 0 auto", ...FAKE_BTN }}
+          >
+            设置
           </div>
         </div>
       </PanelSectionRow>
