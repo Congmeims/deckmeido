@@ -218,8 +218,16 @@ def _too_many_fails() -> int:
 # 查攻略时「哪个游戏」比画面本身还关键：认错了游戏，搜回来的攻略全废。
 # 所以不靠模型猜，按可靠度从高到低自己找：
 # 1. 运行中进程的 SteamAppId 环境变量 —— Steam 启动游戏时会注入，最准
-# 2. localconfig.vdf 里该 appid 的 name —— 用户在库里改过的名字（备注）也在这个字段
-# 3. 都拿不到就交给模型看画面
+# 2. 按 appid 去 Steam 自己的配置里取名字 —— Steam 主页（按 Steam 键弹出的
+#    界面）左上角显示的就是这个字段，所以名字必然和菜单上一致：
+#    Steam 游戏在 localconfig.vdf 的 apps.<appid>.name（用户在库里改的备注也是它），
+#    非 Steam 游戏在 shortcuts.vdf 的 AppName
+# 3. 非 Steam 游戏的 SteamAppId 是 0，用 compatdata 目录名当编号再查（见下）
+# 4. 都拿不到就交给模型看画面
+#
+# 没走「读菜单上的字」那条路：菜单是 gamescope 合成层，抓帧要把 QAM 收起来
+# 而且得等动画，拿到一屏图像还得做 OCR 才有一行文本；直接读配置文件
+# 是同一份数据源，更快也更准。
 
 
 def _read_vdf_apps(path: Path) -> dict[str, str]:
@@ -346,21 +354,55 @@ def _read_shortcuts(path: Path) -> dict[str, str]:
     return out
 
 
+def _steam_homes(home: Path) -> list[Path]:
+    """Steam 安装目录的候选位置
+
+    Deck 上 ~/.steam/steam 是个软链，正常都在，但装到别处（或改了用户目录）时
+    会落在 XDG 的默认位置，所以多列几处。
+    """
+    return [
+        home / ".steam/steam",
+        home / ".local/share/Steam",
+        home / ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+    ]
+
+
+def _all_userdata() -> list[Path]:
+    """所有 Steam 账号的 userdata 目录
+
+    Steam 主页左上角那个游戏名，读的就是这套数据：Steam 游戏走
+    localconfig.vdf 的 apps.<appid>.name，非 Steam 游戏走 shortcuts.vdf 的
+    AppName。所以直接把这两处拼起来，等于拿到和菜单上一样的名字，
+    不用去截菜单画面或读屏幕文字。
+    """
+    home = INSTALL_DIR.parent
+    out: list[Path] = []
+    for steam in _steam_homes(home):
+        ud = steam / "userdata"
+        if ud.is_dir():
+            out.extend(p for p in ud.iterdir() if p.is_dir())
+    # install.sh 给 deckmeido 建了桌面快捷方式，说明这台机器的 XDG 用户目录
+    # 被指到别处了（比如 Documents/deckmeido），Steam 也可能跟着挪了窝
+    try:
+        docs = (home / ".config/user-dirs.dirs").read_text(errors="ignore")
+        m = re.search(r'XDG_DOCUMENTS_DIR="([^"]+)"', docs)
+        if m:
+            nav = Path(m.group(1).replace("$HOME", str(home))) / "steam/nav"
+            out.extend(p for p in nav.iterdir() if p.is_dir())
+    except Exception:
+        pass
+    return out
+
+
 def _app_names() -> dict[str, str]:
     """汇总所有 Steam 账号的 appid → 名字（含非 Steam 游戏的备注名）"""
-    home = INSTALL_DIR.parent
     out: dict[str, str] = {}
-    base = home / ".steam/steam/userdata"
-    if not base.is_dir():
-        base = home / ".local/share/Steam/userdata"
-    if not base.is_dir():
-        return out
-    for cfg in base.glob("*/config/localconfig.vdf"):
+    for ud in _all_userdata():
+        cfg = ud / "config" / "localconfig.vdf"
         for k, v in _read_vdf_apps(cfg).items():
             out.setdefault(k, v)
-    # 非 Steam 游戏只存在 shortcuts.vdf 里，localconfig 里没有它们
-    for sc in base.glob("*/config/shortcuts.vdf"):
-        for k, v in _read_shortcuts(sc).items():
+        # 非 Steam 游戏只存在 shortcuts.vdf 里，localconfig 里没有它们
+        for k, v in _read_shortcuts(ud / "config" / "shortcuts.vdf").items():
             out.setdefault(k, v)
     return out
 

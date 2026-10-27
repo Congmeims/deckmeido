@@ -339,7 +339,8 @@ deckmeido/
 - ~~**Decky 插件联动查攻略**~~ — 已做：QAM 面板加「查攻略（看当前画面）」一键按钮，不用打字。点下去 → `Navigation.CloseSideMenus()` 收起 QAM → 450ms 后抓帧 → 抓完立刻 `Navigation.OpenQuickAccessMenu()` 弹回面板 → 画面连同固定提示词发给后端。后端据画面认游戏与场景，`web_search` 现搜（中文没结果就换英文关键词）再总结成可照做的步骤，回答在 QAM 流式显示，同一条 `ws` 广播也会同步到网页/手机
   - 收起菜单用的是 Steam 的 `MenuStore`（`@decky/ui` 的 `Navigation` 直接调窗口实例），不是模拟按键：QAM 里按 B 是「回上一级标签页」，按几次都不保证关面板
   - 抓帧参数 `screenshot(ticket, hide=True)`：`pipewiresrc` 抓的是 gamescope 合成后的画面，QAM 本身也在里面，不收起来只能拍到半屏游戏
-  - 游戏名不靠模型认：插件扫 `/proc/*/environ` 里的 `SteamAppId`（Steam 启动游戏时注入）拿到运行中 appid，再去 `userdata/*/config/localconfig.vdf` 的 `apps` 段取 `name`——用户在库里改过的名字（备注）就写在这个字段。拿到后拼成「当前游戏：《xxx》」放在问题开头，模型直接拿它搜；取不到才退回看画面判断
+  - 游戏名不靠模型认：插件扫 `/proc/*/environ` 里的 `SteamAppId`（Steam 启动游戏时注入）拿到运行中 appid，再去 Steam 配置里取名字。Steam 游戏走 `userdata/*/config/localconfig.vdf` 的 `apps` 段 `name`（库里改过的备注就是它），非 Steam 游戏走 `shortcuts.vdf` 的 `AppName`——**按 Steam 键弹出的主页左上角那个游戏名，读的就是这两个字段**，所以拿到的必然和菜单上一致，没必要去截菜单画面做 OCR（还得先收 QAM、等动画，慢且易错）。拿到后拼成「当前游戏：《xxx》」放在问题开头，模型直接拿它搜；取不到才退回看画面判断
+  - `userdata` 位置不只猜 `~/.steam/steam`：还会试 `~/.local/share/Steam`、Flatpak 路径，以及 XDG `user-dirs.dirs` 里 `XDG_DOCUMENTS_DIR` 下的 `steam/nav`（`install.sh` 建桌面快捷方式就说明这台机器用户目录被挪过）
   - `localconfig.vdf` 用括号配对解析（app 块里夹着 `cloud` 等子块，按第一个 `}` 切会漏）
   - 非 Steam 游戏（库里那个十位编号的容器）不在 `localconfig.vdf` 里，名字得读 `userdata/*/config/shortcuts.vdf`：这是**二进制** VDF（类型字节 + `\0` 结尾键名），`AppName` 就是库里显示的名字（手动改过的备注也是它）；改过名后 appid 不重算，只能按 appid 查名字，反推没用
   - 非 Steam 游戏运行时 `SteamAppId=0`，退回 `STEAM_COMPAT_DATA_PATH` 的目录名（`compatdata/<编号>`）当编号；界面上按无符号十位显示，目录名却可能写成有符号负数，所以两种写法都拿去匹配
