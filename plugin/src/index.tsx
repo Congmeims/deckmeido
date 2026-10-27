@@ -857,13 +857,13 @@ function Content() {
       </PanelSectionRow>
 
       {/* 「新会话」和「设置」并排一行：两枚都是低频按钮，各占一行太浪费面板高度。
-          宽度贴着文字走（inline-flex），不设 flex:1 —— 撑满整行会和上方「发送」
-          一样宽，在 QAM 的窄栏里直接顶出可视区。
+          宽度按内容分（新会话略宽），不再写死像素：Decky 的 ButtonItem 自带
+          内边距和最小宽度，外层框一窄就会盖住文字、两枚挤在一起。
           新会话要靠后端的 history 广播才能用，core 没连上时只留设置 */}
       <PanelSectionRow>
-        <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ display: "flex", gap: 8, width: "100%" }}>
           {status?.core_ok && !busy && (
-            <div style={{ display: "inline-flex", flex: "0 0 auto", width: 108 }}>
+            <div style={{ flex: "1 1 0", minWidth: 0, overflow: "hidden" }}>
               <ButtonItem layout="below" onClick={newSession} disabled={newing}>
                 {newing ? "正在新建…" : "新会话"}
               </ButtonItem>
@@ -871,7 +871,7 @@ function Content() {
           )}
           {/* 文案固定为「设置」：上下三角一进一出会把按钮宽度撑得跳来跳去，
               展开与否看下面的设置项本身更直观 */}
-          <div style={{ display: "inline-flex", flex: "0 0 auto", width: 72 }}>
+          <div style={{ flex: "0 0 auto", minWidth: 0 }}>
             <ButtonItem layout="below" onClick={() => setShowSettings((v) => !v)}>
               设置
             </ButtonItem>
