@@ -471,24 +471,17 @@ function Content() {
    * 收拾完面板再开回来。
    *
    * 不带参的 OpenQuickAccessMenu() 是按「上一次停留的那一层」恢复的：截屏这一路
-   * 刚 CloseSideMenus 过，很多时候回来就落在通知中心。OpenQuickAccessMenu 的第一个
-   * 参数是标签页序号，Decky 的标签在最前面，所以固定传 1，再把路由压到 /decky
-   * 兜底。两个动作之间要留出面板重新挂载的时间，早了会被 QAM 的入场动画覆盖。
+   * 刚 CloseSideMenus 过，很多时候回来就落在通知中心。
+   * 第一个参数是标签页序号，这里必须传 999 —— EQuickAccessTab 里 Decky 是 999，
+   * 而 0~8 分别是通知 / 远程同乐 / 语音 / 好友 / 设置……。以前传的 1 在新版
+   * SteamOS 上是「远程同乐」，所以回来时压根不在插件页。
    */
   const restoreQam = () => {
     try {
-      Navigation.OpenQuickAccessMenu(1);
+      Navigation.OpenQuickAccessMenu(999);
     } catch {
       Navigation.OpenQuickAccessMenu();
     }
-    setTimeout(() => {
-      try {
-        // NavigateToRoute 不在 @decky/api 的类型里，但运行时存在；老版本没有就保持默认页
-        (Navigation as any).NavigateToRoute?.("/decky");
-      } catch {
-        // 老版本 Decky 没有这个路由，保持默认页即可
-      }
-    }, 600);
   };
 
   /**
@@ -750,17 +743,6 @@ function Content() {
         </PanelSectionRow>
       )}
 
-      {/* 聊歪了、或者想从头问另一件事时换一头。后端受理后会向所有端广播新会话，
-          这里不用手动清空对话列表。放在「设置」上面：换会话是常用操作，
-          不应该藏在设置按钮下面 */}
-      {status?.core_ok && !busy && (
-        <PanelSectionRow>
-          <ButtonItem layout="below" onClick={newSession} disabled={newing}>
-            {newing ? "正在新建…" : "新会话"}
-          </ButtonItem>
-        </PanelSectionRow>
-      )}
-
       {shot && (
         <PanelSectionRow>
           {/* 抓到的画面直接摆出来：抓错帧、抓到黑屏、抓到菜单，一眼就能看出来 */}
@@ -850,17 +832,16 @@ function Content() {
             );
           })}
           {!items.length && !streaming && (
-            <div style={{ ...CARD, color: DIM }}>
-              还没有对话。点上面的「截屏询问」，或者直接在下面打字。
-            </div>
+            <div style={{ ...CARD, color: DIM }}>随便问点什么吧</div>
           )}
         </Focusable>
       </PanelSectionRow>
 
       <PanelSectionRow>
+        {/* 提示语做输入框里的占位符：外面再挂一行标签会白占一行高度 */}
         <TextField
-          label="问点什么"
           value={input}
+          placeholder="问点什么"
           onChange={(e) => setInput(e.target.value)}
         />
       </PanelSectionRow>
@@ -871,10 +852,23 @@ function Content() {
         </ButtonItem>
       </PanelSectionRow>
 
+      {/* 聊歪了、或者想从头问另一件事时换一头。后端受理后会向所有端广播新会话，
+          这里不用手动清空对话列表。放在「设置」上面：换会话是常用操作，
+          不应该藏在设置按钮下面 */}
+      {status?.core_ok && !busy && (
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={newSession} disabled={newing}>
+            {newing ? "正在新建…" : "新会话"}
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
+
       {/* 设置默认收起：QAM 里平时只想要「问一句 / 看一眼」，太长会挡住对话 */}
       <PanelSectionRow>
         <ButtonItem layout="below" onClick={() => setShowSettings((v) => !v)}>
-          {showSettings ? "设置 ▴" : "设置 ▾"}
+          {/* 文案固定为「设置」：上下三角一进一出会把按钮宽度撑得跳来跳去，
+              展开与否看下面的设置项本身更直观 */}
+          设置
         </ButtonItem>
       </PanelSectionRow>
 
