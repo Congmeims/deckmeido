@@ -237,45 +237,6 @@ function Md({ text }: { text: string }) {
   );
 }
 
-/**
- * 面板底部的品牌图标：和 server/static/favicon.png 同一个图形
- * （带蕾丝头饰、系蝴蝶结的浅粉掌机，深色屏幕）。
- *
- * QAM 里加载不了外部图片 —— 插件目录里的 png 走 file:// 会被 CEF 拦掉，
- * 所以这里用内联 SVG 照着画：机身是圆角浅粉块，中间一块深色屏幕，
- * 上方是蕾丝扇形 + 黑蝴蝶结。
- */
-function Logo() {
-  return (
-    <svg width={22} height={16} viewBox="0 0 44 32" aria-hidden="true">
-      {/* 蕾丝头饰：几段相连的半圆，压在机身顶上 */}
-      <path
-        d="M12 13 Q13 4 18.5 4.5 Q21 1.5 24 3.4 Q27 1.5 29.5 4.5 Q35 4 36 13 Z"
-        fill="#f7eef4"
-        stroke="#c9a9bd"
-        strokeWidth="0.8"
-      />
-      {/* 蝴蝶结：左右两片 + 中间结 */}
-      <path d="M24 6.2 L18.6 3.4 L18.6 9 Z" fill="#221b20" />
-      <path d="M24 6.2 L29.4 3.4 L29.4 9 Z" fill="#221b20" />
-      <circle cx="24" cy="6.2" r="1.35" fill="#221b20" />
-      {/* 机身 */}
-      <rect x="3" y="11" width="38" height="18" rx="7" fill="#efe3ec" stroke="#4a3f47" strokeWidth="1.2" />
-      {/* 屏幕 */}
-      <rect x="15" y="14.5" width="14" height="11" rx="1.2" fill="#332e38" />
-      {/* 左摇杆、十字键 */}
-      <circle cx="9" cy="16.5" r="1.9" fill="#4a3f47" />
-      <path d="M6.2 22.6 h2.4 M7.4 21.4 v2.4" stroke="#4a3f47" strokeWidth="1.3" strokeLinecap="round" />
-      {/* 右摇杆、四个按键 */}
-      <circle cx="35" cy="16.5" r="1.9" fill="#4a3f47" />
-      <circle cx="33.4" cy="21.8" r="0.75" fill="#4a3f47" />
-      <circle cx="36.6" cy="21.8" r="0.75" fill="#4a3f47" />
-      <circle cx="35" cy="20.2" r="0.75" fill="#4a3f47" />
-      <circle cx="35" cy="23.4" r="0.75" fill="#4a3f47" />
-    </svg>
-  );
-}
-
 // 来源标记。QAM 只有 ~300px 宽，用短一点的说法：
 // 网页端可能来自 PC 也可能是 Deck 上的浏览器，统一叫「网页」
 const CLIENT_LABEL: Record<string, string> = {
@@ -704,15 +665,6 @@ function Content() {
         </ButtonItem>
       </PanelSectionRow>
 
-      <PanelSectionRow>
-        <ToggleField
-          label="带画面询问"
-          description="发送时抓当前游戏画面一起发给 AI；抓不到时这一轮自动退回纯文字"
-          checked={withShot}
-          onChange={setWithShot}
-        />
-      </PanelSectionRow>
-
       {/* 设置默认收起：QAM 里平时只想要「问一句 / 看一眼」，太长会挡住对话 */}
       <PanelSectionRow>
         <ButtonItem layout="below" onClick={() => setShowSettings((v) => !v)}>
@@ -722,6 +674,14 @@ function Content() {
 
       {showSettings && (
         <>
+          <PanelSectionRow>
+            <ToggleField
+              label="带画面询问"
+              description="发送时抓当前游戏画面一起发给 AI；抓不到时这一轮自动退回纯文字"
+              checked={withShot}
+              onChange={setWithShot}
+            />
+          </PanelSectionRow>
           <PanelSectionRow>
             <ToggleField
               label="语音播报回复"
@@ -739,21 +699,10 @@ function Content() {
         </>
       )}
 
-      {/* 底部品牌行：图标 + 名称 + 版本号，整体居中 */}
+      {/* 底部版本号：居中一行，版本取后端 /api/config，连不上时是插件自己的 */}
       <PanelSectionRow>
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            gap: 6,
-            fontSize: 10,
-            color: DIM,
-          }}
-        >
-          <Logo />
-          <span>DeckMeido</span>
-          <span>v{status?.version || "—"}</span>
+        <div style={{ fontSize: 10, color: DIM, textAlign: "center" }}>
+          v{status?.version || "—"}
         </div>
       </PanelSectionRow>
     </PanelSection>
