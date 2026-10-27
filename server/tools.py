@@ -318,7 +318,9 @@ TOOLS: list[dict] = [
 ]
 
 # 危险操作：任何权限模式下都需确认
-DANGEROUS = {"install_game"}
+# gamepad 写的是 /dev/uinput 虚拟手柄，按下去会直接操作当前游戏/前台界面，
+# 用户不在旁边看着的时候不该自己动 —— 归到必确认，和装游戏同一级别
+DANGEROUS = {"install_game", "gamepad"}
 
 
 def touches_screen(name: str, args: dict) -> bool:

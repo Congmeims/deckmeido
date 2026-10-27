@@ -6,6 +6,31 @@ import re
 
 import httpx
 
+# 图片按 base64 内联进请求体，一张图就能到千万字符级。这里在发车前量一次
+# 请求体大小并记下来：出问题时能分清「体积大」和「真的花掉这么多 token」，
+# 只看字符数会误以为是模型在按字符计费
+_LAST_BODY = 0
+
+
+def _body_size(payload: dict) -> int:
+    """算出这次请求体的字符数（不序列化到网络，只做量尺）"""
+    global _LAST_BODY
+    try:
+        _LAST_BODY = len(json.dumps(payload, ensure_ascii=False))
+    except (TypeError, ValueError):
+        _LAST_BODY = 0
+    return _LAST_BODY
+
+
+def _log_usage(usage: dict | None) -> None:
+    """把服务商回的真实用量打到日志：prompt_tokens 才是这一轮烧掉的输入"""
+    if not isinstance(usage, dict):
+        return
+    pin = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    pout = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+    print(f"[DeckMeido] LLM 用量：请求体 {_LAST_BODY} 字符 → "
+          f"输入 {pin} token，输出 {pout} token", flush=True)
+
 # 部分模型（DeepSeek 系）会把工具调用写成正文里的 DSML 标记而不是标准 tool_calls，
 # 这类片段绝不能展示给用户。标记一旦出现，后面全是工具调用内容或残缺标签，直接截断。
 _START_RE = re.compile(r"<[｜|]{1,2}\s*DSML|<[｜|]{1,2}\s*(?:tool_)?calls?[｜|>\s]",
@@ -95,6 +120,7 @@ class LLMClient:
             payload["max_tokens"] = budget
         if self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort
+        _body_size(payload)
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_acc: dict[int, dict] = {}
@@ -153,6 +179,7 @@ class LLMClient:
             msg["tool_calls"] = [tool_acc[i] for i in sorted(tool_acc)]
         if usage:
             msg["usage"] = usage
+        _log_usage(usage)
         return msg
 
     async def close(self):
