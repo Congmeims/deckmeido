@@ -1,6 +1,7 @@
 import { definePlugin, call, addEventListener, removeEventListener } from "@decky/api";
 import { useEffect, useRef, useState } from "react";
 import { Navigation, PanelSection, PanelSectionRow, ButtonItem, TextField, ToggleField, Focusable } from "@decky/ui";
+import { GiTeapot } from "react-icons/gi";
 
 // 后端在不在、截图能不能用、代理走哪条路，由插件后端探测
 type Status = {
@@ -256,7 +257,7 @@ export default definePlugin(() => ({
   name: "DeckMeido",
   titleView: <div>DeckMeido</div>,
   content: <Content />,
-  icon: <div />,
+  icon: <GiTeapot />,
 }));
 
 function Content() {
