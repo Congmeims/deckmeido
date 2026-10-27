@@ -1147,6 +1147,15 @@ class _Backend:
         async with self._send_lock:
             await self._impl.send(text)
 
+    def sockname(self) -> str:
+        """本端在这条连接上的本地端口，和后端日志里的 127.0.0.1:xxxxx 对得上"""
+        w = getattr(self._impl, "_writer", None)
+        try:
+            host, port = w.get_extra_info("sockname")[:2]
+            return f"{host}:{port}"
+        except Exception:
+            return "?"
+
     async def close(self):
         impl, self._impl = self._impl, None
         if not impl:
@@ -1374,6 +1383,7 @@ async def _ensure_backend() -> tuple[_Backend | None, str]:
     try:
         await bk.open()
     except Exception as exc:
+        decky.logger.error(f"连不上后端 :{port}（{exc}）")
         return None, f"连不上后端 :{port}（{exc}）"
     _BACKEND = bk
     _READER = asyncio.create_task(_read_loop(bk))
@@ -1382,6 +1392,7 @@ async def _ensure_backend() -> tuple[_Backend | None, str]:
         if bk.sid:
             break
         await asyncio.sleep(0.05)
+    decky.logger.info(f"已连上后端 :{port}，本端 {bk.sockname()}，sid={bk.sid or '(空)'}")
     return bk, ""
 
 
@@ -1667,10 +1678,14 @@ class Plugin:
             payload["image"] = image
             payload["image_prompt"] = "（这是当前游戏画面，结合画面回答用户的问题）"
         payload["workspace"] = "/home/deck"
+        sock = bk.sockname()
+        decky.logger.info(f"start_turn：正文 {len(body)} 字，图 {len(image or '')} 字符，经 {sock} 发出")
         try:
             await bk.send(payload)
         except Exception as exc:
+            decky.logger.error(f"start_turn 发送失败：{exc}")
             return {"ok": False, "error": f"发不出去：{exc}"}
+        decky.logger.info("start_turn：已发出")
         # 提问不等后端回声，先在面板上落一条：后端广播回来时会按 ts 去重，
         # 不会出现两条一模一样的「插件端」
         _push_thread({
