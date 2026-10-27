@@ -46,7 +46,180 @@ const CARD: React.CSSProperties = {
 const ERR_COLOR = "#e06c75";
 const DIM = "#8b929a";
 
-// 面板上的手柄键位，分两排：上面是 ABXY + 扳机，下面是方向键 + 菜单键
+/**
+ * QAM 里渲染 markdown。后端给的是 markdown，网页端有 renderMd 处理，
+ * 但 QAM 不能直接塞 HTML（_dangerouslySetInnerHTML 在 Decky 的 CJS 沙箱里
+ * 不可靠，而且模型的输出未经清洗），所以在这里按行切成小块，用 React 元素渲染。
+ *
+ * 只认攻略里真会用到的几种：标题、有序/无序列表、``` 代码块、**加粗**、`行内码`。
+ * 表格和图片直接按原文保留：QAM 只有 ~300px 宽，表格横着放不下，图片也加载不了。
+ */
+type Block =
+  | { t: "h"; text: string }
+  | { t: "ul"; items: string[] }
+  | { t: "ol"; items: string[] }
+  | { t: "code"; text: string }
+  | { t: "p"; text: string };
+
+function parseMd(src: string): Block[] {
+  const out: Block[] = [];
+  const lines = src.replace(/\r\n/g, "\n").split("\n");
+  let para: string[] = [];
+
+  const flushPara = () => {
+    if (para.length) {
+      out.push({ t: "p", text: para.join("\n") });
+      para = [];
+    }
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // 代码块要整段吃掉，里面的 # 和 - 不能当成结构
+    const fence = line.match(/^\s*```/);
+    if (fence) {
+      flushPara();
+      const buf: string[] = [];
+      i++;
+      while (i < lines.length && !/^\s*```/.test(lines[i])) buf.push(lines[i++]);
+      out.push({ t: "code", text: buf.join("\n") });
+      continue;
+    }
+    const h = line.match(/^\s*#{1,6}\s+(.+?)\s*#*\s*$/);
+    if (h) {
+      flushPara();
+      out.push({ t: "h", text: h[1] });
+      continue;
+    }
+    const ul = line.match(/^\s*[-*+]\s+(.+)$/);
+    const ol = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (ul || ol) {
+      flushPara();
+      const list = (ul ? "ul" : "ol") as "ul" | "ol";
+      const last = out[out.length - 1];
+      const items = ul ? [ul[1]] : [ol![1]];
+      // 连续的列表行合成一个块，否则每条都单独排一段会很散
+      while (i + 1 < lines.length) {
+        const nx = lines[i + 1];
+        const mu = nx.match(/^\s*[-*+]\s+(.+)$/);
+        const mo = nx.match(/^\s*\d+[.)]\s+(.+)$/);
+        if (ul && mu) items.push(mu[1]);
+        else if (ol && mo) items.push(mo[1]);
+        else break;
+        i++;
+      }
+      if (last && last.t === list) last.items.push(...items);
+      else out.push({ t: list, items });
+      continue;
+    }
+    if (!line.trim()) {
+      flushPara();
+      continue;
+    }
+    para.push(line);
+  }
+  flushPara();
+  return out;
+}
+
+/** 行内：`code`、**粗体**；其余原样（表格竖线、链接文字都留着可读） */
+function inline(text: string): React.ReactNode[] {
+  const nodes: React.ReactNode[] = [];
+  const re = /(`[^`\n]+`|\*\*[^*\n]+\*\*)/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  let k = 0;
+  while ((m = re.exec(text))) {
+    if (m.index > last) nodes.push(text.slice(last, m.index));
+    const tk = m[0];
+    if (tk.startsWith("`")) {
+      nodes.push(
+        <code
+          key={k++}
+          style={{
+            background: "rgba(255,255,255,.1)",
+            borderRadius: 3,
+            padding: "0 3px",
+            fontSize: 11,
+          }}
+        >
+          {tk.slice(1, -1)}
+        </code>
+      );
+    } else {
+      nodes.push(
+        <b key={k++} style={{ color: "#fff" }}>
+          {tk.slice(2, -2)}
+        </b>
+      );
+    }
+    last = m.index + tk.length;
+  }
+  if (last < text.length) nodes.push(text.slice(last));
+  return nodes;
+}
+
+function Md({ text }: { text: string }) {
+  const blocks = parseMd(text);
+  return (
+    <>
+      {blocks.map((b, i) => {
+        if (b.t === "h") {
+          return (
+            <div
+              key={i}
+              style={{ fontWeight: 700, fontSize: 12.5, color: "#fff", margin: "6px 0 3px" }}
+            >
+              {inline(b.text)}
+            </div>
+          );
+        }
+        if (b.t === "code") {
+          return (
+            <pre
+              key={i}
+              style={{
+                margin: "4px 0",
+                padding: "6px 8px",
+                background: "rgba(0,0,0,.35)",
+                borderRadius: 4,
+                fontSize: 11,
+                lineHeight: 1.4,
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+                overflowX: "auto",
+              }}
+            >
+              <code>{b.text}</code>
+            </pre>
+          );
+        }
+        if (b.t === "ul" || b.t === "ol") {
+          const Tag = b.t;
+          return (
+            <Tag key={i} style={{ margin: "3px 0", paddingLeft: 18 }}>
+              {b.items.map((it, j) => (
+                <li key={j} style={{ margin: "1px 0" }}>
+                  {inline(it)}
+                </li>
+              ))}
+            </Tag>
+          );
+        }
+        return (
+          <div key={i} style={{ margin: "3px 0" }}>
+            {b.text.split("\n").map((ln, j) => (
+              <div key={j}>{inline(ln)}</div>
+            ))}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+// 面板上的手柄键位，分四排：ABXY、肩键、摇杆键、菜单键与方向键。
+// 界面效果图（tools/ui-preview.html）里也照这个顺序排，改一处记得同步
 const PAD_ROWS: { key: string; label: string }[][] = [
   [
     { key: "y", label: "Y" },
@@ -412,7 +585,7 @@ function Content() {
                 ? "游戏模式抓帧可用"
                 : status.capture_reason || "当前抓不到画面"
               : "正在探测后端…"}
-          {status && !(busy && activity) && ` · 端口 ${status.port} · 转发 ${status.proxy}`}
+          {status && ` · 端口 ${status.port} · 转发 ${status.proxy}`}
         </div>
       </PanelSectionRow>
 
@@ -475,13 +648,11 @@ function Content() {
         </PanelSectionRow>
       ))}
 
-      {turns.length > 0 && (
-        <PanelSectionRow>
-          <ButtonItem layout="below" onClick={() => setTurns([])}>
-            清空这段对话记录
-          </ButtonItem>
-        </PanelSectionRow>
-      )}
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={() => setTurns([])}>
+          清空这段对话记录
+        </ButtonItem>
+      </PanelSectionRow>
 
       <PanelSectionRow>
         <ButtonItem layout="below" onClick={lock}>
@@ -504,7 +675,7 @@ function Content() {
                   t.role === "assistant" ? "2px solid #5aa9e6" : "2px solid transparent",
               }}
             >
-              {t.text}
+              <Md text={t.text} />
               {t.streaming && <span style={{ color: DIM }}>▍</span>}
             </div>
           ))}
