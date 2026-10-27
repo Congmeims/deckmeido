@@ -255,15 +255,6 @@ declare const __PLUGIN_VERSION__: string;
 const PLUGIN_VERSION =
   typeof __PLUGIN_VERSION__ === "string" ? __PLUGIN_VERSION__ : "—";
 
-// 来源标记。QAM 只有 ~300px 宽，四个端统一用两个字：
-// 电脑（PC 浏览器）/ 手机（手机浏览器）/ 掌机（Deck 上的桌面客户端）/ 插件（QAM）
-const CLIENT_LABEL: Record<string, string> = {
-  web: "电脑",
-  mobile: "手机",
-  client: "掌机",
-  qam: "插件",
-};
-
 // 截屏询问在面板上留的那句配文：真正的提示词有一百多字，
 // 长显会把整个面板撑开，用户也不用读它
 const SHOT_ASK_BRIEF = "看看这个，我该怎么做？";
@@ -790,7 +781,6 @@ function Content() {
                   borderLeft: "2px solid #5aa9e6",
                 }}
               >
-                {CLIENT_LABEL.qam && <div style={{ fontSize: 9, color: DIM, marginBottom: 2 }}>插件</div>}
                 <Md text={streaming} />
                 <span style={{ color: DIM }}>▍</span>
               </div>
@@ -799,9 +789,8 @@ function Content() {
           {/* 倒序：最新一条在最上面，进来不用先把列表拉到底。
               正在生成的那条（streaming）排在最前，正好是「最新」的位置 */}
           {items.slice().reverse().map((m, i) => {
-            const tag = CLIENT_LABEL[m.client] ?? "";
             // 一左一右：AI 在左、我说话在右，各带一条同色竖条，
-            // 扫一眼就知道哪句是谁说的，不用去读来源角标
+            // 扫一眼就知道哪句是谁说的
             const mine = m.role === "user";
             return (
               <div
@@ -828,12 +817,6 @@ function Content() {
                     textAlign: mine ? "right" : "left",
                   }}
                 >
-                  {tag && (
-                    // 来源角标：所有端混在一起时，一眼看清这句是谁说的
-                    <div style={{ fontSize: 9, color: DIM, marginBottom: 2 }}>
-                      {tag}
-                    </div>
-                  )}
                   {m.image && (
                     // 这一轮附带的画面：以前只有模型看得到，屏幕上一直是空的
                     <img
