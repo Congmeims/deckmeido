@@ -343,6 +343,32 @@ function Content() {
     }
   };
 
+  // 重开机默认进游戏模式，后端不会自己起来。这里补一个入口，
+  // 按下后插件以 deck 身份 spawn uvicorn，等到 /api/status 应答才返回
+  const [starting, setStarting] = useState(false);
+  const startBackend = async () => {
+    if (starting) return;
+    setStarting(true);
+    setError("");
+    try {
+      const r = (await call<[string], { ok: boolean; error?: string; already?: boolean }>(
+        "start_backend",
+        ticket
+      )) as { ok: boolean; error?: string; already?: boolean };
+      if (!r.ok) {
+        setError(r.error ?? "拉起后端失败");
+        return;
+      }
+      await refreshStatus();
+      await call<[string], { ok: boolean; error?: string }>("session_open", ticket);
+      await call<[string], { ok: boolean }>("ready", ticket);
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+    } finally {
+      setStarting(false);
+    }
+  };
+
   // 流式内容从插件后端来（前端不直连 :18765，绕开 CEF 的 CSP 限制）
   useEffect(() => {
     const onDelta = (msg: Delta) => {
@@ -670,6 +696,15 @@ function Content() {
           {busy ? `中断（${elapsed}s）` : "截屏询问"}
         </ButtonItem>
       </PanelSectionRow>
+
+      {/* 后端没起来时把「启动」放在最显眼的位置：不改什么设置就能用 */}
+      {status && !status.core_ok && (
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={startBackend} disabled={starting}>
+            {starting ? "正在启动后端…" : "启动后端"}
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
 
       {error && (
         <PanelSectionRow>

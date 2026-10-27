@@ -529,6 +529,67 @@ def _runtime_dir() -> str:
     return f"/run/user/{_target_uid()}"
 
 
+def _backend_log_fd() -> int:
+    """后端 stdout/stderr 的去处：和客户端一样写 backend.log，不丢
+
+    以前插件拉起后端只能 DEVNULL，崩了连 traceback 都没有；这里照
+    client/main.py 的做法留一代备份，超过 5MB 就滚动。
+    """
+    log = INSTALL_DIR / "server" / "backend.log"
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        if log.exists() and log.stat().st_size > 5 * 1024 * 1024:
+            os.replace(log, log.with_name("backend.log.1"))
+        fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        os.write(fd, f"\n===== backend start {time.strftime('%Y-%m-%d %H:%M:%S')} (plugin) =====\n".encode())
+        return fd
+    except Exception:
+        return -3  # subprocess.DEVNULL
+
+
+async def _start_backend(port: int) -> tuple[bool, str]:
+    """拉起后端，轮询到它应答为止；第二个返回值是失败原因
+
+    以 deck 身份起（插件本身是 root，直接用 root 跑后端会让它生成的文件
+    全归 root，下次客户端再拉就写不动了）。后端自己有单实例守卫
+    （server/singleton.py），重复拉起的那份会自己退出，不会抢端口。
+    """
+    py = INSTALL_DIR / ".venv" / "bin" / "python"
+    if not py.exists():
+        return False, f"找不到 {py}"
+    log = INSTALL_DIR / "server" / "backend.log"
+    try:
+        fd = _backend_log_fd()
+        kwargs: dict = {"stdout": fd, "stderr": fd}
+        if not _run_as():
+            kwargs["start_new_session"] = True
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *_run_as(), str(py), "-m", "uvicorn", "server.main:app",
+                "--host", "0.0.0.0", "--port", str(port),
+                cwd=str(INSTALL_DIR), **kwargs,
+            )
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+    except Exception as exc:
+        return False, f"启动失败：{exc}"
+    # 后端要加载模型、连设备，给足 40 秒
+    cfg = _load_server_cfg()
+    token = str(cfg.get("token", "") or "")
+    for _ in range(80):
+        core = await _core_http(port, token, "GET", "/api/status", timeout=2.0)
+        if core.get("ok"):
+            return True, ""
+        if proc.returncode is not None:
+            return False, f"后端进程退出了（code {proc.returncode}），日志：{log}"
+        await asyncio.sleep(0.5)
+    return False, f"后端 40 秒内没有应答，日志：{log}"
+
+
 async def _gamescope_pw_node() -> tuple[str | None, str]:
     """找 gamescope 的 PipeWire 视频源节点 id，第二个返回值是失败原因"""
     if not shutil.which("pw-dump"):
@@ -1477,6 +1538,31 @@ class Plugin:
         elif _THREAD:
             _emit({"kind": "thread", "items": _THREAD})
         return {"ok": True}
+
+    async def start_backend(self, ticket: str = "") -> dict:
+        """面板上的「启动后端」：重开机进游戏模式后后端通常是没跑的
+
+        先探一下再拉，避免和客户端同时拉起两份（后端有单实例守卫，
+        多半是白等 40 秒才返回成功）。
+        """
+        _require(ticket, "start_backend")
+        cfg = _load_server_cfg()
+        port = int(cfg.get("port", 18765))
+        token = str(cfg.get("token", "") or "").strip()
+        if not token:
+            return {"ok": False, "error": "后端配置里的 token 是空的，先在网页设置页生成一个"}
+        core = await _core_http(port, token, "GET", "/api/status", timeout=2.0)
+        if core.get("ok"):
+            return {"ok": True, "already": True}
+        decky.logger.info("QAM 拉起后端 :%s", port)
+        ok, why = await _start_backend(port)
+        if not ok:
+            decky.logger.error("拉起后端失败：%s", why)
+            return {"ok": False, "error": why}
+        # 后端换了新连接，旧的 ws 已经没用，重连一次面板才拿得到 history
+        await _drop_backend()
+        await _ensure_backend()
+        return {"ok": True, "already": False}
 
     async def unlock(self, token: str) -> dict:
         """用访问令牌解锁插件能力，成功后拿到票据，之后的调用都要带上
