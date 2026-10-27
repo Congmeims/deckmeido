@@ -1384,6 +1384,17 @@ async def api_set_config(req: ConfigUpdate):
             "token": TOKEN}
 
 
+@app.post("/api/tts", dependencies=[Depends(check_token_any)])
+async def api_set_tts(enabled: bool = Query(...)):
+    """只切语音播报开关：给 Decky 插件面板用
+
+    QAM 里没法像网页设置页那样填一整张表单，只带一个参数，走的还是
+    update_config 同一条热更新路径（tts.enable 立即生效，不用重启）。
+    """
+    update_config({"tts": {"enable": bool(enabled)}})
+    return {"ok": True, "tts_enable": tts.enable}
+
+
 # ---------- 版本与升级 ----------
 
 # 不校验令牌：鉴权页在登录前就要显示版本号

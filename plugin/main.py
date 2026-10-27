@@ -62,6 +62,15 @@ def _find_install_dir() -> Path:
 INSTALL_DIR = _find_install_dir()
 CONFIG_PATH = INSTALL_DIR / "server" / "config.toml"
 
+# 面板底部显示版本号：优先用后端 config 里报的版本（和网页设置页一致），
+# 后端连不上时退回插件自己的 package.json
+_PLUGIN_VERSION = "0.1.0"
+try:
+    _pkg = json.loads((Path(__file__).resolve().parent / "package.json").read_text(encoding="utf-8"))
+    _PLUGIN_VERSION = str(_pkg.get("version") or _PLUGIN_VERSION)
+except Exception:
+    pass
+
 
 def _load_server_cfg() -> dict:
     """读后端的 [server] 段，拿 port 和 token"""
@@ -1313,11 +1322,12 @@ def _lan_ip() -> str:
         s.close()
 
 
-async def _core_status(port: int, token: str) -> dict:
-    """问一次后端自己的 /api/status，确认女仆核心活着
+async def _core_http(port: int, token: str, method: str, path: str,
+                     timeout: float = 5.0) -> dict:
+    """向后端的本机接口发一个请求，返回 {"ok": bool, "data": {...} | "error": str}
 
-    不走 ws：这里只要一个「在不在、什么模式」的结论，HTTP 一步拿到，
-    也顺便验证了 token 是后端认的（ws 握手失败时前端只会看到连不上）。
+    不走 ws：这类请求都只要一个结论，HTTP 一步拿到，也顺带验证了 token 是
+    后端认的（ws 握手失败时前端只会看到连不上）。
     """
     if not token:
         return {"ok": False, "error": "配置里没有 token"}
@@ -1327,14 +1337,14 @@ async def _core_status(port: int, token: str) -> dict:
         return {"ok": False, "error": f"连不上 :{port}（{exc}）"}
     try:
         req = (
-            "GET /api/status HTTP/1.1\r\n"
+            f"{method} {path} HTTP/1.1\r\n"
             f"Host: 127.0.0.1:{port}\r\n"
             f"X-Token: {token}\r\n"
             "Connection: close\r\n\r\n"
         )
         writer.write(req.encode())
         await writer.drain()
-        raw = await asyncio.wait_for(reader.read(), timeout=5)
+        raw = await asyncio.wait_for(reader.read(), timeout=timeout)
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
     finally:
@@ -1352,6 +1362,20 @@ async def _core_status(port: int, token: str) -> dict:
         return {"ok": False, "error": "返回内容不是 JSON"}
 
 
+async def _core_status(port: int, token: str) -> dict:
+    """问一次后端自己的 /api/status，确认女仆核心活着（在不在、什么模式）"""
+    return await _core_http(port, token, "GET", "/api/status")
+
+
+async def _core_prefs(port: int, token: str) -> dict:
+    """读后端的偏好项（语音播报、版本号），面板设置区要显示/切换这些"""
+    r = await _core_http(port, token, "GET", "/api/config")
+    if not r["ok"]:
+        return {"ok": False, "error": r.get("error", ""), "tts": False, "version": ""}
+    d = r.get("data") or {}
+    return {"ok": True, "tts": bool(d.get("tts_enable")), "version": str(d.get("version") or "")}
+
+
 class Plugin:
     async def get_status(self) -> dict:
         """QAM 打开时先问一次：后端连得上吗、截图能不能用
@@ -1361,8 +1385,10 @@ class Plugin:
         """
         cfg = _load_server_cfg()
         port = int(cfg.get("port", 18765))
+        token = str(cfg.get("token", "") or "").strip()
         node, why = await _gamescope_pw_node()
-        core = await _core_status(port, str(cfg.get("token", "") or "").strip())
+        core = await _core_status(port, token)
+        prefs = await _core_prefs(port, token) if core.get("ok") else {}
         return {
             "install_dir": str(INSTALL_DIR),
             "config_ok": CONFIG_PATH.exists(),
@@ -1381,6 +1407,9 @@ class Plugin:
             "core_ok": bool(core.get("ok")),
             "core_reason": str(core.get("error") or ""),
             "core_mode": str((core.get("data") or {}).get("mode") or ""),
+            # 设置区：语音播报开关（由后端 tts.enable 决定）与版本号（底部显示）
+            "tts": bool(prefs.get("tts")),
+            "version": str(prefs.get("version") or _PLUGIN_VERSION),
             # 虚拟手柄能不能用：设备节点在 + 进程有写权限
             "gamepad": os.access("/dev/uinput", os.W_OK) if os.path.exists("/dev/uinput") else False,
             # 本机鉴权状态：false 时前端只显示解锁框
@@ -1436,6 +1465,18 @@ class Plugin:
         _require(ticket, "lock")
         _clear_ticket()
         return {"ok": True}
+
+    async def set_tts(self, enabled: bool, ticket: str = "") -> dict:
+        """切语音播报：交给后端写入 [tts] enable，热更新、不用重启"""
+        _require(ticket, "set_tts")
+        cfg = _load_server_cfg()
+        port = int(cfg.get("port", 18765))
+        token = str(cfg.get("token", "") or "").strip()
+        r = await _core_http(port, token, "POST",
+                             f"/api/tts?enabled={'true' if enabled else 'false'}")
+        if not r["ok"]:
+            return {"ok": False, "error": r.get("error") or "后端没有接受这次修改"}
+        return {"ok": True, "tts": bool((r.get("data") or {}).get("tts_enable"))}
 
     async def screenshot(self, ticket: str = "", hide: bool = False) -> dict:
         """抓当前游戏画面

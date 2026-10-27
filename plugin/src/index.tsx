@@ -22,6 +22,10 @@ type Status = {
   core_mode: string;
   // 虚拟手柄能不能用（/dev/uinput 存在且可写）
   gamepad: boolean;
+  // 设置区：语音播报（后端 tts.enable）
+  tts: boolean;
+  // 底部显示：后端版本号，后端连不上时是插件自己的版本
+  version: string;
   // 本机鉴权：false 时面板只显示解锁框
   unlocked: boolean;
 };
@@ -233,6 +237,27 @@ function Md({ text }: { text: string }) {
   );
 }
 
+/**
+ * 面板底部的 logo。QAM 里加载不了外部图片（插件目录里的 png 也一样，
+ * CEF 不给 file:// 权限），所以用一个内联 SVG：圆角方块 + 女仆头饰的轮廓，
+ * 配色取和对话区一致的淡蓝。
+ */
+function Logo() {
+  return (
+    <svg width={14} height={14} viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="1" y="1" width="22" height="22" rx="6" fill="#1b2230" stroke="#5aa9e6" strokeWidth="1.5" />
+      {/* 头饰：左右两片花边 */}
+      <path d="M6 9.5 L8.5 6.5 L11 9.5" fill="none" stroke="#5aa9e6" strokeWidth="1.4" strokeLinejoin="round" />
+      <path d="M13 9.5 L15.5 6.5 L18 9.5" fill="none" stroke="#5aa9e6" strokeWidth="1.4" strokeLinejoin="round" />
+      {/* 眼睛 */}
+      <circle cx="9" cy="13" r="1.3" fill="#9fd0f5" />
+      <circle cx="15" cy="13" r="1.3" fill="#9fd0f5" />
+      {/* 嘴 */}
+      <path d="M10 17 Q12 18.4 14 17" fill="none" stroke="#9fd0f5" strokeWidth="1.2" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 // 来源标记。QAM 只有 ~300px 宽，用短一点的说法：
 // 网页端可能来自 PC 也可能是 Deck 上的浏览器，统一叫「网页」
 const CLIENT_LABEL: Record<string, string> = {
@@ -262,6 +287,8 @@ function Content() {
   // 当前这一轮正在做什么（后端 tool_activity 的原文），空表示还没开始动手
   const [activity, setActivity] = useState("");
   const [withShot, setWithShot] = useState(true);
+  // 语音播报的实际值以后端为准：status 回来后同步过来，切换时先乐观更新
+  const [tts, setTts] = useState(false);
   // 解锁：令牌输入框 + 后端给的票据（之后每次调用都要带上）
   const [tokenInput, setTokenInput] = useState("");
   const [ticket, setTicket] = useState("");
@@ -275,6 +302,7 @@ function Content() {
     try {
       const st = (await call<[], Status>("get_status")) as Status;
       setStatus(st);
+      setTts(!!st.tts);
       // 后端说没解锁就把本地票据丢掉：插件可能重启过，旧票据已经作废，
       // 留着只会让每次调用都报「票据不对」
       if (!st.unlocked) setTicket("");
@@ -497,6 +525,23 @@ function Content() {
     );
   };
 
+  /** 语音播报开关：先按用户点的显示，后端拒绝再翻回去并提示 */
+  const toggleTts = async (v: boolean) => {
+    setTts(v);
+    try {
+      const r = (await call<[boolean, string], { ok: boolean; tts?: boolean; error?: string }>(
+        "set_tts",
+        v,
+        ticket
+      )) as { ok: boolean; tts?: boolean; error?: string };
+      if (!r.ok) throw new Error(r.error ?? "后端没有接受这次修改");
+      setTts(!!r.tts);
+    } catch (e: any) {
+      setTts(!v);
+      setError(`语音播报切换失败：${String(e?.message ?? e)}`);
+    }
+  };
+
   const cancel = async () => {
     setBusyBoth(false);
     setActivity("");
@@ -646,6 +691,40 @@ function Content() {
           checked={withShot}
           onChange={setWithShot}
         />
+      </PanelSectionRow>
+
+      <PanelSectionRow>
+        <ToggleField
+          label="语音播报回复"
+          description="答复生成完在本机念一遍；和网页设置页的开关是同一个"
+          checked={tts}
+          onChange={toggleTts}
+        />
+      </PanelSectionRow>
+
+      {error && (
+        <PanelSectionRow>
+          <div style={{ ...CARD, color: ERR_COLOR, background: "rgba(224,108,117,.1)" }}>
+            {error}
+          </div>
+        </PanelSectionRow>
+      )}
+
+      {/* 底部品牌行：logo + 名称 + 版本号 */}
+      <PanelSectionRow>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            fontSize: 10,
+            color: DIM,
+          }}
+        >
+          <Logo />
+          <span>DeckMeido</span>
+          <span>v{status?.version || "—"}</span>
+        </div>
       </PanelSectionRow>
     </PanelSection>
   );
