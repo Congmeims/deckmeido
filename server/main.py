@@ -3013,8 +3013,16 @@ async def run_agent(events: list[dict], extra_system: str = "",
             # 动屏幕的工具一律不给：带图这轮只要「看图说怎么办」，动手会换掉
             # 用户截图时的画面，答的内容也就对不上他看到的那一帧了
             if image_part is not None:
-                dropped = [t["function"]["name"] for t in tool_calls
-                           if tools.touches_screen(t["function"]["name"])]
+                # touches_screen 要的是解析后的参数（要判断 desktop 的 action、
+                # run_command 的命令内容），而 arguments 这里是 JSON 字符串
+                def _screen_call(c: dict) -> bool:
+                    try:
+                        a = json.loads(c["function"].get("arguments") or "{}")
+                    except (ValueError, TypeError):
+                        a = {}
+                    return tools.touches_screen(c["function"]["name"], a if isinstance(a, dict) else {})
+
+                dropped = [t["function"]["name"] for t in tool_calls if _screen_call(t)]
                 if len(dropped) == len(tool_calls):
                     # 整批都是屏幕操作：连同模型那句「我先截个图」一起作废，
                     # 让它直接按已有画面作答，界面上不留一次空工具调用
@@ -3023,8 +3031,7 @@ async def run_agent(events: list[dict], extra_system: str = "",
                     msgs.append({"role": "user", "content":
                                  "（不用截图也不用操作屏幕，直接根据上面那张画面回答。）"})
                     continue
-                tool_calls = [c for c in tool_calls
-                              if not tools.touches_screen(c["function"]["name"])]
+                tool_calls = [c for c in tool_calls if not _screen_call(c)]
 
             # 有工具调用：本轮流式输出的内容是中间话，最终答复会重新流式。
             # 但用户屏幕上已经看到了，必须以 text 事件留在 events 里，
