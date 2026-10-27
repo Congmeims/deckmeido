@@ -1,4 +1,4 @@
-﻿"""网页端实时画面（H.264 / fragmented MP4 推流）。
+"""网页端实时画面（H.264 / fragmented MP4 推流）。
 
 游戏模式复用 gamescope 的 PipeWire 节点：`gst-launch-1.0` 起一条常驻管线
 `pipewiresrc ! videoconvert ! videorate ! vaapih264enc ! mp4mux ! fdsink`，
