@@ -44,6 +44,8 @@ type Item = {
   // 来源：web / mobile / client / qam，空表示老数据没记
   client: string;
   ts: number;
+  // 随提问附带的画面（截屏询问/别的端发的图），后端存好后给的 /shots/ 路径
+  image?: string;
 };
 
 // 插件后端推上来的流式消息
@@ -185,10 +187,12 @@ function inline(text: string): React.ReactNode[] {
   return nodes;
 }
 
-function Md({ text }: { text: string }) {
+function Md({ text, align }: { text: string; align?: "left" | "right" }) {
   const blocks = parseMd(text);
   return (
-    <>
+    // 对齐挂在最外层：用户消息靠右显示，自己说的话右边缘对齐才顺眼。
+    // 列表项和代码块仍保持左对齐（右对齐的代码几乎没法读）
+    <div style={{ textAlign: align ?? "left" }}>
       {blocks.map((b, i) => {
         if (b.t === "h") {
           return (
@@ -214,6 +218,7 @@ function Md({ text }: { text: string }) {
                 whiteSpace: "pre-wrap",
                 wordBreak: "break-word",
                 overflowX: "auto",
+                textAlign: "left",
               }}
             >
               <code>{b.text}</code>
@@ -223,7 +228,7 @@ function Md({ text }: { text: string }) {
         if (b.t === "ul" || b.t === "ol") {
           const Tag = b.t;
           return (
-            <Tag key={i} style={{ margin: "3px 0", paddingLeft: 18 }}>
+            <Tag key={i} style={{ margin: "3px 0", paddingLeft: 18, textAlign: "left" }}>
               {b.items.map((it, j) => (
                 <li key={j} style={{ margin: "1px 0" }}>
                   {inline(it)}
@@ -240,17 +245,17 @@ function Md({ text }: { text: string }) {
           </div>
         );
       })}
-    </>
+    </div>
   );
 }
 
-// 来源标记。QAM 只有 ~300px 宽，用短一点的说法：
-// 网页端可能来自 PC 也可能是 Deck 上的浏览器，统一叫「网页」
+// 来源标记。QAM 只有 ~300px 宽，四个端统一用两个字：
+// 电脑（PC 浏览器）/ 手机（手机浏览器）/ 掌机（Deck 上的桌面客户端）/ 插件（QAM）
 const CLIENT_LABEL: Record<string, string> = {
-  web: "PC网页端",
-  mobile: "手机网页端",
-  client: "客户端",
-  qam: "插件端",
+  web: "电脑",
+  mobile: "手机",
+  client: "掌机",
+  qam: "插件",
 };
 
 export default definePlugin(() => ({
@@ -346,6 +351,8 @@ function Content() {
   // 重开机默认进游戏模式，后端不会自己起来。这里补一个入口，
   // 按下后插件以 deck 身份 spawn uvicorn，等到 /api/status 应答才返回
   const [starting, setStarting] = useState(false);
+  // 新建会话的进行中标记：和「启动后端」分开，否则两个按钮会一起变成「正在…」
+  const [newing, setNewing] = useState(false);
   const startBackend = async () => {
     if (starting) return;
     setStarting(true);
@@ -419,10 +426,11 @@ function Content() {
     })();
   }, [ticket]);
 
-  // 新内容进来就滚到底，否则窄栏里看不到最新一行
+  // 列表是倒序（最新在最上），新内容进来就滚回顶部，
+  // 否则窄栏里还停在旧消息那一屏，等于没看到
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el) el.scrollTop = 0;
   }, [items, streaming]);
 
   // 忙碌计时：长时间没动静时界面要给个「还在跑」的反馈
@@ -507,7 +515,7 @@ function Content() {
       if (!st.unlocked || !st.ticket) throw new Error("插件未解锁，先输入访问令牌");
       const tk = st.ticket;
 
-      let image: string | null = null;
+      let shotPath: string | null = null;
       let game: { appid?: string; name?: string } | null = null;
       if (grab) {
         // 先收面板：CloseSideMenus 走的是 Steam 的 MenuStore，等于替用户按了
@@ -517,21 +525,24 @@ function Content() {
         // 切走时闪过的通知页一起拍进来。所以这里放宽到 1.2s，后端还会再等一次。
         if (hideQam) Navigation.CloseSideMenus();
         if (hideQam) await new Promise((r) => setTimeout(r, 1200));
+        // 只拿落盘路径：一张图的 base64 有 16MB，走 Decky 的 IPC 会让调用失败。
+        // 面板预览用插件另存的小缩略图（几十 KB），原图只在插件进程内部读
         const snap = (await call<
           [string, boolean],
-          { ok: boolean; image?: string; error?: string; game?: { appid?: string; name?: string } }
+          { ok: boolean; shot?: string; thumb?: string; error?: string; game?: { appid?: string; name?: string } }
         >("screenshot", tk, hideQam)) as {
           ok: boolean;
-          image?: string;
+          shot?: string;
+          thumb?: string;
           error?: string;
           game?: { appid?: string; name?: string };
         };
         // 抓完立刻把面板连同预览一起摆出来：后面还有几十秒生成时间，
         // 用户应该能在这段时间里确认「发给 AI 的到底是哪一帧」
         if (hideQam) restoreQam();
-        if (snap.ok && snap.image) {
-          image = snap.image;
-          setShot(`data:image/png;base64,${snap.image}`);
+        if (snap.ok && snap.shot) {
+          shotPath = snap.shot;
+          setShot(snap.thumb ? `data:image/jpeg;base64,${snap.thumb}` : "");
         } else {
           // 截图失败不阻断提问：这一轮退回纯文字，并在界面上说清楚原因
           setError(`截图失败，这轮只发文字：${snap.error ?? "未知原因"}`);
@@ -551,7 +562,7 @@ function Content() {
       const res = (await call<[string, string | null, string], { ok: boolean; error?: string }>(
         "start_turn",
         body,
-        image,
+        shotPath,
         tk
       )) as { ok: boolean; error?: string };
       if (!res.ok) throw new Error(res.error ?? "发不出去");
@@ -623,10 +634,35 @@ function Content() {
     restoreQam();
   };
 
+  /** 新会话：后端会向所有端广播 history，这边的对话列表随事件重建 */
+  const newSession = async () => {
+    if (newing) return;
+    setNewing(true);
+    setError("");
+    try {
+      const r = (await call<[string], { ok: boolean; error?: string }>(
+        "session_new",
+        ticket
+      )) as { ok: boolean; error?: string };
+      if (!r.ok) throw new Error(r.error ?? "后端没有接受");
+      // 不依赖广播的到达时机：本地先把列表和临时状态清干净，
+      // 否则按下的瞬间下面还挂着上一段对话，看起来像「没清掉」
+      setItems([]);
+      setShot("");
+      setStreaming("");
+      setActivity("");
+      curRef.current = "";
+    } catch (e: any) {
+      setError(`新建会话失败：${String(e?.message ?? e)}`);
+    } finally {
+      setNewing(false);
+    }
+  };
+
   // 未解锁：面板只留解锁框，提问一律不显示，避免用户点了才发现没权限
   if (status && !status.unlocked) {
     return (
-      <PanelSection title="DeckMeido">
+      <PanelSection>
         <PanelSectionRow>
           <div style={{ fontSize: 10, color: DIM, lineHeight: 1.5 }}>
             插件以 root 运行，需要先输入访问令牌解锁（默认 meido）
@@ -674,7 +710,7 @@ function Content() {
   const coreWhy = status && !status.core_ok ? status.core_reason : "";
 
   return (
-    <PanelSection title="DeckMeido">
+    <PanelSection>
       <PanelSectionRow>
         <div style={{ fontSize: 10, lineHeight: 1.5 }}>
           <div style={{ color: DIM }}>
@@ -714,6 +750,17 @@ function Content() {
         </PanelSectionRow>
       )}
 
+      {/* 聊歪了、或者想从头问另一件事时换一头。后端受理后会向所有端广播新会话，
+          这里不用手动清空对话列表。放在「设置」上面：换会话是常用操作，
+          不应该藏在设置按钮下面 */}
+      {status?.core_ok && !busy && (
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={newSession} disabled={newing}>
+            {newing ? "正在新建…" : "新会话"}
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
+
       {shot && (
         <PanelSectionRow>
           {/* 抓到的画面直接摆出来：抓错帧、抓到黑屏、抓到菜单，一眼就能看出来 */}
@@ -733,39 +780,75 @@ function Content() {
           ref={scrollRef as any}
           style={{ maxHeight: 330, overflowY: "auto", display: "block" }}
         >
-          {items.map((m, i) => {
+          {streaming && (
+            <div style={{ display: "flex", justifyContent: "flex-start", marginBottom: 6 }}>
+              <div
+                style={{
+                  ...CARD,
+                  marginBottom: 0,
+                  maxWidth: "82%",
+                  background: "rgba(255,255,255,.06)",
+                  borderLeft: "2px solid #5aa9e6",
+                }}
+              >
+                {CLIENT_LABEL.qam && <div style={{ fontSize: 9, color: DIM, marginBottom: 2 }}>插件</div>}
+                <Md text={streaming} />
+                <span style={{ color: DIM }}>▍</span>
+              </div>
+            </div>
+          )}
+          {/* 倒序：最新一条在最上面，进来不用先把列表拉到底。
+              正在生成的那条（streaming）排在最前，正好是「最新」的位置 */}
+          {items.slice().reverse().map((m, i) => {
             const tag = CLIENT_LABEL[m.client] ?? "";
+            // 一左一右：AI 在左、我说话在右，各带一条同色竖条，
+            // 扫一眼就知道哪句是谁说的，不用去读来源角标
+            const mine = m.role === "user";
             return (
               <div
                 key={`${m.ts}-${i}`}
                 style={{
-                  ...CARD,
-                  background: m.role === "user" ? "rgba(255,255,255,.06)" : "transparent",
-                  borderLeft: m.role === "assistant" ? "2px solid #5aa9e6" : "2px solid transparent",
+                  display: "flex",
+                  justifyContent: mine ? "flex-end" : "flex-start",
+                  marginBottom: 6,
                 }}
               >
-                {tag && (
-                  // 来源角标：所有端混在一起时，一眼看清这句是谁说的
-                  <div style={{ fontSize: 9, color: DIM, marginBottom: 2 }}>
-                    {tag}
-                  </div>
-                )}
-                <Md text={m.text} />
+                <div
+                  style={{
+                    ...CARD,
+                    marginBottom: 0,
+                    // 气泡只占八成长度，太满就看不出左右分别了
+                    maxWidth: "82%",
+                    background: mine ? "rgba(90,169,230,.14)" : "rgba(255,255,255,.06)",
+                    borderLeft: mine ? "2px solid transparent" : "2px solid #5aa9e6",
+                    borderRight: mine ? "2px solid #5aa9e6" : "2px solid transparent",
+                    textAlign: mine ? "right" : "left",
+                  }}
+                >
+                  {tag && (
+                    // 来源角标：所有端混在一起时，一眼看清这句是谁说的
+                    <div style={{ fontSize: 9, color: DIM, marginBottom: 2 }}>
+                      {tag}
+                    </div>
+                  )}
+                  {m.image && (
+                    // 这一轮附带的画面：以前只有模型看得到，屏幕上一直是空的
+                    <img
+                      src={m.image}
+                      style={{
+                        display: "block",
+                        width: "100%",
+                        height: "auto",
+                        marginBottom: 4,
+                        borderRadius: 4,
+                      }}
+                    />
+                  )}
+                  <Md text={m.text} align={mine ? "right" : "left"} />
+                </div>
               </div>
             );
           })}
-          {streaming && (
-            <div
-              style={{
-                ...CARD,
-                borderLeft: "2px solid #5aa9e6",
-              }}
-            >
-              {CLIENT_LABEL.qam && <div style={{ fontSize: 9, color: DIM, marginBottom: 2 }}>插件端</div>}
-              <Md text={streaming} />
-              <span style={{ color: DIM }}>▍</span>
-            </div>
-          )}
           {!items.length && !streaming && (
             <div style={{ ...CARD, color: DIM }}>
               还没有对话。点上面的「截屏询问」，或者直接在下面打字。
@@ -791,7 +874,7 @@ function Content() {
       {/* 设置默认收起：QAM 里平时只想要「问一句 / 看一眼」，太长会挡住对话 */}
       <PanelSectionRow>
         <ButtonItem layout="below" onClick={() => setShowSettings((v) => !v)}>
-          {showSettings ? "收起设置 ▴" : "设置 ▾"}
+          {showSettings ? "设置 ▴" : "设置 ▾"}
         </ButtonItem>
       </PanelSectionRow>
 

@@ -23,6 +23,7 @@ import os
 import re
 import secrets
 import shutil
+import subprocess
 import time
 import tomllib
 from pathlib import Path
@@ -529,6 +530,47 @@ def _runtime_dir() -> str:
     return f"/run/user/{_target_uid()}"
 
 
+# 截屏落盘的目录：QAM 面板只拿路径，图不经过 Decky 的 IPC
+_SHOT_DIR = Path("/tmp/deckmeido_shots")
+
+
+def _make_thumb(src: Path, width: int = 480) -> str:
+    """把原图缩成一张小 JPEG 的 base64，只给面板预览用
+
+    原图 1MB 左右，面板要的只是「这是哪一帧」。缩到 480 宽后大约 40KB，
+    走 Decky 的调用通道没有压力。机器上没有转换工具就返回空串，
+    预览不显示，但不影响提问。
+    """
+    # 缩略图必须另起名字，不能拿原图改后缀：原图本身就是 .jpg，
+    # with_suffix(".jpg") 会返回原图自己的路径，filesink 一开就把原图截断成 0 字节，
+    # 之后 start_turn 读到的就是空文件（表现为「发了但没带图」）
+    out = src.with_name(src.stem + "_thumb.jpg")
+    for cmd in (["gst-launch-1.0"], ["ffmpeg", "-y"]):
+        exe = shutil.which(cmd[0]) or (f"/usr/bin/{cmd[0]}" if Path(f"/usr/bin/{cmd[0]}").exists() else None)
+        if not exe:
+            continue
+        if cmd[0] == "ffmpeg":
+            argv = [exe, "-y", "-loglevel", "error", "-i", str(src),
+                    "-vf", f"scale={width}:-1", str(out)]
+        else:
+            # 输入可能是 JPEG 也可能是 PNG，解码交给 decodebin，别写死 pngdec。
+            # 显式给 height 并把 JPG 质量压到 80：只写 width=480 时 videoscale
+            # 会把高度留成 800，出来的缩略图有 400KB 以上，白白撑大返回值
+            argv = [exe, "-q", "filesrc", f"location={src}", "!", "decodebin", "!",
+                    "videoscale", "!", "videoconvert", "!",
+                    "video/x-raw,width=480,height=300", "!",
+                    "jpegenc", "quality=80", "!", "filesink", f"location={out}"]
+        try:
+            subprocess.run(argv, capture_output=True, timeout=20, check=True)
+            if out.exists() and out.stat().st_size > 0:
+                data = base64.b64encode(out.read_bytes()).decode("ascii")
+                out.unlink(missing_ok=True)
+                return data
+        except Exception:
+            continue
+    return ""
+
+
 def _backend_log_fd() -> int:
     """后端 stdout/stderr 的去处：和客户端一样写 backend.log，不丢
 
@@ -639,13 +681,18 @@ def _find_gst() -> str | None:
 
 async def _capture_once(node: str, gst: str, timeout: int = 25) -> tuple[bool, str]:
     """抓一帧，返回 (成功, base64 或错误说明)"""
-    tmp = Path("/tmp") / f"deckmeido_shot_{os.getpid()}_{next(_SHOT_SEQ)}.png"
+    tmp = Path("/tmp") / f"deckmeido_shot_{os.getpid()}_{next(_SHOT_SEQ)}.jpg"
     # 注意：pipewiresrc 的 path=... 不能和 num-buffers 塞进同一个 argv。
     # gst-launch 按 argv 逐个解析元素，两个属性挤在一项里就会被当成非法元素名，
     # 直接报 "erroneous pipeline: syntax error" 而一帧都不抓。
+    #
+    # 出 JPEG 而不是 PNG：1280x800 的游戏画面存 PNG 有 1200 万字节，base64 之后
+    # 1600 万字符。LLM 网关对请求体有上限，这么大的图会被上游截断
+    # （unexpected EOF → 503 no_healthy_account），看着就像「LLM 调用失败」，
+    # 而同样配置下发纯文字是正常的。JPEG q90 大约 200KB，画质对看图问答绰绰有余。
     cmd = _run_as() + [
         gst, "-q", "pipewiresrc", f"path={node}", "num-buffers=6", "!",
-        "videoconvert", "!", "pngenc", "!", "filesink", f"location={tmp}",
+        "videoconvert", "!", "jpegenc", "quality=90", "!", "filesink", f"location={tmp}",
     ]
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -1176,8 +1223,9 @@ _THREAD: list[dict] = []
 _THREAD_MAX = 200     # 只留最近这么多条，再往前翻也用不上
 # 最近一次推给面板的 thread 快照，等界面 ready 时补发（见 _emit）
 _LAST_THREAD: dict | None = None
-# 面板展示的来源标记，和后端、网页端的叫法保持一致
-_CLIENT_LABEL = {"web": "网页", "mobile": "手机", "client": "客户端", "qam": "插件"}
+# 面板展示的来源标记，和后端、网页端的叫法保持一致：
+# 电脑（PC 浏览器）/ 手机（手机浏览器）/ 掌机（Deck 桌面客户端）/ 插件（QAM）
+_CLIENT_LABEL = {"web": "电脑", "mobile": "手机", "client": "掌机", "qam": "插件"}
 
 
 def _push_thread(item: dict):
@@ -1195,6 +1243,10 @@ def _push_thread(item: dict):
         for m in reversed(_THREAD[-8:]):
             if (m.get("role") == item["role"] and not float(m.get("ts") or 0)
                     and str(m.get("text") or "") == str(item.get("text") or "")):
+                # 本地占位是纯文字的，图只挂在本机这张缩略图以外的路径上：
+                # 回填时补进去，否则这一轮的画面要等下次重连才会出现
+                if not item.get("image") and m.get("image"):
+                    item = {**item, "image": m["image"]}
                 m.update(item)
                 _emit({"kind": "thread", "items": _THREAD})
                 return
@@ -1204,10 +1256,25 @@ def _push_thread(item: dict):
     _emit({"kind": "thread", "items": _THREAD})
 
 
+def _shot_url(path: str) -> str:
+    """把后端给的 /shots/xxx 拼成面板能直接加载的地址
+
+    面板跑在 Deck 本机的 CEF 里，和后端同机，走回环即可；
+    token 必须带上，静态图也走鉴权。
+    """
+    if not path:
+        return ""
+    cfg = _load_server_cfg()
+    port = int(cfg.get("port", 18765))
+    token = str(cfg.get("token", "") or "")
+    return f"http://127.0.0.1:{port}{path}?token={token}"
+
+
 def _sync_thread(hist: list):
     """用后端给的完整历史对齐本地列表（连上时、别的端改会话时）
 
-    只看文本消息：随图那条多模态消息（content 是数组）不进面板。
+    只看文本消息：随图那条多模态消息（content 是数组）不进面板，
+    它的画面由挂在 user 消息 events 里的路径显示。
     """
     out = []
     for m in hist:
@@ -1216,11 +1283,17 @@ def _sync_thread(hist: list):
         content = m.get("content")
         if isinstance(content, list):
             continue
+        image = ""
+        for ev in m.get("events") or []:
+            if isinstance(ev, dict) and ev.get("image"):
+                image = _shot_url(str(ev["image"]))
+                break
         out.append({
             "role": m["role"],
             "text": str(content or ""),
             "client": str(m.get("client") or ""),
             "ts": float(m.get("ts") or 0),
+            **({"image": image} if image else {}),
         })
     _THREAD[:] = out[-_THREAD_MAX:]
     _emit({"kind": "thread", "items": _THREAD})
@@ -1315,12 +1388,18 @@ async def _read_loop(bk: _Backend):
             _emit({"kind": "status", "running": bool((msg.get("data") or {}).get("running"))})
             continue
         if typ == "user_message":
-            _push_thread({
+            item = {
                 "role": "user",
                 "text": str(msg.get("text") or ""),
                 "client": str(msg.get("client") or ""),
                 "ts": float(msg.get("ts") or 0),
-            })
+            }
+            # 截屏询问附带的画面：后端已存成 /shots/xxx 并挂在 events 上
+            for ev in msg.get("events") or []:
+                if isinstance(ev, dict) and ev.get("image"):
+                    item["image"] = _shot_url(str(ev["image"]))
+                    break
+            _push_thread(item)
             continue
         if typ == "assistant_message":
             # 助手消息现在也带来源（后端按同一轮的提问打标）；老数据没有这个字段，
@@ -1429,7 +1508,7 @@ def _lan_ip() -> str:
 
 
 async def _core_http(port: int, token: str, method: str, path: str,
-                     timeout: float = 5.0) -> dict:
+                     timeout: float = 5.0, body: dict | None = None) -> dict:
     """向后端的本机接口发一个请求，返回 {"ok": bool, "data": {...} | "error": str}
 
     不走 ws：这类请求都只要一个结论，HTTP 一步拿到，也顺带验证了 token 是
@@ -1442,15 +1521,30 @@ async def _core_http(port: int, token: str, method: str, path: str,
     except Exception as exc:
         return {"ok": False, "error": f"连不上 :{port}（{exc}）"}
     try:
+        payload = b""
+        extra = ""
+        if body is not None:
+            payload = json.dumps(body).encode()
+            extra = (f"Content-Type: application/json\r\n"
+                     f"Content-Length: {len(payload)}\r\n")
         req = (
             f"{method} {path} HTTP/1.1\r\n"
             f"Host: 127.0.0.1:{port}\r\n"
             f"X-Token: {token}\r\n"
+            f"{extra}"
             "Connection: close\r\n\r\n"
-        )
-        writer.write(req.encode())
+        ).encode() + payload
+        writer.write(req)
         await writer.drain()
-        raw = await asyncio.wait_for(reader.read(), timeout=timeout)
+        # 后端返回体可能很大（history 全量），一次 read() 只拿到首个 TCP 段，
+        # 所以读到 EOF 为止
+        chunks = []
+        while True:
+            chunk = await asyncio.wait_for(reader.read(65536), timeout=timeout)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks)
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
     finally:
@@ -1482,6 +1576,21 @@ async def _core_prefs(port: int, token: str) -> dict:
     return {"ok": True, "tts": bool(d.get("tts_enable")), "version": str(d.get("version") or "")}
 
 
+async def _session_post(what: str, path: str) -> dict:
+    """会话类操作共用的 POST：拿配置、确认后端活着、发请求"""
+    cfg = _load_server_cfg()
+    port = int(cfg.get("port", 18765))
+    token = str(cfg.get("token", "") or "").strip()
+    if not token:
+        return {"ok": False, "error": "后端配置里的 token 是空的"}
+    r = await _core_http(port, token, "POST", path, timeout=8.0, body={})
+    if not r["ok"]:
+        # 后端在跑但 reject 了，和根本没跑是两回事，错误里带上原始原因
+        decky.logger.error(f"{what} 失败：{r.get('error')}")
+        return {"ok": False, "error": str(r.get("error") or "后端没有应答")}
+    return {"ok": True, "id": str((r.get("data") or {}).get("id") or "")}
+
+
 class Plugin:
     async def get_status(self) -> dict:
         """QAM 打开时先问一次：后端连得上吗、截图能不能用
@@ -1495,6 +1604,13 @@ class Plugin:
         node, why = await _gamescope_pw_node()
         core = await _core_status(port, token)
         prefs = await _core_prefs(port, token) if core.get("ok") else {}
+        # 面板只会写「探测失败（原因）」，日志里留一份，事后能对上时间点
+        decky.logger.info(
+            f"get_status：核心 {'正常' if core.get('ok') else '异常'}"
+            f"{'' if core.get('ok') else '（' + str(core.get('error') or '') + '）'}，"
+            f"画面节点 {'有' if node else '没有'}"
+            f"{'' if node else '（' + why + '）'}，已解锁 {_unlocked()}"
+        )
         return {
             "install_dir": str(INSTALL_DIR),
             "config_ok": CONFIG_PATH.exists(),
@@ -1575,6 +1691,15 @@ class Plugin:
         await _ensure_backend()
         return {"ok": True, "already": False}
 
+    async def session_new(self, ticket: str = "") -> dict:
+        """新建会话：QAM 上这一轮聊下去不对劲时，从这里重新开一头
+
+        走 HTTP 而不是 ws：后端受理后会向所有连接广播 history/session_changed，
+        插件侧的 _read_loop 收到就自然刷新，不需要在这里额外处理返回值。
+        """
+        _require(ticket, "session_new")
+        return await _session_post("session_new", "/api/sessions/create")
+
     async def unlock(self, token: str) -> dict:
         """用访问令牌解锁插件能力，成功后拿到票据，之后的调用都要带上
 
@@ -1629,9 +1754,19 @@ class Plugin:
         if hide:
             await asyncio.sleep(1.2)
         ok, payload = await grab_screenshot()
-        if ok:
-            return {"ok": True, "image": payload, "game": game}
-        return {"ok": False, "error": payload, "game": game}
+        if not ok:
+            decky.logger.error(f"screenshot 失败：{payload}")
+            return {"ok": False, "error": payload, "game": game}
+        # 图片只落到本地文件，不经过 Decky 的 IPC 回传：一张 1280x800 的 PNG
+        # base64 有 16MB 左右，这么大的字符串塞进 JS↔Python 的调用会静默失败
+        # ——前端既收不到图，随后的 start_turn 也整个派发不到后端。
+        shot = Path(_SHOT_DIR) / f"shot_{os.getpid()}_{next(_SHOT_SEQ)}.jpg"
+        shot.parent.mkdir(parents=True, exist_ok=True)
+        shot.write_bytes(base64.b64decode(payload))
+        decky.logger.info(f"screenshot 返回 ok，图存到 {shot}（{shot.stat().st_size} 字节）")
+        # 面板上的预览另存一张缩略图：确认「截到的是哪一帧」不需要原图，
+        # 几十 KB 的 JPEG 才塞得进返回值
+        return {"ok": True, "shot": str(shot), "thumb": _make_thumb(shot), "game": game}
 
     async def gamepad_press(self, key: str, ms: int = 80, ticket: str = "") -> dict:
         """模拟按一下手柄键：a/b/x/y/lb/rb/up/down/left/right/start/select/guide/l3/r3/share"""
@@ -1658,14 +1793,32 @@ class Plugin:
         return {"ok": True}
 
     async def start_turn(
-        self, text: str, image: str | None = None, ticket: str = ""
+        self, text: str, shot: str | None = None, ticket: str = ""
     ) -> dict:
-        """把一轮对话发给后端。返回后流式内容通过 deckmeido_delta 推给前端"""
+        """把一轮对话发给后端。返回后流式内容通过 deckmeido_delta 推给前端
+
+        shot 是 screenshot 落盘的文件路径（不是 base64）：16MB 的图片数据
+        塞进 Decky 的 IPC 会让整次调用静默失败，所以图只在插件进程内部读。
+        """
+        decky.logger.info(f"start_turn 被调用：{len(text or '')} 字，图 {shot or '(无)'}")
         _require(ticket, "start_turn")
         global _ACC, _LAST_REPLY
         text = str(text or "").strip()
         if not text:
             return {"ok": False, "error": "问题是空的"}
+
+        image = ""
+        if shot:
+            try:
+                raw = Path(shot).read_bytes()
+                image = base64.b64encode(raw).decode("ascii")
+                # 读到的字节数和写入时的对不上，说明文件在两次调用之间被清空/替换了
+                decky.logger.info(f"start_turn：读图 {len(raw)} 字节 -> base64 {len(image)} 字符")
+                if not raw:
+                    decky.logger.error(f"start_turn：图文件是空的（{shot}），这一轮退回纯文字")
+            except Exception as exc:
+                # 图读不出来不阻断这一轮：退回纯文字，并在日志里留原因
+                decky.logger.error(f"start_turn 读图失败（{shot}）：{exc}")
 
         bk, why = await _ensure_backend()
         if not bk:
@@ -1679,7 +1832,7 @@ class Plugin:
             payload["image_prompt"] = "（这是当前游戏画面，结合画面回答用户的问题）"
         payload["workspace"] = "/home/deck"
         sock = bk.sockname()
-        decky.logger.info(f"start_turn：正文 {len(body)} 字，图 {len(image or '')} 字符，经 {sock} 发出")
+        decky.logger.info(f"start_turn：正文 {len(text)} 字，图 {len(image)} 字符，经 {sock} 发出")
         try:
             await bk.send(payload)
         except Exception as exc:
@@ -1741,6 +1894,35 @@ class Plugin:
     async def _main(self):
         decky.logger.info(f"DeckMeido 插件已加载，安装目录 {INSTALL_DIR}")
         _run_as()
+        # 开机默认进游戏模式，这时后端通常没在跑，用户不点「启动后端」就等于插件不可用。
+        # 后台自动拉一次：成功与否都不打扰用户，面板上本来就有状态和执行按钮。
+        asyncio.get_running_loop().create_task(self._autostart_backend())
+
+    async def _autostart_backend(self, retries: int = 3) -> None:
+        """插件加载时自动拉起后端（失败不提示，面板上的按钮仍可手动重试）
+
+        开机那几十秒里网络、磁盘都可能还没就绪，所以退避重试几次；
+        后端自己有单实例守卫，和客户端同时拉起也不会起两份。
+        """
+        cfg = _load_server_cfg()
+        port = int(cfg.get("port", 18765))
+        token = str(cfg.get("token", "") or "").strip()
+        if not token:
+            decky.logger.warning("自动启动后端跳过：配置里没有 token")
+            return
+        for attempt in range(1, retries + 1):
+            await asyncio.sleep(3 if attempt == 1 else 10)
+            core = await _core_http(port, token, "GET", "/api/status", timeout=2.0)
+            if core.get("ok"):
+                decky.logger.info(f"后端已在运行 :{port}，无需自动启动")
+                return
+            decky.logger.info(f"自动启动后端 :{port}（第 {attempt}/{retries} 次）")
+            ok, why = await _start_backend(port)
+            if ok:
+                decky.logger.info(f"后端已自动启动 :{port}")
+                return
+            decky.logger.warning(f"自动启动后端失败（第 {attempt} 次）：{why}")
+        decky.logger.error("自动启动后端多次失败，需要用户在面板上手动启动")
 
     async def _unload(self):
         await _drop_backend()

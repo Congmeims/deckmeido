@@ -176,9 +176,13 @@
   .msg:hover .msg-foot, .msg-foot:focus-within {
     opacity: 1; visibility: visible; pointer-events: auto;
   }
-  /* 触屏（SteamOS 游戏模式没有 hover）拿不到鼠标悬停，就常显，否则按钮等于不存在 */
+  /* 触屏（SteamOS 游戏模式没有 hover）拿不到鼠标悬停，就常显，否则按钮等于不存在。
+     但只在对话最末一条上常显：手机端每屏好几条，一排「重试 分享 删除 时间」
+     全亮着会盖满对话。往上翻看旧消息时照常点一下气泡把它们叫出来 */
   @media (hover: none) {
-    .msg-foot { opacity: 1; visibility: visible; pointer-events: auto; }
+    .msg:last-child .msg-foot,
+    .events:last-child .msg-foot { opacity: 1; visibility: visible; pointer-events: auto; }
+    .msg.foot-on .msg-foot { opacity: 1; visibility: visible; pointer-events: auto; }
   }
   .msg-foot .time { margin-top: 0; }
   .msg-acts { display: flex; gap: 2px; }
@@ -332,6 +336,12 @@
   .tl-body .shot { display: block; width: auto; max-width: 100%; height: auto; border-radius: 8px; border: 1px solid var(--line); cursor: zoom-in; }
   /* 截图缩略图：按对话区宽度的 30% 显示，气泡跟着收缩；窄屏保底 160px */
   .tl-body.pic .shot { width: 30vw; min-width: 160px; max-width: 100%; }
+  /* 附带的画面（提问里那张）只当缩略图用：16:9 裁切、高度封顶，
+     点开才是原图。整张铺开会把一段对话挤成一屏以上 */
+  .tl-body.pic .shot.thumb {
+    width: 40vw; max-width: 280px; height: auto; max-height: 22dvh;
+    object-fit: cover; object-position: top left;
+  }
   .stream-body { white-space: pre-wrap; word-break: break-word; }
   #send.stop { background: var(--danger); }
 
@@ -766,10 +776,11 @@
   .sys-card { padding: 14px 14px 12px; border-bottom: 1px solid var(--line); }
   .sys-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 14px; font-weight: 600; margin-bottom: 10px; }
   .sys-ip { font-size: 11.5px; color: var(--muted); font-family: ui-monospace, monospace; font-weight: 400; }
-  /* 三列网格：标签列与数值列等宽（34px），进度槽就自动在卡片里水平居中；
-     四条条的左右端点也严格落在同一垂直线上，不再参差 */
+  /* 三列网格：标签列与数值列等宽，进度槽就自动在卡片里水平居中；
+     几条条的左右端点严格落在同一垂直线上。第三列给数值留 46px：
+     上下文那行是「82% · 13.1k」，按 34px 排会顶出卡片右边界 */
   .sys-row {
-    display: grid; grid-template-columns: 34px 1fr 34px;
+    display: grid; grid-template-columns: 34px minmax(0, 1fr) 46px;
     align-items: center; gap: 8px; margin: 7px 0;
     font-size: 12px; color: var(--muted);
   }
@@ -778,7 +789,8 @@
   .fill { height: 100%; width: 0%; border-radius: 3px; background: var(--brand); transition: width .4s; }
   .fill.hot { background: var(--danger); }
   .fill.warn { background: #e6b422; }
-  .sys-val { font-size: 10.5px; font-family: ui-monospace, monospace; text-align: right; white-space: nowrap; }
+  .sys-val { font-size: 10.5px; font-family: ui-monospace, monospace; text-align: right; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; }
   /* 上下文行：窄屏时顶栏徽章被隐藏，改由这一行显示；宽屏有徽章就不重复占地方 */
   #ctxRow { display: none; }
   @media (max-width: 560px) { #ctxRow { display: grid; } }
@@ -1259,12 +1271,21 @@
     if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
     return (n / 1073741824).toFixed(1) + ' GB';
   }
+  // 静态资源的 <img src> 也走 GET，只能靠查询参数带令牌。
+  // 有的图片来源（live 事件里回传的 ev.image）本身已经带 token 了，
+  // 再拼一次就成了 ?token=x?token=x，后端取到的值不匹配直接 401，
+  // 表现就是「PC 网页端一张图都没有」。所以统一从这里过一道
+  function withToken(url) {
+    if (!url) return url;
+    if (/[?&]token=/.test(url)) return url;
+    return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(token);
+  }
   function fileCardHtml(label, path) {
     var name = label || path.split('/').pop() || path;
     var ext = (name.split('.').pop() || '').toLowerCase();
     var url = '/files/' + path.split('/').map(encodeURIComponent).join('/');
     // 下载走 GET，只能靠查询参数带上令牌（浏览器不会给 <a> 加自定义头）
-    var href = url + (token ? '?token=' + encodeURIComponent(token) : '');
+    var href = withToken(url);
     // 卡片带文件路径属性，挂载后再去问大小（列表渲染是同步的，不能在里面 await）
     return '<div class="file-card" data-path="' + escapeHtml(path) + '">'
          + '<span class="fc-icon">' + (FILE_ICONS[ext] || '📄') + '</span>'
@@ -1316,7 +1337,10 @@
     s = s.replace(/\[([^\]\n]*)\]\((\/files\/[^)\s]+)\)/g, function (m, label, href) {
       return fileCardHtml(label, href.slice('/files/'.length).split('?')[0]);
     });
-    s = s.replace(/!\[([^\]]*)\]\((\/uploads\/[^)\s]+)\)/g, '<img class="chat-img" src="$2">');
+    s = s.replace(/!\[([^\]]*)\]\((\/uploads\/[^)\s]+)\)/g, function (m, alt, href) {
+      // 上传的图在 /uploads/ 下，同样需要令牌，否则浏览器拿到 401 只显示破图
+      return '<img class="chat-img" alt="' + alt + '" src="' + withToken(href) + '">';
+    });
     s = s.replace(/\n{2,}/g, '<br><br>').replace(/\n/g, '<br>');
     // 行首缩进用不换行空格占位，避免连续半角空格被浏览器折叠/当作换行
     s = s.replace(/(^|<br>)([ \t]+)/g, function (m, pre, sp) {
@@ -1336,9 +1360,34 @@
     return /Mobile|Android/.test(navigator.userAgent) ? 'mobile' : 'web';
   }
 
-  var CLIENT_LABEL = { web: '网页', mobile: '手机', client: '客户端', qam: 'QAM' };
+  // 设备身份：端类型（web/mobile/client）只说明「哪种浏览器」，两台电脑都是 web。
+  // 想判断「这条是不是我这台设备发的」，必须有一个每台设备各自唯一的 id。
+  // 存在 localStorage 里，同一浏览器长期不变；隐私模式或无痕每次会换新 id，
+  // 那只影响「本端」角标是否显示，不影响对话
+  var DEVICE_ID = (function () {
+    try {
+      var k = 'deckmeido_device_id';
+      var v = localStorage.getItem(k);
+      if (!v) {
+        v = (window.crypto && crypto.randomUUID)
+          ? crypto.randomUUID()
+          : String(Date.now()) + '-' + Math.random().toString(36).slice(2, 10);
+        localStorage.setItem(k, v);
+      }
+      return v;
+    } catch (e) { return ''; }
+  })();
 
-  function addMsg(role, text, ts, events, client) {
+  // 四种端：电脑（PC 浏览器，兜底）/ 手机（手机浏览器）/ 掌机（Deck 桌面客户端）/
+  // 插件（QAM）。
+  var CLIENT_LABEL = { web: '电脑', mobile: '手机', client: '掌机', qam: '插件' };
+  // 老数据里没有 client 字段时按 device 兜底：有 device 说明是浏览器连的
+  function clientLabel(client, device) {
+    if (CLIENT_LABEL[client]) return CLIENT_LABEL[client];
+    return device ? '电脑' : '';
+  }
+
+  function addMsg(role, text, ts, events, client, device) {
     // 历史回放：事件与正文按「屏幕上出现过的顺序」串成一条时间线。
     // 旧版把事件块整体摆在正文上方，于是「思考→说话→执行」的顺序被打乱成
     // 「思考全在上、说话在中、命令在最下」；现在 order 里有序，按序摆放即可
@@ -1356,14 +1405,18 @@
     var el = document.createElement('div');
     el.className = 'msg ' + role;
     if (ts) el.dataset.ts = String(ts);
-    if (role === 'user' && CLIENT_LABEL[client]) {
-      // 来源角标：老数据没有 client 字段，就不显示
+    if (role === 'user' && clientLabel(client, device)) {
+      // 来源角标：老数据没有 client 字段，就不显示。
+      // 「本端」只在设备 id 与本人一致时才标：两台电脑的 client 都是 web，
+      // 只比 client 会让别人的发言也显示成「本端」。老数据没有 device 字段，
+      // 那就退回比较 client 类型，至少还能区分手机和电脑
+      var own = device ? (device === DEVICE_ID) : (!device && client === myClient());
       var src = document.createElement('span');
       src.className = 'msg-src';
-      src.textContent = client === myClient() ? '本端' : CLIENT_LABEL[client];
+      src.textContent = own ? '本端' : clientLabel(client, device);
       // 把原始值和本端认定一起写进 title：角标认错时一眼能看出是哪一边算错了
-      src.title = '发起来源：' + CLIENT_LABEL[client] + '（' + client
-                  + '）；本端认定为 ' + myClient();
+      src.title = '发起来源：' + clientLabel(client, device) + '（' + client
+                  + '）；本端认定为 ' + myClient() + (device ? '，设备 ' + device.slice(0, 8) : '');
       el.appendChild(src);
     }
     if (role === 'assistant' || role === 'user') {
@@ -1466,6 +1519,29 @@
     return { tl: tl, head: head };
   }
 
+  // 附带的画面（截屏询问发出去的那张）：缩略图内联在时间线行里，
+  // 点图看原图，点这一行的标题就地展开/收起
+  function makeShotRow(ev) {
+    var r = makeTlRow('截图', null, false);
+    var chipEl = document.createElement('span');
+    chipEl.className = 'tl-chip';
+    chipEl.textContent = ev.summary || '附带的画面';
+    r.head.appendChild(chipEl);
+    var arrow = document.createElement('span');
+    arrow.className = 'tl-arrow';
+    r.head.appendChild(arrow);
+    var body = document.createElement('div');
+    body.className = 'tl-body pic';
+    var img = document.createElement('img');
+    img.className = 'shot thumb';
+    img.src = withToken(ev.image);
+    img.alt = '附带的画面';
+    body.appendChild(img);
+    r.tl.appendChild(body);
+    r.tl.classList.add('open');
+    return r.tl;
+  }
+
   // 思维链行（live 流式与历史渲染共用）
   function makeThoughtRow(text, open) {
     var body = text || '';
@@ -1512,6 +1588,13 @@
       return;
     }
     if (ev.type !== 'tool') return;
+    // 随提问附带的画面：一条「截图 · 附带的画面」+ 小缩略图。
+    // 以前它走下面通用的截图行（「已截屏」+ 铺满整行的大图），回放一轮
+    // 截屏询问时屏幕上先是一整屏图片，后面才是正文
+    if (ev.name === 'screenshot' && ev.image) {
+      box.appendChild(makeShotRow(ev));
+      return;
+    }
     var info = toolRowInfo(ev);
     var hasBody = !!(ev.output || ev.image || ev.diff || ev.error || (ev.files && ev.files.length));
     var r = makeTlRow(ev.approved ? ('已批准：' + (ev.summary || '')) : info.text,
@@ -1558,7 +1641,7 @@
       } else if (ev.image) {
         var img = document.createElement('img');
         img.className = 'shot';
-        img.src = ev.image + '?token=' + encodeURIComponent(token);
+        img.src = withToken(ev.image);
         img.alt = '屏幕截图';
         body.appendChild(img);
       } else if (ev.error) {
@@ -1731,9 +1814,14 @@
           // 清空后必须重算按钮：否则切会话/新连接时，上一轮残留的终止态会一直挂着
           updateSendBtn();
           (msg.messages || []).forEach(function (m) {
-            // 用户消息不落时间戳，助手消息带上事件（截屏图/搜索/终端输出），刷新后才不会丢
+            // 随提问附带的画面在历史里是一条独立的 content 数组消息（给模型看图用的），
+            // 不是对话内容。以前把它当正文渲染，屏幕上就多出一条
+            // 「[object Object][object Object]」的气泡
+            if (m.content && typeof m.content !== 'string') return;
+            // 用户消息也会带事件（截屏询问那一步附带的画面），
+            // 只挂 assistant 的话，回放历史时提问里的图就丢了
             addMsg(m.role === 'user' ? 'user' : 'assistant', m.content, m.ts,
-                   m.role === 'assistant' ? m.events : null, m.client);
+                   m.events, m.client, m.device);
           });
           // 崩溃补丁：后端被杀时最后一条正文可能只发到浏览器、没来得及写盘。
           // 本地缓存里若有一条服务端历史里没有的回复，补在末尾，避免「我的回复凭空消失」
@@ -1786,7 +1874,7 @@
           setBusy(true);          // 别的端发起的任务，这边也要能一键叫停
           turnCacheReset();       // 新一轮开始，本地屏幕缓存清零
           if (msg.sid) turnCache.sid = msg.sid;
-          addMsg('user', msg.text, msg.ts, null, msg.client);
+          addMsg('user', msg.text, msg.ts, msg.events || null, msg.client, msg.device);
           liveBox = document.createElement('div');
           liveBox.className = 'events';
           messages.appendChild(liveBox);
@@ -2468,7 +2556,8 @@
       return;
     }
     queuedNoticeShown = false;
-    ws.send(JSON.stringify({ type: 'chat', text: text, client: myClient() }));
+    ws.send(JSON.stringify({ type: 'chat', text: text, client: myClient(),
+                             device: DEVICE_ID }));
     lastSendAt = Date.now();   // 自愈逻辑据此判断「刚发出去，服务端可能还在建 task」
     setBusy(true);
   }
@@ -3155,7 +3244,7 @@
     plusMenu.classList.remove('show');
     if (ws && ws.readyState === 1 && !busy) {
       ws.send(JSON.stringify({ type: 'chat', text: '截屏，把当前桌面画面展示给我',
-                               client: myClient() }));
+                               client: myClient(), device: DEVICE_ID }));
       setBusy(true);
     }
   });
@@ -3477,6 +3566,9 @@
     if (navigator.clipboard) navigator.clipboard.writeText(t).catch(function () {});
   });
   // 事件委托：消息区里的图片与代码块
+  // 触屏没有 hover：只有最后一条常显操作按钮，往上的旧消息点一下气泡
+  // 才把「重试 分享 删除 时间」叫出来（CSS 里 `.msg.foot-on` 那个分支）
+  var NO_HOVER = window.matchMedia && window.matchMedia('(hover: none)').matches;
   messages.addEventListener('click', function (e) {
     var img = e.target.closest('img.shot, img.chat-img');
     if (img) { openImage(img.src); return; }
@@ -3484,6 +3576,16 @@
     if (pre) {
       codePre.textContent = pre.textContent;
       codeView.classList.add('show');
+      return;
+    }
+    // 点按钮本身（重试/分享/删除）不要顺带把行收起来：只处理点到气泡正文的情况
+    var msg = e.target.closest('.msg');
+    if (NO_HOVER && msg && !e.target.closest('.msg-foot') && !e.target.closest('a')) {
+      var wasOn = msg.classList.contains('foot-on');
+      Array.prototype.forEach.call(messages.querySelectorAll('.msg.foot-on'), function (m) {
+        m.classList.remove('foot-on');
+      });
+      if (!wasOn) msg.classList.add('foot-on');
     }
   });
 
