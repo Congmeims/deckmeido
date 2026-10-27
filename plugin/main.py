@@ -15,6 +15,7 @@
 import asyncio
 import base64
 import hashlib
+import inspect
 import itertools
 import hmac
 import json
@@ -1157,14 +1158,25 @@ def _emit(msg: dict):
     界面可能比面板开关得晚（Decky 在面板首帧之后才挂监听），后端连得早时
     history 那一条 thread 会落空，所以这里顺手留一份最新快照，等面板调
     ready() 再补发。
+
+    新版 Decky 的 decky.emit 是协程，直接调用什么都不会发出去（只在日志里
+    留一条 RuntimeWarning），连当前事件循环也要忙到下一次 await 才第一次真正
+    执行 —— 所以这里必须挂到循环上跑，不能当同步函数使。
     """
     global _LAST_THREAD
     if msg.get("kind") == "thread":
         _LAST_THREAD = msg
     try:
-        decky.emit("deckmeido_delta", msg)
+        res = decky.emit("deckmeido_delta", msg)
     except Exception as exc:
         decky.logger.warning(f"推送前端失败：{exc}")
+        return
+    if inspect.isawaitable(res):
+        try:
+            asyncio.get_running_loop().create_task(res)
+        except RuntimeError:
+            # 没有运行中的循环（不该发生），至少别把结果丢掉
+            decky.logger.warning("推送前端失败：没有事件循环")
 
 
 def _finalize(cancelled: bool = False):
