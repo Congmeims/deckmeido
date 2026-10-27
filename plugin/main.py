@@ -366,6 +366,47 @@ def _read_shortcuts(path: Path) -> dict[str, str]:
     return out
 
 
+def _steam_running_app(names: dict[str, str]) -> tuple[str, str] | None:
+    """Steam 账本里当前在跑的那款，返回 (appid, name)；没有则 None
+
+    进程表里查不到 SteamAppId 时用它（Linux 原生版、启动器套娃的那类）。
+    localconfig 的 LastPlayed 只有退出后才更新，所以不能拿它当「正在运行」。
+    console_log.txt 里成对记着 "Game process added ... AppID <n>" 与
+    "Game process removed ... AppID <n>"，按出现顺序跑一遍，剩下没被移除的
+    就是此刻在跑的那款——这是 Steam 自己的账本，比按画面猜靠谱。
+    """
+    if not names:
+        return None
+    for steam in _steam_homes(INSTALL_DIR.parent):
+        log = steam / "logs" / "console_log.txt"
+        try:
+            # 只读尾部：这个日志能到几十 MB，整份读进内存在掌机上太贵
+            size = log.stat().st_size
+            with log.open("rb") as f:
+                f.seek(max(0, size - 400_000))
+                tail = f.read().decode("utf-8", "replace")
+        except Exception:
+            continue
+        running: list[str] = []
+        for line in tail.splitlines():
+            m = re.search(r"AppID (\d+)", line)
+            if not m:
+                continue
+            appid = m.group(1)
+            if "Game process added" in line:
+                # 同一款重启一次会再 added 一遍，去重免得越堆越多
+                if appid in running:
+                    running.remove(appid)
+                running.append(appid)
+            elif "Game process removed" in line and appid in running:
+                running.remove(appid)
+        # 最新启动的那款优先：启动器可能带出两层进程
+        for appid in reversed(running):
+            if names.get(appid):
+                return appid, names[appid]
+    return None
+
+
 def _steam_homes(home: Path) -> list[Path]:
     """Steam 安装目录的候选位置
 
@@ -472,19 +513,26 @@ def _running_app_ids() -> list[str]:
     return ids
 
 
+
 def _current_game() -> dict:
-    """返回 {appid, name}，找不到就 name 为空"""
-    ids = _running_app_ids()
-    if not ids:
-        return {"appid": "", "name": ""}
+    """当前正在运行的游戏：{appid, name}，没在玩游戏就 name 为空
+
+    两条路取同一个事实，不是靠画面猜：
+    1. 进程环境变量里的 SteamAppId / STEAM_COMPAT_DATA_PATH —— Proton 游戏都带；
+    2. Steam 日志里的 "Game process added / removed" 账本 —— 原生 Linux 版和
+       启动器套娃那类没有第 1 条的，靠这条。
+    查到名字后由调用方写进提问，模型搜攻略就不会搜到同系列的别的作品。
+    """
     names = _app_names()
     # 同一个游戏会有好几个子进程，环境变量一致；取第一个能查到名字的。
-    # 非 Steam 游戏（库里那个十位编号）走的就是这条路：compatdata 目录名
+    # 非 Steam 游戏（库里那个十位编号）就走这条路：compatdata 目录名
     # 命中 shortcuts.vdf 的 appid，拿到的是用户在库里改过的 AppName。
-    for appid in ids:
+    for appid in _running_app_ids():
         if names.get(appid):
             return {"appid": appid, "name": names[appid]}
-    return {"appid": ids[0], "name": ""}
+    # 进程表里没有线索：用 Steam 自己的运行记录
+    appid, name = _steam_running_app(names) or ("", "")
+    return {"appid": appid, "name": name}
 
 
 # ---------- 身份与运行目录 ----------
@@ -1647,6 +1695,9 @@ class Plugin:
             # 设置区：语音播报开关（由后端 tts.enable 决定）与版本号（底部显示）
             "tts": bool(prefs.get("tts")),
             "version": str(prefs.get("version") or _PLUGIN_VERSION),
+            # 当前正在运行的游戏名：抓帧时会再查一次，这里给面板一个初值，
+            # 让用户按「截屏询问」之前就能看到这一问会带上哪款游戏
+            "game_name": (_current_game().get("name") or ""),
             # 虚拟手柄能不能用：设备节点在 + 进程有写权限
             "gamepad": os.access("/dev/uinput", os.W_OK) if os.path.exists("/dev/uinput") else False,
             # 本机鉴权状态：false 时前端只显示解锁框
@@ -1752,6 +1803,30 @@ class Plugin:
         if not r["ok"]:
             return {"ok": False, "error": r.get("error") or "后端没有接受这次修改"}
         return {"ok": True, "tts": bool((r.get("data") or {}).get("tts_enable"))}
+
+    async def get_ask_template(self, ticket: str = "") -> dict:
+        """读「截屏询问」的提示词模板（存在后端配置里，网页设置页改的也是这份）"""
+        _require(ticket, "get_ask_template")
+        cfg = _load_server_cfg()
+        r = await _core_http(int(cfg.get("port", 18765)),
+                             str(cfg.get("token", "") or "").strip(),
+                             "GET", "/api/ask-template")
+        if not r["ok"]:
+            return {"ok": False, "error": r.get("error") or "读取失败"}
+        data = r.get("data") or {}
+        return {"ok": True, "text": str(data.get("text") or ""),
+                "default": str(data.get("default") or "")}
+
+    async def set_ask_template(self, text: str, ticket: str = "") -> dict:
+        """改「截屏询问」的提示词模板：传空串表示恢复默认"""
+        _require(ticket, "set_ask_template")
+        cfg = _load_server_cfg()
+        r = await _core_http(int(cfg.get("port", 18765)),
+                             str(cfg.get("token", "") or "").strip(),
+                             "POST", "/api/ask-template", body={"text": text})
+        if not r["ok"]:
+            return {"ok": False, "error": r.get("error") or "后端没有接受这次修改"}
+        return {"ok": True, "text": str((r.get("data") or {}).get("text") or "")}
 
     async def screenshot(self, ticket: str = "", hide: bool = False) -> dict:
         """抓当前游戏画面

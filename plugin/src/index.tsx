@@ -27,6 +27,8 @@ type Status = {
   gamepad: boolean;
   // 设置区：语音播报（后端 tts.enable）
   tts: boolean;
+  // 当前正在运行的游戏名（后端从 Steam 进程/日志读出），没在玩时为空
+  game_name: string;
   // 底部显示：后端版本号，后端连不上时是插件自己的版本
   version: string;
   // 本机鉴权：false 时面板只显示解锁框
@@ -259,6 +261,12 @@ const PLUGIN_VERSION =
 // 长显会把整个面板撑开，用户也不用读它
 const SHOT_ASK_BRIEF = "看看这个，我该怎么做？";
 
+// 后端还没读到模板时用的兜底：和后端 DEFAULT_ASK_TEMPLATE 保持一致
+const DEFAULT_ASK_TPL =
+  "看我卡在哪一步，说说现在这个画面里我该做什么。需要的话先联网查一下这款游戏的攻略，" +
+  "再总结成几条可以直接照做的步骤，200 字以内。\n" +
+  "不要剧透：只讲眼前这一步怎么过，不要提前说后面的剧情、结局或其他关卡的解法。";
+
 export default definePlugin(() => ({
   name: "DeckMeido",
   titleView: <div>DeckMeido</div>,
@@ -288,6 +296,9 @@ function Content() {
   const [showSettings, setShowSettings] = useState(false);
   // 语音播报的实际值以后端为准：status 回来后同步过来，切换时先乐观更新
   const [tts, setTts] = useState(false);
+  // 「截屏询问」用的提示词模板，存在后端配置里（网页设置页改的也是这一份）
+  const [askTpl, setAskTpl] = useState("");
+  const [askTplEdit, setAskTplEdit] = useState("");
   // 本端最近一次抓到的画面（data: URL），只用于在面板里确认「刚才截到的是什么」
   const [shot, setShot] = useState<string>("");
   // 解锁：令牌输入框 + 后端给的票据（之后每次调用都要带上）
@@ -310,6 +321,8 @@ function Content() {
       // 票据以后端为准：面板重挂载后本地是空的，这里补回来；
       // 后端说没解锁（插件重启过、票据过期）就把本地那张丢掉
       setTicket(st.ticket || "");
+      // 模板跟着票据一起取：没解锁时后端会拒绝，取不到就保持空（不影响默认模板生效）
+      if (st.ticket) void loadAskTpl(st.ticket);
       return st;
     } catch (e: any) {
       const why = String(e?.message ?? e);
@@ -582,22 +595,49 @@ function Content() {
     }
   };
 
+  /** 读「截屏询问」模板：和网页设置页共用同一份后端配置 */
+  const loadAskTpl = async (tk: string) => {
+    try {
+      const r = (await call<[string], { ok: boolean; text?: string }>(
+        "get_ask_template",
+        tk
+      )) as { ok: boolean; text?: string };
+      if (r.ok && r.text) {
+        setAskTpl(r.text);
+        setAskTplEdit(r.text);
+      }
+    } catch {
+      /* 取不到就用后端默认模板，这里不打扰用户 */
+    }
+  };
+
+  /** 保存「截屏询问」模板：清空即恢复默认（后端负责判定） */
+  const saveAskTpl = async () => {
+    try {
+      const r = (await call<[string, string], { ok: boolean; text?: string; error?: string }>(
+        "set_ask_template",
+        askTplEdit,
+        ticket
+      )) as { ok: boolean; text?: string; error?: string };
+      if (!r.ok) throw new Error(r.error ?? "后端没有接受这次修改");
+      setAskTpl(r.text ?? "");
+      setAskTplEdit(r.text ?? "");
+      setError("");
+    } catch (e: any) {
+      setError(`提示词保存失败：${String(e?.message ?? e)}`);
+    }
+  };
+
   /**
    * 截屏询问：收面板 → 抓一帧当前画面 → 带图自动问 AI。
-   * 提问写死「看我卡在哪一步」，是因为这个按钮就是给「现在过不去了」用的，
-   * 用户不用描述场景，模型看画面更快；游戏名由后端从 Steam 取进提问里。
-   * 界面上只留一句「截图 · 看看这关怎么过」：完整提示词有一百多字，
-   * 长显会把整个面板撑开，用户也不用读它。
+   * 问什么由设置里的模板决定（默认就是「看我卡在哪一步…不要剧透」）；
+   * 正在玩哪款游戏由后端从 Steam 的进程/日志里读出来，拼在模板前面，
+   * 模型搜攻略时就不会搜到同系列的别的作品。
+   * 界面上只留一句短配文：完整提示词有一百多字，长显会把整个面板撑开。
    */
   const shotAsk = async () => {
     if (busyRef.current) return;
-    await runTurn(
-      "看我卡在哪一步，说说现在这个画面里我该做什么，需要的话先联网查一下最新攻略，" +
-        "再总结成几条可以直接照做的步骤，200 字以内。",
-      true,
-      true,
-      SHOT_ASK_BRIEF
-    );
+    await runTurn(askTpl || DEFAULT_ASK_TPL, true, true, SHOT_ASK_BRIEF);
   };
 
   /** 语音播报开关：先按用户点的显示，后端拒绝再翻回去并提示 */
@@ -713,11 +753,15 @@ function Content() {
         </div>
       </PanelSectionRow>
 
-      {/* 放在按钮上面：抓帧那一分钟面板是收着的，回来第一眼就该看见进度和取消 */}
+      {/* 放在按钮上面：抓帧那一分钟面板是收着的，回来第一眼就该看见进度和取消。
+          按钮下多留一点：它和下面的对话区之间原本只隔 row 的默认间距，
+          第一句话几乎贴着按钮，看着像挤在一起 */}
       <PanelSectionRow>
-        <ButtonItem layout="below" onClick={busy ? cancel : shotAsk}>
-          {busy ? `中断（${elapsed}s）` : "截屏询问"}
-        </ButtonItem>
+        <div style={{ paddingBottom: 6 }}>
+          <ButtonItem layout="below" onClick={busy ? cancel : shotAsk}>
+            {busy ? `中断（${elapsed}s）` : "截屏询问"}
+          </ButtonItem>
+        </div>
       </PanelSectionRow>
 
       {/* 后端没起来时把「启动」放在最显眼的位置：不改什么设置就能用 */}
@@ -754,7 +798,7 @@ function Content() {
       <PanelSectionRow>
         <Focusable
           ref={scrollRef as any}
-          style={{ maxHeight: 330, overflowY: "auto", display: "block" }}
+          style={{ maxHeight: 330, overflowY: "auto", display: "block", paddingTop: 6 }}
         >
           {streaming && (
             <div style={{ display: "flex", justifyContent: "flex-start", marginBottom: 4 }}>
@@ -832,12 +876,13 @@ function Content() {
       </PanelSectionRow>
 
       {/* 隔断：上面是可滚动的对话区，下面是输入区。没有这条线时，
-          消息滚到底会和「问问 Meido...」粘成一片，看不出哪块能滚 */}
+          消息滚到底会和「问问 Meido...」粘成一片，看不出哪块能滚。
+           上下各留 10px：紧贴着回复和输入框都显得挤 */}
       <div
         style={{
           height: 1,
           background: "rgba(255,255,255,.12)",
-          margin: "2px 0 8px",
+          margin: "10px 0 10px",
         }}
       />
 
@@ -896,6 +941,31 @@ function Content() {
               checked={tts}
               onChange={toggleTts}
             />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            {/* 「截屏询问」的提示词：默认就是「看我卡在哪一步…不要剧透，200 字以内」。
+                放在这里可以直接改，和网页设置页是同一份；清空保存即恢复默认 */}
+            <div style={{ fontSize: 10, color: DIM, marginBottom: 4 }}>
+              截屏询问的提示词{status?.game_name ? `（当前游戏：${status.game_name}）` : ""}
+            </div>
+            <TextField
+              value={askTplEdit}
+              onChange={(e) => setAskTplEdit(e.target.value)}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <div style={{ display: "flex", gap: 8, width: "100%" }}>
+              <div style={{ flex: "1 1 0", minWidth: 0 }}>
+                <ButtonItem layout="below" onClick={saveAskTpl}>
+                  保存提示词
+                </ButtonItem>
+              </div>
+              <div style={{ flex: "0 0 auto", minWidth: 0 }}>
+                <ButtonItem layout="below" onClick={() => setAskTplEdit(DEFAULT_ASK_TPL)}>
+                  恢复默认
+                </ButtonItem>
+              </div>
+            </div>
           </PanelSectionRow>
           <PanelSectionRow>
             <div style={{ fontSize: 10, color: DIM }}>

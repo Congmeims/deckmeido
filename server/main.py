@@ -144,6 +144,14 @@ llm = LLMClient(
 )
 
 PERSONA = CFG.get("persona", {})
+# 「截屏询问」的提示词模板。插件点按钮时会把这段连同当前画面发过来，
+# 所以模板本身放在配置里，用户可以在设置页随时改（例如换个问法、加一条自己的要求）。
+DEFAULT_ASK_TEMPLATE = (
+    "看我卡在哪一步，说说现在这个画面里我该做什么。需要的话先联网查一下这款游戏的攻略，\n"
+    "再总结成几条可以直接照做的步骤，200 字以内。\n"
+    "不要剧透：只讲眼前这一步怎么过，不要提前说后面的剧情、结局或其他关卡的解法。"
+)
+ASK_TEMPLATE = str(CFG.get("agent", {}).get("ask_template") or "").strip() or DEFAULT_ASK_TEMPLATE
 # 单轮最多几轮工具往返。以前默认 0 = 不限，模型一旦陷进「截图 → 没看懂 → 再截图」
 # 这种循环就会一直跑下去，只能靠用户点终止。给一个够用的上限，
 # 到顶时按既有逻辑补一句「到了单轮上限」，把控制权交回用户。
@@ -478,12 +486,14 @@ tts = TTS(
 
 def apply_config(cfg: dict):
     """热更新运行配置（LLM / TTS / 权限模式 / 访问令牌），无需重启"""
-    global CFG, TOKEN, PERMISSION_MODE, PERSONA, SYSTEM_PROMPT, MAX_TOOL_ROUNDS
+    global CFG, TOKEN, PERMISSION_MODE, PERSONA, SYSTEM_PROMPT, MAX_TOOL_ROUNDS, ASK_TEMPLATE
     CFG = cfg
     PERSONA = cfg.get("persona", {})
     TOKEN = (cfg["server"].get("token") or TOKEN).strip().lower()
     MAX_TOOL_ROUNDS = (int(cfg.get("agent", {}).get("max_tool_rounds", 0))
                        or DEFAULT_MAX_TOOL_ROUNDS)
+    ASK_TEMPLATE = (str(cfg.get("agent", {}).get("ask_template") or "").strip()
+                    or DEFAULT_ASK_TEMPLATE)
     c = cfg["llm"]
     llm.base_url = c["base_url"].rstrip("/")
     llm.api_key = c["api_key"]
@@ -1486,6 +1496,13 @@ class ConfigUpdate(BaseModel):
     persona_ending: str | None = None
     persona_suffix: str | None = None
     persona_forbid: str | None = None
+    # 「截屏询问」提示词模板：空字符串表示恢复默认
+    ask_template: str | None = None
+
+
+class AskTemplateUpdate(BaseModel):
+    # 空 / 全空白表示恢复默认模板
+    text: str = ""
 
 
 def _mask_key(key: str) -> str:
@@ -1527,6 +1544,9 @@ async def api_get_config():
         "persona_suffix": (PERSONA.get("style") or {}).get("suffix", ""),
         # 禁用词列表在界面上是一行、用逗号隔开
         "persona_forbid": "，".join((PERSONA.get("style") or {}).get("forbid") or []),
+        # 「截屏询问」的提示词模板：插件设置区里可以直接改
+        "ask_template": ASK_TEMPLATE,
+        "ask_template_default": DEFAULT_ASK_TEMPLATE,
     }
 
 
@@ -1597,6 +1617,11 @@ async def api_set_config(req: ConfigUpdate):
         updates["security"] = {"permission_mode": req.permission_mode}
     if req.workspace is not None and req.workspace.strip():
         updates["workspace"] = {"dir": req.workspace.strip()}
+    if req.ask_template is not None:
+        # 清空即恢复默认：模板是「截屏询问」唯一的提问来源，
+        # 留成空串会让这个按钮发不出去任何内容
+        tpl = req.ask_template.strip() or DEFAULT_ASK_TEMPLATE
+        updates.setdefault("agent", {})["ask_template"] = tpl
     if req.persona_name is not None:
         # 人设走设置页写入，用户不需要（也不该被迫）去改 config.toml。
         # 留空就写回默认值，避免空串把人设搞没。
@@ -1642,6 +1667,23 @@ async def api_set_tts(enabled: bool = Query(...)):
     """
     update_config({"tts": {"enable": bool(enabled)}})
     return {"ok": True, "tts_enable": tts.enable}
+
+
+@app.get("/api/ask-template", dependencies=[Depends(check_token)])
+async def api_get_ask_template():
+    """「截屏询问」提示词模板：插件面板展开设置区时读一次"""
+    return {"ok": True, "text": ASK_TEMPLATE, "default": DEFAULT_ASK_TEMPLATE}
+
+
+@app.post("/api/ask-template", dependencies=[Depends(check_token_any)])
+async def api_set_ask_template(req: AskTemplateUpdate):
+    """改「截屏询问」提示词模板：空 / 全空白表示恢复默认
+
+    模板只影响下一次点「截屏询问」，已经发出的那一轮不受影响。
+    """
+    tpl = req.text.strip() or DEFAULT_ASK_TEMPLATE
+    update_config({"agent": {"ask_template": tpl}})
+    return {"ok": True, "text": ASK_TEMPLATE}
 
 
 # ---------- 版本与升级 ----------
@@ -2875,6 +2917,13 @@ async def run_agent(events: list[dict], extra_system: str = "",
         # 它挑错图回答。这时把截图工具从这一轮的清单里摘掉
         round_tools = tools.TOOLS if image_part is None else [
             t for t in tools.TOOLS if t["function"]["name"] != "screenshot"]
+        # 带图提问是「一问一答」：模型答完通常会顺手再截一张确认，于是又对着
+        # 新画面续一轮，用户看到的是一条提问连着好几张图和好几段回答。
+        # 所以带图这轮答完正文就直接收工，不再继续跑工具轮
+        if image_part is not None:
+            extra_system = (extra_system + "\n" if extra_system else "") + (
+                "本轮是带着用户给的画面提问的：直接根据这张画面回答即可。"
+                "画面就这一张，不要再截图，答完即止。")
         while MAX_TOOL_ROUNDS <= 0 or round_no < MAX_TOOL_ROUNDS:
             round_no += 1
             # 单轮里工具往返也会堆积上下文，超过阈值就先压缩再继续。
@@ -2946,6 +2995,28 @@ async def run_agent(events: list[dict], extra_system: str = "",
                             "要我接着写就说「继续」。）")
                     return (body + note) if body else note.strip()
                 return msg.get("content") or "（没有回复内容）"
+
+            # 带图这轮只答一次：模型拿到工具结果后常常再截一张确认，
+            # 于是又对着新画面续一轮，用户看到一条提问连着好几张图和好几段回答。
+            # 所以带上图提问时，答完第一段正文就收工
+            if image_part is not None and "".join(stream_text).strip():
+                return "".join(stream_text).strip()
+
+            # 动屏幕的工具一律不给：带图这轮只要「看图说怎么办」，动手会换掉
+            # 用户截图时的画面，答的内容也就对不上他看到的那一帧了
+            if image_part is not None:
+                dropped = [t["function"]["name"] for t in tool_calls
+                           if tools.touches_screen(t["function"]["name"])]
+                if len(dropped) == len(tool_calls):
+                    # 整批都是屏幕操作：连同模型那句「我先截个图」一起作废，
+                    # 让它直接按已有画面作答，界面上不留一次空工具调用
+                    stream_text.clear()
+                    msgs.append({"role": "assistant", "content": msg.get("content") or ""})
+                    msgs.append({"role": "user", "content":
+                                 "（不用截图也不用操作屏幕，直接根据上面那张画面回答。）"})
+                    continue
+                tool_calls = [c for c in tool_calls
+                              if not tools.touches_screen(c["function"]["name"])]
 
             # 有工具调用：本轮流式输出的内容是中间话，最终答复会重新流式。
             # 但用户屏幕上已经看到了，必须以 text 事件留在 events 里，
