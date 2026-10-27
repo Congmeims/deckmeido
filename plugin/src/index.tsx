@@ -249,6 +249,12 @@ function Md({ text, align }: { text: string; align?: "left" | "right" }) {
   );
 }
 
+// 插件自己的版本号。构建时由 rollup 的 replace 从 package.json 注进来；
+// 要求与主程序的 VERSION 保持一致（发布时一起改）
+declare const __PLUGIN_VERSION__: string;
+const PLUGIN_VERSION =
+  typeof __PLUGIN_VERSION__ === "string" ? __PLUGIN_VERSION__ : "—";
+
 // 来源标记。QAM 只有 ~300px 宽，四个端统一用两个字：
 // 电脑（PC 浏览器）/ 手机（手机浏览器）/ 掌机（Deck 上的桌面客户端）/ 插件（QAM）
 const CLIENT_LABEL: Record<string, string> = {
@@ -846,6 +852,16 @@ function Content() {
         </Focusable>
       </PanelSectionRow>
 
+      {/* 隔断：上面是可滚动的对话区，下面是输入区。没有这条线时，
+          消息滚到底会和「问点什么」粘成一片，看不出哪块能滚 */}
+      <div
+        style={{
+          height: 1,
+          background: "rgba(255,255,255,.12)",
+          margin: "2px 0 8px",
+        }}
+      />
+
       <PanelSectionRow>
         {/* 提示语做输入框里的占位符：外面再挂一行标签会白占一行高度 */}
         <TextField
@@ -861,24 +877,25 @@ function Content() {
         </ButtonItem>
       </PanelSectionRow>
 
-      {/* 聊歪了、或者想从头问另一件事时换一头。后端受理后会向所有端广播新会话，
-          这里不用手动清空对话列表。放在「设置」上面：换会话是常用操作，
-          不应该藏在设置按钮下面 */}
-      {status?.core_ok && !busy && (
-        <PanelSectionRow>
-          <ButtonItem layout="below" onClick={newSession} disabled={newing}>
-            {newing ? "正在新建…" : "新会话"}
-          </ButtonItem>
-        </PanelSectionRow>
-      )}
-
-      {/* 设置默认收起：QAM 里平时只想要「问一句 / 看一眼」，太长会挡住对话 */}
+      {/* 「新会话」和「设置」并排一行：两枚都是低频按钮，各占一行太浪费面板高度。
+          新会话要靠后端的 history 广播才能用，core 没连上时只留设置 */}
       <PanelSectionRow>
-        <ButtonItem layout="below" onClick={() => setShowSettings((v) => !v)}>
+        <div style={{ display: "flex", gap: 8 }}>
+          {status?.core_ok && !busy && (
+            <div style={{ flex: 1 }}>
+              <ButtonItem layout="below" onClick={newSession} disabled={newing}>
+                {newing ? "正在新建…" : "新会话"}
+              </ButtonItem>
+            </div>
+          )}
           {/* 文案固定为「设置」：上下三角一进一出会把按钮宽度撑得跳来跳去，
               展开与否看下面的设置项本身更直观 */}
-          设置
-        </ButtonItem>
+          <div style={{ flex: 1 }}>
+            <ButtonItem layout="below" onClick={() => setShowSettings((v) => !v)}>
+              设置
+            </ButtonItem>
+          </div>
+        </div>
       </PanelSectionRow>
 
       {showSettings && (
@@ -908,10 +925,12 @@ function Content() {
         </>
       )}
 
-      {/* 底部版本号：居中一行，版本取后端 /api/config，连不上时是插件自己的 */}
+      {/* 底部版本号：主程序版本在前，插件自己的在后。
+          两边版本号要求一致（都是 package.json / VERSION 里的那一版），
+          不一致时会一眼看出来，省得怀疑装错了包 */}
       <PanelSectionRow>
         <div style={{ fontSize: 10, color: DIM, textAlign: "center" }}>
-          v{status?.version || "—"}
+          v{status?.version || "—"} · 插件 {PLUGIN_VERSION}
         </div>
       </PanelSectionRow>
     </PanelSection>

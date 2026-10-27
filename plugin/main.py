@@ -66,7 +66,7 @@ CONFIG_PATH = INSTALL_DIR / "server" / "config.toml"
 
 # 面板底部显示版本号：优先用后端 config 里报的版本（和网页设置页一致），
 # 后端连不上时退回插件自己的 package.json
-_PLUGIN_VERSION = "0.1.0"
+_PLUGIN_VERSION = "0.2.0"
 try:
     _pkg = json.loads((Path(__file__).resolve().parent / "package.json").read_text(encoding="utf-8"))
     _PLUGIN_VERSION = str(_pkg.get("version") or _PLUGIN_VERSION)
