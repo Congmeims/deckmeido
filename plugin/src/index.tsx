@@ -425,9 +425,12 @@ function Content() {
   };
 
   /**
-   * 收拾完面板再开回来。OpenQuickAccessMenu() 不带参时会按「上一次停留的
-   * 那一层」恢复，截屏这一路刚 CloseSideMenus 过，回来常常落到通知中心而不是 Decky，
-   * 所以这里显式指定 QAM 并给出要跳到的标签页，保证回到插件自己的界面。
+   * 收拾完面板再开回来。
+   *
+   * 不带参的 OpenQuickAccessMenu() 是按「上一次停留的那一层」恢复的：截屏这一路
+   * 刚 CloseSideMenus 过，很多时候回来就落在通知中心。OpenQuickAccessMenu 的第一个
+   * 参数是标签页序号，Decky 的标签在最前面，所以固定传 1，再把路由压到 /decky
+   * 兜底。两个动作之间要留出面板重新挂载的时间，早了会被 QAM 的入场动画覆盖。
    */
   const restoreQam = () => {
     try {
@@ -442,7 +445,7 @@ function Content() {
       } catch {
         // 老版本 Decky 没有这个路由，保持默认页即可
       }
-    }, 250);
+    }, 600);
   };
 
   /**
@@ -473,11 +476,12 @@ function Content() {
       let game: { appid?: string; name?: string } | null = null;
       if (grab) {
         // 先收面板：CloseSideMenus 走的是 Steam 的 MenuStore，等于替用户按了
-        // 一次「关闭侧栏」，和按 B 不是一回事（B 在菜单里是「回上一级」）。
-        // 必须等这一帧真的画完再抓，否则抓到的还是「游戏 + QAM」的合成画面，
-        // 和收起动画赛跑是没有意义的。
+        // 一次「关闭侧栏」（按 B 只是回上一级，面板还开着）。
+        // 这一下要等的东西不止收起动画：侧栏滑走后 Steam 还要重绘一帧游戏画面，
+        // 而 pipewiresrc 抓的是合成结果，抢在前面就会把正在消失的侧栏、甚至侧栏
+        // 切走时闪过的通知页一起拍进来。所以这里放宽到 1.2s，后端还会再等一次。
         if (hideQam) Navigation.CloseSideMenus();
-        if (hideQam) await new Promise((r) => setTimeout(r, 550));
+        if (hideQam) await new Promise((r) => setTimeout(r, 1200));
         const snap = (await call<
           [string, boolean],
           { ok: boolean; image?: string; error?: string; game?: { appid?: string; name?: string } }

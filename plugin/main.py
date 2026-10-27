@@ -593,8 +593,13 @@ async def _capture_once(node: str, gst: str, timeout: int = 25) -> tuple[bool, s
         _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         if not tmp.exists() or tmp.stat().st_size < 10000:
             detail = (err or b"").decode("utf-8", "replace").strip()[-300:]
+            decky.logger.warning(f"抓帧没拿到有效画面：{detail or '文件为空'}")
             return False, f"抓帧没拿到有效画面{('：' + detail) if detail else ''}"
-        return True, base64.b64encode(tmp.read_bytes()).decode("ascii")
+        size = tmp.stat().st_size
+        data = base64.b64encode(tmp.read_bytes()).decode("ascii")
+        # 日志里带上大小：前端拿到图却没显示时，先看这一条就知道是没抓到还是没渲染
+        decky.logger.info(f"抓帧成功：{size} 字节")
+        return True, data
     except asyncio.TimeoutError:
         return False, f"抓帧超时（{timeout}s）"
     except Exception as exc:
@@ -1499,16 +1504,18 @@ class Plugin:
     async def screenshot(self, ticket: str = "", hide: bool = False) -> dict:
         """抓当前游戏画面
 
-        hide=True 时抓帧前留一段空档，让前端先收起 QAM：gamescope 的 pipewiresrc
-        抓的是合成后的画面，QAM 面板本身也在里面，不收起来就只能拍到半屏游戏。
-        菜单收起的动画大约 200ms，这里给 450ms 再抓。
+        hide=True 时前端会先把 QAM 收起来：gamescope 的 pipewiresrc 抓的是
+        合成后的画面，QAM 面板本身也在里面。收面板到真正抓帧之间要留够时间
+        —— 面板的收起动画加一次重绘接近 1 秒，短了抓到的还是「游戏 + 侧栏」，
+        甚至抓到侧栏正在切走的通知页。
         """
         _require(ticket, "screenshot")
-        if hide:
-            await asyncio.sleep(0.45)
         # 和抓帧一起把当前游戏的 appid/名字带回去：查攻略时要拼进提示词，
-        # 单独再开一次接口既慢又容易和画面错位
+        # 单独再开一次接口既慢又容易和画面错位。这一项要读 vdf、翻进程表，
+        # 放在等画面之前做，省下来的时间正好也留给侧栏收干净。
         game = await asyncio.to_thread(_current_game)
+        if hide:
+            await asyncio.sleep(1.2)
         ok, payload = await grab_screenshot()
         if ok:
             return {"ok": True, "image": payload, "game": game}
