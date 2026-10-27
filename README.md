@@ -306,7 +306,7 @@ deckmeido/
 
 ### 游戏模式
 
-- ~~**Decky 插件载体**~~ — 已做：`plugin/` 是独立 Decky 插件，`plugin/deploy.sh` 装到 `~/homebrew/plugins`（目录属 `root:root`，需要 sudo，或建软链接指向 `~/deckmeido/plugin`）。QAM 面板里能对话、看流式回答、点虚拟手柄
+- ~~**Decky 插件载体**~~ — 已做：`plugin/` 是独立 Decky 插件，`plugin/deploy.sh` 装到 `~/homebrew/plugins`（目录属 `root:root`，需要 sudo，或建软链接指向 `~/deckmeido/plugin`）。QAM 面板里能对话、看各端流式回答，「截屏询问」一键带图问（手柄键位区已删，改由模型调 `gamepad` 工具）
 - ~~**游戏内截帧**~~ — 已做：`pw-dump` 找到 `node.name=gamescope` 且 `media.class=Video/Source` 的节点，`gst-launch-1.0` 抓帧。踩过两个坑：① root 跑时要 `runuser -u deck` 降权，`XDG_RUNTIME_DIR` 必须指向 `/run/user/1000`；② `pipewiresrc path=N num-buffers=6` 必须拆成独立 argv token，整段塞一个 token 会让 gst 报 `syntax error` 并静默降级成纯文本
 - ~~**虚拟手柄**~~ — 已做：`plugin` 侧 `_Gamepad` 走 `/dev/uinput`，ABXY / 十字键 / 摇杆可用；`deck` 用户对 `/dev/uinput` 有 ACL（`user:deck:rw-`）
 - ~~**手柄补全 Xbox 布局**~~ — 已做：在 `guide` 之外补齐 `lt`/`rt`（`ABS_Z`/`ABS_RZ`，`trigger` 动作给 0..1 力度，`press`/`hold` 等于一踩到底）、`l3`/`r3`（`BTN_THUMBL`/`BTN_THUMBR`）、右摇杆（`ABS_RX`/`ABS_RY`，`stick` 加 `side=right`）、`share`（`KEY_RECORD` 0xA7，Series X|S 才有，部分驱动/游戏不认）。`release` 除摇杆回中外还会松开仍踩着的扳机，避免「松开后车还在开」
@@ -317,7 +317,14 @@ deckmeido/
   - 令牌优先级：环境变量 `DECKMEIDO_QAM_TOKEN` > 插件设置目录 `plugin.toml` 的 `[plugin] qam_token` > **默认 `meido`**（与后端 `config.example.toml` 默认值一致，用户只需记一个）
   - 解锁后发 32 字节随机票据，落盘到 `decky.DECKY_PLUGIN_SETTINGS_DIR/qam_session.json`（目录 `0700`、文件 `0600`），12 小时有效，Decky 重启不用重输；`lock` 与插件卸载都会删掉它
   - 令牌比较走 `hmac.compare_digest`（先各自 sha256 成定长再比），连续错 5 次冷却 30 秒，避免 4 位级令牌被脚本穷举
-  - 前端：未解锁时 QAM 只渲染解锁框（输入令牌 → 解锁），解锁后才显示提问区与手柄区，底部有「锁定（退出解锁）」
+  - 前端：未解锁时 QAM 只渲染解锁框（输入令牌 → 解锁），解锁后才显示提问区，底部有「锁定（退出解锁）」
+- ~~**QAM 面板改成以对话为主**~~ — 已做：面板从上到下依次是「状态双行 →『截屏询问』→ 全部端的对话 → 打字输入框 →『发送』→『带画面询问』开关 →『锁定』」。原来那四排测试用的手柄按键区已删掉（虚拟手柄仍由模型通过 `gamepad` 工具调用）
+  - 状态第一行：`自动截图可用` / `自动截图不可用（原因）` + `女仆核心 正常` / `女仆核心 异常`（异常标红）；第二行 `192.168.x.x:18765`，别的设备照这个地址连。IP 用 UDP `connect(8.8.8.8)` 取默认出口地址，核心状态直接问 `/api/status`
+  - 「截屏询问」：收起 QAM → 抓帧 → 带图自动问「看我卡在哪一步」，游戏名由后端从 Steam 取进提问里
+  - 对话区显示**所有端**的提问与回复（客户端 / PC网页端 / 插件端 / 手机网页端 各有角标），数据来自后端已有的 `user_message` / `assistant_message` 广播和连上时的 `history` 快照；随图那条多模态消息不进面板
+  - 来源标记现在问答两侧都带（`handle_chat` 把 `client` 同时写进 user 与 assistant 的历史和广播），老数据没有该字段时退回「最近一条提问的来源」
+  - 插件侧 `_THREAD` 聚合 + `_LAST_THREAD` 快照：Decky 是先渲染面板后挂监听，`history` 那条 thread 可能早于首帧，所以前端挂好监听后调 `ready()` 补发一次；本端提问不等回声先落一条（ts=0），后端回声按「角色+正文」把它替换成带真实 ts 的那条
+  - 待真机确认：`ready()` 补发能否覆盖 Decky 重挂监听的时机；助手回复的来源在新旧会话混排时是否标对
   - 已验证：13 项（默认令牌、8 个受保护方法在未解锁时全部拒绝、大小写无关、票据落盘、错票据拒绝、盘上恢复、过期失效、lock 清除、连续失败冷却、环境变量覆盖）
 - **远程控制** — 让局域网设备通过 HTTP 注入按键与触摸，实现「远程下一句指令，agent 代为操作」。路线已确认：`ydotool`（键鼠，`ydotoold` 已在跑）+ `/dev/uinput`（手柄，`deck` 已在 `input` 组且设备可写）；decky-flow 的 EIS 桥是本机 Unix socket 而非网桥，这一层可以省掉
   - 前置：**先做网络鉴权**。`:18765` 目前无 token 监听 `0.0.0.0`，等于把「可执行命令」的入口开放给整个局域网

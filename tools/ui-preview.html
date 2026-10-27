@@ -61,8 +61,9 @@
   /* PanelSectionRow：每行之间有 8px 间距 */
   .row + .row{margin-top:8px}
 
-  /* 状态行（10px 灰字） */
+  /* 状态行（10px 灰字，两行：可用性 / ip:port） */
   .status{font-size:10px;color:var(--dim);line-height:1.5}
+  .status .bad{color:var(--err)}
 
   /* TextField：Steam 的输入框是浅色底、深色字 */
   .field{background:rgba(255,255,255,.9);border-radius:3px;padding:6px 8px;color:#111}
@@ -88,14 +89,8 @@
   .btn.primary{background:rgba(90,169,230,.22);border-color:rgba(90,169,230,.55)}
   .btn.on{border-color:#fff;background:rgba(255,255,255,.16)}
 
-  /* 手柄键位：flex 等分，4px 间隔 */
-  .padlbl{font-size:10px;color:var(--dim);margin:2px 0 2px}
-  .pad{display:flex;gap:4px}
-  .pad .k{
-    flex:1;text-align:center;padding:10px 0;font-size:13px;
-    border-radius:4px;border:1px solid var(--line);background:var(--fill);
-  }
-  .pad .k.on{border-color:#fff}
+  /* 对话区：最高 330px 滚动 */
+  .thread{max-height:330px;overflow:hidden}
 
   /* 对话记录：用户灰底、助手左侧蓝线 */
   .card{
@@ -104,11 +99,13 @@
   }
   .card.user{background:rgba(255,255,255,.06)}
   .card.ai{border-left:2px solid transparent;border-left-color:var(--accent)}
+  .card .src{font-size:9px;color:var(--dim);margin-bottom:2px}
   .card .h{font-weight:700;font-size:12.5px;color:#fff;margin:6px 0 3px}
   .card ol,.card ul{margin:3px 0;padding-left:18px}
   .card li{margin:1px 0}
   .card code{background:rgba(255,255,255,.1);border-radius:3px;padding:0 3px;font-size:11px}
   .card .err{color:var(--err);background:rgba(224,108,117,.1)}
+  .card.empty{color:var(--dim)}
 
   /* 解锁态：只有输入框和按钮 */
   .locked .sec{padding:12px 10px}
@@ -147,57 +144,17 @@
       <div class="sec">
         <div class="title">DeckMeido</div>
 
-        <div class="row"><div class="status">游戏模式抓帧可用 · 端口 18765 · 转发 直连</div></div>
-
         <div class="row">
-          <div class="field">
-            <div class="lbl">问点什么</div>
-            <div class="val ph">问点什么</div>
+          <div class="status">
+            <div>自动截图可用 · 女仆核心 正常</div>
+            <div>192.168.2.109:18765</div>
           </div>
         </div>
 
-        <div class="row">
-          <div class="toggle">
-            <div class="tg"></div>
-            <div>
-              <div class="txt">带画面提问</div>
-              <div class="desc">抓当前游戏画面一起发给 AI；抓不到时这一轮自动退回纯文字</div>
-            </div>
-          </div>
-        </div>
+        <div class="row"><div class="btn primary">截屏询问</div></div>
 
-        <div class="row"><div class="btn">查攻略（看当前画面）</div></div>
-        <div class="row"><div class="btn primary">问 AI</div></div>
-
-        <div class="row"><div class="padlbl">模拟手柄按键（发给前台游戏）</div></div>
-
-        <div class="row">
-          <div class="pad">
-            <div class="k">Y</div><div class="k">X</div><div class="k">B</div><div class="k">A</div>
-          </div>
-        </div>
-        <div class="row">
-          <div class="pad">
-            <div class="k">LB</div><div class="k">RB</div><div class="k">LT</div><div class="k">RT</div>
-          </div>
-        </div>
-        <div class="row">
-          <div class="pad">
-            <div class="k">L3</div><div class="k">R3</div><div class="k">≡</div>
-            <div class="k">◱</div><div class="k">Xbox</div><div class="k">分享</div>
-          </div>
-        </div>
-        <div class="row">
-          <div class="pad">
-            <div class="k">↑</div><div class="k">↓</div><div class="k">←</div><div class="k">→</div>
-          </div>
-        </div>
-
-        <div class="row"><div class="btn">清空这段对话记录</div></div>
-        <div class="row"><div class="btn">锁定（退出解锁）</div></div>
-
-        <div class="row">
-          <div class="card user">这个 Boss 第二阶段怎么打</div>
+        <div class="row thread">
+          <div class="card user"><div class="src">客户端</div>这个 Boss 第二阶段怎么打</div>
           <div class="card ai">
             <div class="h">第二阶段：火焰阶段</div>
             <ol>
@@ -207,13 +164,32 @@
             </ol>
             别急着喝药，等它转身再喝。
           </div>
-          <div class="card user">打不过，换武器有用吗</div>
-          <div class="card ai">有用。这阶段火抗高，换成物理伤害的…<span style="color:var(--dim)">▍</span></div>
+          <div class="card user"><div class="src">手机网页端</div>打不过，换武器有用吗</div>
+          <div class="card ai"><div class="src">手机网页端</div>有用。这阶段火抗高，换成物理伤害的…</div>
+          <div class="card user"><div class="src">插件端</div>看我卡在哪一步</div>
+          <div class="card ai"><div class="src">插件端</div>你现在站在第二根柱子旁，先清掉…<span style="color:var(--dim)">▍</span></div>
         </div>
 
         <div class="row">
-          <div class="card err" style="margin-bottom:0">截图失败：pipewire 源不可用</div>
+          <div class="field">
+            <div class="lbl">问点什么</div>
+            <div class="val ph">问点什么</div>
+          </div>
         </div>
+
+        <div class="row"><div class="btn">发送</div></div>
+
+        <div class="row">
+          <div class="toggle">
+            <div class="tg"></div>
+            <div>
+              <div class="txt">带画面询问</div>
+              <div class="desc">发送时抓当前游戏画面一起发给 AI；抓不到时这一轮自动退回纯文字</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="row"><div class="btn">锁定（退出解锁）</div></div>
       </div>
     </div>
   </div>
@@ -222,10 +198,10 @@
     <h2>对照要点</h2>
     <ul>
       <li><span class="sw" style="background:#23262c"></span>整块 <code>PanelSection</code> 是深灰卡片，标题小号大写。</li>
-      <li>状态行只有 10px，抓帧不可用时这里显示 <code>capture_reason</code>。</li>
-      <li>「问 AI」是主动作，其余按钮同宽同高，方便手柄逐格移动。</li>
-      <li>手柄键位 4 排：ABXY / 肩键 / 摇杆键 / 方向键；<code>/dev/uinput</code> 不可用时整片变暗到 40%。</li>
-      <li>对话区最高 260px 滚动，用户灰底，助手只留左侧 2px 蓝线。</li>
+      <li>状态两行：第一行「自动截图可用/不可用 · 女仆核心 正常/异常」，第二行「设备 IP:端口」。</li>
+      <li>「截屏询问」是主动作：收面板 → 抓帧 → 带图自动问 AI，忙时变成「中断（Ns）」。</li>
+      <li>对话紧跟在按钮下方，最高 330px 滚动；所有端的提问与回复都在这里，问答两侧都带来源角标（客户端 / PC网页端 / 手机网页端 / 插件端）。</li>
+      <li>对话下方才是输入框、「发送」和「带画面询问」开关。</li>
       <li>AI 回复按 markdown 渲染：标题加粗、有序列表缩进 18px、行内码浅底。</li>
     </ul>
 

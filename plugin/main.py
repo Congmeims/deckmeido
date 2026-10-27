@@ -883,8 +883,9 @@ _GAMEPAD = _Gamepad()
 class _RawWSClient:
     """不依赖 websockets 库的最小客户端（只要文本帧，够后端用）"""
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, user_agent: str = ""):
         self.url = url
+        self.user_agent = user_agent
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._buf = b""
@@ -906,8 +907,8 @@ class _RawWSClient:
             f"Sec-WebSocket-Key: {key}\r\n"
             "Sec-WebSocket-Version: 13\r\n"
             f"Origin: http://{host}:{port}\r\n"
-            "\r\n"
-        )
+            + (f"User-Agent: {self.user_agent}\r\n" if self.user_agent else "")
+        ) + "\r\n"
         self._writer.write(req.encode())
         await self._writer.drain()
         head = await self._reader.readuntil(b"\r\n\r\n")
@@ -1034,21 +1035,27 @@ def _frame(opcode: int, payload: bytes, mask: bool = True) -> bytes:
 
 
 class _Backend:
-    """一条连到后端的常驻 ws，用来转发对话"""
+    """一条连到后端的常驻 ws。
+
+    只用来「发」：每一轮带 turn_id 发出去，订阅由 _TailWS 单独负责。
+    """
 
     def __init__(self, url: str):
         self.url = url
         self._impl = None
         self._send_lock = asyncio.Lock()
-        self.sid = ""
 
     async def open(self):
+        # 后端用 UA 判断「这条连接是网页还是手机」，插件不声明就会被当成一个
+        # 额外的网页端，界面上白多出一栏来源。标成 QAM 才认得出是谁
+        hdr = {"User-Agent": "DeckMeido-QAM/1.0"}
         if _ws_connect is not None:
             self._impl = await _ws_connect(
-                self.url, max_size=32 * 1024 * 1024, open_timeout=10
+                self.url, max_size=32 * 1024 * 1024, open_timeout=10,
+                additional_headers=hdr,
             )
         else:
-            self._impl = await _RawWSClient(self.url).__aenter__()
+            self._impl = await _RawWSClient(self.url, user_agent=hdr["User-Agent"]).__aenter__()
 
     async def recv(self) -> str:
         msg = await self._impl.recv()
@@ -1074,6 +1081,59 @@ _READER: asyncio.Task | None = None
 _ACC = ""            # 本轮已收到的增量正文
 _LAST_REPLY = ""     # 本轮确定下来的完整正文
 _FINAL_EVENT = asyncio.Event()
+# 面板展示的对话：所有端的提问和回复，{role, text, client, ts}
+_THREAD: list[dict] = []
+_THREAD_MAX = 200     # 只留最近这么多条，再往前翻也用不上
+# 最近一次推给面板的 thread 快照，等界面 ready 时补发（见 _emit）
+_LAST_THREAD: dict | None = None
+# 面板展示的来源标记，和后端、网页端的叫法保持一致
+_CLIENT_LABEL = {"web": "网页", "mobile": "手机", "client": "客户端", "qam": "插件"}
+
+
+def _push_thread(item: dict):
+    """追加一条并推给面板。
+
+    user_message 的 ts 在历史里唯一，重复推送（重连后补发）按 ts 去掉。
+    """
+    ts = float(item.get("ts") or 0)
+    for m in (_THREAD[-8:] if ts else []):
+        if m.get("role") == item["role"] and abs(float(m.get("ts") or 0) - ts) < 1e-6:
+            return
+    # ts 为 0 的是「本地先落、还没拿到后端时间戳」的那条（见 start_turn）：
+    # 后端回声在 ts 上对不上，按角色+正文把本地占位换掉
+    if ts:
+        for m in reversed(_THREAD[-8:]):
+            if (m.get("role") == item["role"] and not float(m.get("ts") or 0)
+                    and str(m.get("text") or "") == str(item.get("text") or "")):
+                m.update(item)
+                _emit({"kind": "thread", "items": _THREAD})
+                return
+    _THREAD.append(item)
+    if len(_THREAD) > _THREAD_MAX:
+        del _THREAD[: len(_THREAD) - _THREAD_MAX]
+    _emit({"kind": "thread", "items": _THREAD})
+
+
+def _sync_thread(hist: list):
+    """用后端给的完整历史对齐本地列表（连上时、别的端改会话时）
+
+    只看文本消息：随图那条多模态消息（content 是数组）不进面板。
+    """
+    out = []
+    for m in hist:
+        if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            continue
+        out.append({
+            "role": m["role"],
+            "text": str(content or ""),
+            "client": str(m.get("client") or ""),
+            "ts": float(m.get("ts") or 0),
+        })
+    _THREAD[:] = out[-_THREAD_MAX:]
+    _emit({"kind": "thread", "items": _THREAD})
 
 
 def _backend_url(port: int, token: str) -> str:
@@ -1081,7 +1141,15 @@ def _backend_url(port: int, token: str) -> str:
 
 
 def _emit(msg: dict):
-    """把一条消息推给 QAM（前端 addEventListener("deckmeido_delta")）"""
+    """把一条消息推给 QAM（前端 addEventListener("deckmeido_delta")）
+
+    界面可能比面板开关得晚（Decky 在面板首帧之后才挂监听），后端连得早时
+    history 那一条 thread 会落空，所以这里顺手留一份最新快照，等面板调
+    ready() 再补发。
+    """
+    global _LAST_THREAD
+    if msg.get("kind") == "thread":
+        _LAST_THREAD = msg
     try:
         decky.emit("deckmeido_delta", msg)
     except Exception as exc:
@@ -1103,7 +1171,11 @@ def _finalize(cancelled: bool = False):
 
 
 async def _read_loop(bk: _Backend):
-    """常驻读：history 里拿 sid，之后只转发本轮的消息"""
+    """常驻读：history 对齐列表，之后所有端（客户端/网页/手机/插件）的消息都进面板
+
+    后端把用户提问和助手回复广播给每一条 ws 连接，所以这里能拿到别的端的对话。
+    本端发出去的那一轮还要额外走 delta / final，把那几十秒的流式过程显示出来。
+    """
     global _ACC
     while True:
         try:
@@ -1118,15 +1190,47 @@ async def _read_loop(bk: _Backend):
         except Exception:
             continue
         typ = msg.get("type")
-        if typ == "history" and not bk.sid:
-            bk.sid = str(msg.get("sid") or "")
+        sid = str(msg.get("sid") or "")
+        mine = bool(sid) and sid == bk.sid
+        if typ == "history":
+            if not bk.sid:
+                bk.sid = sid
+            _sync_thread(msg.get("messages") or [])
             continue
         if typ == "status":
             # 状态广播不带 sid（它在改配置时也会发），所以放在 sid 过滤之前
             _emit({"kind": "status", "running": bool((msg.get("data") or {}).get("running"))})
             continue
-        if not bk.sid or msg.get("sid") != bk.sid:
-            # 别的会话（网页端）的消息，与 QAM 这一页无关
+        if typ == "user_message":
+            _push_thread({
+                "role": "user",
+                "text": str(msg.get("text") or ""),
+                "client": str(msg.get("client") or ""),
+                "ts": float(msg.get("ts") or 0),
+            })
+            continue
+        if typ == "assistant_message":
+            # 助手消息现在也带来源（后端按同一轮的提问打标）；老数据没有这个字段，
+            # 退回「最近一条 user 的 client」来归户
+            _push_thread({
+                "role": "assistant",
+                "text": str(msg.get("text") or ""),
+                "client": str(msg.get("client") or _nearby_client()),
+                "ts": float(msg.get("ts") or 0),
+            })
+            if not mine:
+                continue
+            if msg.get("cancelled"):
+                # 用户点了终止：已生成的部分比「已终止当前操作」有用，保留它
+                _ACC = _ACC or str(msg.get("text") or "已终止当前操作")
+                _finalize(cancelled=True)
+            else:
+                # 唯一带完整正文的收尾消息
+                _ACC = str(msg.get("text") or _ACC)
+                _finalize()
+            continue
+        if not mine:
+            # 别的会话的流式过程与本端这一轮无关，正文已由 assistant_message 收下
             continue
         if typ == "delta":
             text = str(msg.get("text") or "")
@@ -1136,19 +1240,17 @@ async def _read_loop(bk: _Backend):
             if msg.get("final"):
                 # 正文已完整，但先不冻结：后面还有一条 assistant_message 要覆盖它
                 _ACC = str(msg.get("reply") or _ACC)
-        elif typ == "assistant_message":
-            if msg.get("cancelled"):
-                # 用户点了终止：已生成的部分比「已终止当前操作」有用，保留它
-                _ACC = _ACC or str(msg.get("text") or "已终止当前操作")
-                _finalize(cancelled=True)
-            else:
-                # 唯一带完整正文的收尾消息
-                _ACC = str(msg.get("text") or _ACC)
-                _finalize()
         elif typ == "tool_activity":
             # 「正在读文件：…」这类过程提示，只给界面看，不进正文
             _emit({"kind": "tool", "text": str(msg.get("text") or "")})
 
+
+def _nearby_client() -> str:
+    """找最近一条 user 消息的来源，当作这轮回复的归属"""
+    for m in reversed(_THREAD):
+        if m.get("role") == "user":
+            return str(m.get("client") or "")
+    return ""
 
 
 async def _ensure_backend() -> tuple[_Backend | None, str]:
@@ -1171,7 +1273,7 @@ async def _ensure_backend() -> tuple[_Backend | None, str]:
         return None, f"连不上后端 :{port}（{exc}）"
     _BACKEND = bk
     _READER = asyncio.create_task(_read_loop(bk))
-    # 等 history：拿不到 sid 就无法过滤别的客户端的广播
+    # 等 history：拿到 sid 才能认出哪条 δ 是本端这一轮的
     for _ in range(100):
         if bk.sid:
             break
@@ -1193,6 +1295,63 @@ async def _drop_backend():
         await bk.close()
 
 
+def _lan_ip() -> str:
+    """本机在局域网里的地址，给别的端填后端地址用
+
+    UDP connect 不发包，只是让内核挑一条默认出口并告诉我们源地址，
+    比解析 ip addr 稳（没有默认路由时退回 127.0.0.1）。
+    """
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return str(s.getsockname()[0])
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+async def _core_status(port: int, token: str) -> dict:
+    """问一次后端自己的 /api/status，确认女仆核心活着
+
+    不走 ws：这里只要一个「在不在、什么模式」的结论，HTTP 一步拿到，
+    也顺便验证了 token 是后端认的（ws 握手失败时前端只会看到连不上）。
+    """
+    if not token:
+        return {"ok": False, "error": "配置里没有 token"}
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    except Exception as exc:
+        return {"ok": False, "error": f"连不上 :{port}（{exc}）"}
+    try:
+        req = (
+            "GET /api/status HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            f"X-Token: {token}\r\n"
+            "Connection: close\r\n\r\n"
+        )
+        writer.write(req.encode())
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.read(), timeout=5)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+    head, _, body = raw.partition(b"\r\n\r\n")
+    if b" 200 " not in head.split(b"\r\n", 1)[0]:
+        return {"ok": False, "error": head.split(b"\r\n", 1)[0].decode("utf-8", "replace")[:60]}
+    try:
+        return {"ok": True, "data": json.loads(body)}
+    except Exception:
+        return {"ok": False, "error": "返回内容不是 JSON"}
+
+
 class Plugin:
     async def get_status(self) -> dict:
         """QAM 打开时先问一次：后端连得上吗、截图能不能用
@@ -1201,8 +1360,9 @@ class Plugin:
         输入框还是正常面板，而且它只报能力，不含任何画面或对话内容。
         """
         cfg = _load_server_cfg()
-        port = cfg.get("port", 18765)
+        port = int(cfg.get("port", 18765))
         node, why = await _gamescope_pw_node()
+        core = await _core_status(port, str(cfg.get("token", "") or "").strip())
         return {
             "install_dir": str(INSTALL_DIR),
             "config_ok": CONFIG_PATH.exists(),
@@ -1215,11 +1375,41 @@ class Plugin:
             "uid": os.getuid(),
             "as_user": " ".join(_run_as()) or "(self)",
             "proxy": "websockets" if _ws_connect else "raw",
+            # 面板第二行显示成「192.168.x.x:18765」，别的设备照这个地址连
+            "ip": _lan_ip(),
+            # 女仆核心（后端自身的 /api/status）在不在、跑没跑起来
+            "core_ok": bool(core.get("ok")),
+            "core_reason": str(core.get("error") or ""),
+            "core_mode": str((core.get("data") or {}).get("mode") or ""),
             # 虚拟手柄能不能用：设备节点在 + 进程有写权限
             "gamepad": os.access("/dev/uinput", os.W_OK) if os.path.exists("/dev/uinput") else False,
             # 本机鉴权状态：false 时前端只显示解锁框
             "unlocked": _unlocked(),
         }
+
+    async def session_open(self, ticket: str = "") -> dict:
+        """面板打开时调一次：连上后端并拉回全部对话（所有端的提问与回复）
+
+        连上后 _read_loop 会先收到 history 并推一条 thread 事件，前端不必等这里的返回。
+        """
+        _require(ticket, "session_open")
+        bk, why = await _ensure_backend()
+        if not bk:
+            return {"ok": False, "error": why}
+        return {"ok": True}
+
+    async def ready(self, ticket: str = "") -> dict:
+        """前端挂好监听后调一次：把积攒下来的对话补推过去
+
+        Decky 是先渲染面板、后挂 addEventListener，而 history 那条 thread 可能在
+        面板首帧之前就推完了。这里不重新连后端，只把快照再发一遍。
+        """
+        _require(ticket, "ready")
+        if _LAST_THREAD:
+            _emit(_LAST_THREAD)
+        elif _THREAD:
+            _emit({"kind": "thread", "items": _THREAD})
+        return {"ok": True}
 
     async def unlock(self, token: str) -> dict:
         """用访问令牌解锁插件能力，成功后拿到票据，之后的调用都要带上
@@ -1314,6 +1504,14 @@ class Plugin:
             await bk.send(payload)
         except Exception as exc:
             return {"ok": False, "error": f"发不出去：{exc}"}
+        # 提问不等后端回声，先在面板上落一条：后端广播回来时会按 ts 去重，
+        # 不会出现两条一模一样的「插件端」
+        _push_thread({
+            "role": "user",
+            "text": text,
+            "client": "qam",
+            "ts": time.time(),
+        })
         return {"ok": True}
 
     async def wait_final(self, timeout: float = 900, ticket: str = "") -> dict:

@@ -1567,7 +1567,7 @@ async def handle_chat(text: str, announce: bool = True,
         # 用户点了终止：广播终止消息并向上传递
         await manager.broadcast({"type": "assistant_message", "text": "已终止当前操作",
                                  "ts": time.time(), "events": events, "cancelled": True,
-                                 **sid_tag})
+                                 **sid_tag, **src_tag})
         feed_push("assistant_message", text="已终止当前操作", events=events)
         # 终止时把已经生成的部分保住：屏幕上出现过的每一段正文都留下，
         # 不能只用最后那段（工具调用前的过渡话也在屏幕上显示过）
@@ -1579,7 +1579,8 @@ async def handle_chat(text: str, announce: bool = True,
             killed_text = (killed_text + "\n\n" + partial.strip()).strip() if killed_text else partial.strip()
         if killed_text:
             hist.append({"role": "assistant", "content": killed_text,
-                         "events": events, "interrupted": True, "ts": time.time()})
+                         "events": events, "interrupted": True, "ts": time.time(),
+                         **src_tag})
         save_session_snapshot(turn_sid, hist)
         clear_stream(turn_sid)
         _turn["active"] = False
@@ -1590,8 +1591,10 @@ async def handle_chat(text: str, announce: bool = True,
     # 助手消息同样只取一次时间戳：落盘用的和广播给界面的是同一个值，
     # 前端按 data-ts 删除才能精确命中这一条
     asst_ts = time.time()
+    # 回答也带上这条提问的来源：QAM 面板把各端的问答混在一列显示，
+    # 只看 user 的标记分不清哪条回答是应哪一句的
     hist.append({"role": "assistant", "content": reply, "events": events,
-                 "ts": asst_ts})
+                 "ts": asst_ts, **src_tag})
     # 关键：写回「本轮所属」的会话文件。中途被切走时 current_sid 已经指向别处，
     # 用 save_current_session 会把这一轮错写进新会话（串回复的根源）
     save_session_snapshot(turn_sid, hist)
@@ -1619,7 +1622,7 @@ async def handle_chat(text: str, announce: bool = True,
         feed_push("system", text="上一轮对话已完成，结果保存在原会话中")
     else:
         await manager.broadcast({"type": "assistant_message", "text": reply, "ts": asst_ts,
-                                 "events": events, **sid_tag})
+                                 "events": events, **sid_tag, **src_tag})
         feed_push("assistant_message", text=reply, events=events)
         # 语音播报：只播报最终回复，不播报思维链/工具过程（后台进行，不阻塞）
         asyncio.create_task(tts.speak(reply))

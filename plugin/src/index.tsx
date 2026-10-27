@@ -14,10 +14,25 @@ type Status = {
   uid: number;
   as_user: string;
   proxy: string;
+  // 本机局域网地址：面板第二行显示成 ip:port
+  ip: string;
+  // 女仆核心（后端自身）活没活着
+  core_ok: boolean;
+  core_reason: string;
+  core_mode: string;
   // 虚拟手柄能不能用（/dev/uinput 存在且可写）
   gamepad: boolean;
   // 本机鉴权：false 时面板只显示解锁框
   unlocked: boolean;
+};
+
+// 面板展示的一条对话（所有端的提问和回复都在这）
+type Item = {
+  role: "user" | "assistant";
+  text: string;
+  // 来源：web / mobile / client / qam，空表示老数据没记
+  client: string;
+  ts: number;
 };
 
 // 插件后端推上来的流式消息
@@ -27,9 +42,9 @@ type Delta =
   // 「正在读文件：…」这类过程提示，只显示在状态行
   | { kind: "tool"; text: string }
   // 后端一轮结束后的状态广播，只用来确认「已经空闲」
-  | { kind: "status"; running: boolean };
-
-type Turn = { role: "user" | "assistant"; text: string; streaming?: boolean };
+  | { kind: "status"; running: boolean }
+  // 全部对话（history 对齐或新消息追加）
+  | { kind: "thread"; items: Item[] };
 
 const CARD: React.CSSProperties = {
   // QAM 只有 ~300px 宽，字号和留白都按窄栏调，长词强制换行
@@ -218,47 +233,13 @@ function Md({ text }: { text: string }) {
   );
 }
 
-// 面板上的手柄键位，分四排：ABXY、肩键、摇杆键、菜单键与方向键。
-// 界面效果图（tools/ui-preview.html）里也照这个顺序排，改一处记得同步
-const PAD_ROWS: { key: string; label: string }[][] = [
-  [
-    { key: "y", label: "Y" },
-    { key: "x", label: "X" },
-    { key: "b", label: "B" },
-    { key: "a", label: "A" },
-  ],
-  [
-    { key: "lb", label: "LB" },
-    { key: "rb", label: "RB" },
-    { key: "lt", label: "LT" },
-    { key: "rt", label: "RT" },
-  ],
-  [
-    { key: "l3", label: "L3" },
-    { key: "r3", label: "R3" },
-    { key: "start", label: "≡" },
-    { key: "select", label: "◱" },
-    { key: "guide", label: "Xbox" },
-    { key: "share", label: "分享" },
-  ],
-  [
-    { key: "up", label: "↑" },
-    { key: "down", label: "↓" },
-    { key: "left", label: "←" },
-    { key: "right", label: "→" },
-  ],
-];
-
-const PAD_BTN: React.CSSProperties = {
-  flex: 1,
-  // Steam 的字体在 QAM 里偏大，按钮给足高度才好用手柄点
-  padding: "10px 0",
-  fontSize: 13,
-  borderRadius: 4,
-  border: "1px solid rgba(255,255,255,.14)",
-  background: "rgba(255,255,255,.06)",
-  color: "#fff",
-  textAlign: "center",
+// 来源标记。QAM 只有 ~300px 宽，用短一点的说法：
+// 网页端可能来自 PC 也可能是 Deck 上的浏览器，统一叫「网页」
+const CLIENT_LABEL: Record<string, string> = {
+  web: "PC网页端",
+  mobile: "手机网页端",
+  client: "客户端",
+  qam: "插件端",
 };
 
 export default definePlugin(() => ({
@@ -272,14 +253,15 @@ function Content() {
   const [status, setStatus] = useState<Status | null>(null);
   const [error, setError] = useState<string>("");
   const [input, setInput] = useState("");
-  const [turns, setTurns] = useState<Turn[]>([]);
+  // 所有端的提问和回复，直接照后端推来的顺序显示
+  const [items, setItems] = useState<Item[]>([]);
+  // 本端这一轮正在生成的正文（还没进 items，收尾时由 final 落进去）
+  const [streaming, setStreaming] = useState("");
   const [busy, setBusy] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   // 当前这一轮正在做什么（后端 tool_activity 的原文），空表示还没开始动手
   const [activity, setActivity] = useState("");
   const [withShot, setWithShot] = useState(true);
-  // 手柄区最近一次操作的结果，只用来给一句提示
-  const [padMsg, setPadMsg] = useState("");
   // 解锁：令牌输入框 + 后端给的票据（之后每次调用都要带上）
   const [tokenInput, setTokenInput] = useState("");
   const [ticket, setTicket] = useState("");
@@ -331,7 +313,8 @@ function Content() {
       /* 锁不上不影响界面回到解锁框 */
     }
     setTicket("");
-    setTurns([]);
+    setItems([]);
+    setStreaming("");
     setError("");
     await refreshStatus();
   };
@@ -339,6 +322,10 @@ function Content() {
   // 流式内容从插件后端来（前端不直连 :18765，绕开 CEF 的 CSP 限制）
   useEffect(() => {
     const onDelta = (msg: Delta) => {
+      if (msg.kind === "thread") {
+        setItems(msg.items);
+        return;
+      }
       if (msg.kind === "status") {
         // 后端空了但界面还转着：说明这轮没收到 final（比如连接断了），先把按钮还回来
         if (!msg.running && busyRef.current) {
@@ -354,7 +341,7 @@ function Content() {
       }
       if (msg.kind === "delta") {
         curRef.current += msg.text;
-        flushAssistant(false);
+        flushAssistant();
       } else {
         curRef.current = msg.text;
         finishTurn(msg.cancelled);
@@ -368,11 +355,25 @@ function Content() {
     refreshStatus();
   }, []);
 
+  // 解锁后连上后端，把「所有端」的提问和回复一次拉回来；
+  // 再调一次 ready：history 那条 thread 可能在本面板首帧之前就推过了
+  useEffect(() => {
+    if (!ticket) return;
+    (async () => {
+      try {
+        await call<[string], { ok: boolean; error?: string }>("session_open", ticket);
+        await call<[string], { ok: boolean }>("ready", ticket);
+      } catch {
+        /* 连不上会在 get_status 里体现，这里不重复报错 */
+      }
+    })();
+  }, [ticket]);
+
   // 新内容进来就滚到底，否则窄栏里看不到最新一行
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [turns]);
+  }, [items, streaming]);
 
   // 忙碌计时：长时间没动静时界面要给个「还在跑」的反馈
   useEffect(() => {
@@ -388,19 +389,14 @@ function Content() {
     setBusy(v);
   };
 
-  const flushAssistant = (final: boolean) => {
-    const text = curRef.current;
-    setTurns((prev) => {
-      const last = prev[prev.length - 1];
-      if (last && last.role === "assistant") {
-        return [...prev.slice(0, -1), { role: "assistant", text, streaming: !final }];
-      }
-      return [...prev, { role: "assistant", text, streaming: !final }];
-    });
+  const flushAssistant = () => {
+    setStreaming(curRef.current);
   };
 
   const finishTurn = (cancelled?: boolean) => {
-    flushAssistant(true);
+    // 正文落进 items 由后端推来的 assistant_message（thread 事件）负责，
+    // 这里只收掉本端的流式占位
+    setStreaming("");
     setBusyBoth(false);
     setActivity("");
     if (cancelled) setError("这一轮已中断");
@@ -421,8 +417,10 @@ function Content() {
     if (busyRef.current) return;
     setError("");
     setActivity("");
-    setTurns((prev) => [...prev, { role: "user", text }]);
+    // 用户那条由后端广播回来（带来源、带 ts），这里不抢先插一条，
+    // 否则同一句话会先本地显示一次、再被所有端同步的消息覆盖
     curRef.current = "";
+    setStreaming("");
     setBusyBoth(true);
 
     try {
@@ -493,20 +491,19 @@ function Content() {
       setError(String(e?.message ?? e));
       setBusyBoth(false);
       setActivity("");
-      if (curRef.current) flushAssistant(true);
+      setStreaming("");
     }
   };
 
   /**
-   * 一键查攻略：语音/打字都不方便时，直接拿当前画面去问。
-   * 提示词写死「先搜再总结」，是因为攻略类问题答案更新快，
-   * 单靠模型记忆容易给出过期的打法或道具位置。
-   * 游戏名由后端从 Steam（运行中 appid + 库里改过的名字）取，取不到才让模型自己认。
+   * 截屏询问：收面板 → 抓一帧当前画面 → 带图自动问 AI。
+   * 提问写死「看我卡在哪一步」，是因为这个按钮就是给「现在过不去了」用的，
+   * 用户不用描述场景，模型看画面更快；游戏名由后端从 Steam 取进提问里。
    */
-  const guide = async () => {
+  const shotAsk = async () => {
     if (busyRef.current) return;
     await runTurn(
-      "看我卡在哪一步，先联网搜这个游戏当前场景的最新攻略（中文搜不到就用英文关键词再搜），" +
+      "看我卡在哪一步，说说现在这个画面里我该做什么，需要的话先联网查一下最新攻略，" +
         "再总结成几条可以直接照做的步骤，200 字以内。",
       true,
       true
@@ -524,25 +521,7 @@ function Content() {
     setError("这一轮已中断");
   };
 
-  const padPress = async (key: string) => {
-    if (!status?.gamepad) {
-      setPadMsg("/dev/uinput 不可用，手柄按键发不出去");
-      return;
-    }
-    try {
-      const r = (await call<[string, number, string], { ok: boolean; error?: string }>(
-        "gamepad_press",
-        key,
-        80,
-        ticket
-      )) as { ok: boolean; error?: string };
-      setPadMsg(r.ok ? `已发送 ${key.toUpperCase()}` : (r.error ?? "发送失败"));
-    } catch (e: any) {
-      setPadMsg(String(e?.message ?? e));
-    }
-  };
-
-  // 未解锁：面板只留解锁框，提问和手柄一律不显示，避免用户点了才发现没权限
+  // 未解锁：面板只留解锁框，提问一律不显示，避免用户点了才发现没权限
   if (status && !status.unlocked) {
     return (
       <PanelSection title="DeckMeido">
@@ -574,47 +553,34 @@ function Content() {
     );
   }
 
+  const captureLine = status
+    ? status.capture_ok
+      ? "自动截图可用"
+      : `自动截图不可用${status.capture_reason ? `（${status.capture_reason}）` : ""}`
+    : "正在探测后端…";
+  const coreLine = status ? (status.core_ok ? "女仆核心 正常" : "女仆核心 异常") : "女仆核心 未知";
+  const coreWhy = status && !status.core_ok ? status.core_reason : "";
+
   return (
     <PanelSection title="DeckMeido">
       <PanelSectionRow>
-        <div style={{ fontSize: 10, color: DIM, lineHeight: 1.5 }}>
-          {busy && activity
-            ? activity
-            : status
-              ? status.capture_ok
-                ? "游戏模式抓帧可用"
-                : status.capture_reason || "当前抓不到画面"
-              : "正在探测后端…"}
-          {status && ` · 端口 ${status.port} · 转发 ${status.proxy}`}
+        <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+          <div style={{ color: DIM }}>
+            <span style={{ color: status?.capture_ok ? DIM : ERR_COLOR }}>{captureLine}</span>
+            {" · "}
+            <span style={{ color: status?.core_ok ? DIM : ERR_COLOR }}>{coreLine}</span>
+          </div>
+          <div style={{ color: DIM }}>
+            {status ? `${status.ip}:${status.port}` : "—"}
+          </div>
+          {coreWhy && <div style={{ color: ERR_COLOR }}>{coreWhy}</div>}
+          {busy && activity && <div style={{ color: DIM }}>{activity}</div>}
         </div>
       </PanelSectionRow>
 
       <PanelSectionRow>
-        <TextField
-          label="问点什么"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-        />
-      </PanelSectionRow>
-
-      <PanelSectionRow>
-        <ToggleField
-          label="带画面提问"
-          description="抓当前游戏画面一起发给 AI；抓不到时这一轮自动退回纯文字"
-          checked={withShot}
-          onChange={setWithShot}
-        />
-      </PanelSectionRow>
-
-      <PanelSectionRow>
-        <ButtonItem layout="below" onClick={guide}>
-          查攻略（看当前画面）
-        </ButtonItem>
-      </PanelSectionRow>
-
-      <PanelSectionRow>
-        <ButtonItem layout="below" onClick={busy ? cancel : ask}>
-          {busy ? `中断（${elapsed}s）` : "问 AI"}
+        <ButtonItem layout="below" onClick={busy ? cancel : shotAsk}>
+          {busy ? `中断（${elapsed}s）` : "截屏询问"}
         </ButtonItem>
       </PanelSectionRow>
 
@@ -627,59 +593,78 @@ function Content() {
       )}
 
       <PanelSectionRow>
-        <div style={{ fontSize: 10, color: DIM, marginBottom: 2 }}>
-          {padMsg || "模拟手柄按键（发给前台游戏）"}
-        </div>
+        <Focusable
+          ref={scrollRef as any}
+          style={{ maxHeight: 330, overflowY: "auto", display: "block" }}
+        >
+          {items.map((m, i) => {
+            const tag = CLIENT_LABEL[m.client] ?? "";
+            return (
+              <div
+                key={`${m.ts}-${i}`}
+                style={{
+                  ...CARD,
+                  background: m.role === "user" ? "rgba(255,255,255,.06)" : "transparent",
+                  borderLeft: m.role === "assistant" ? "2px solid #5aa9e6" : "2px solid transparent",
+                }}
+              >
+                {tag && (
+                  // 来源角标：所有端混在一起时，一眼看清这句是谁说的
+                  <div style={{ fontSize: 9, color: DIM, marginBottom: 2 }}>
+                    {tag}
+                  </div>
+                )}
+                <Md text={m.text} />
+              </div>
+            );
+          })}
+          {streaming && (
+            <div
+              style={{
+                ...CARD,
+                borderLeft: "2px solid #5aa9e6",
+              }}
+            >
+              {CLIENT_LABEL.qam && <div style={{ fontSize: 9, color: DIM, marginBottom: 2 }}>插件端</div>}
+              <Md text={streaming} />
+              <span style={{ color: DIM }}>▍</span>
+            </div>
+          )}
+          {!items.length && !streaming && (
+            <div style={{ ...CARD, color: DIM }}>
+              还没有对话。点上面的「截屏询问」，或者直接在下面打字。
+            </div>
+          )}
+        </Focusable>
       </PanelSectionRow>
 
-      {PAD_ROWS.map((row, ri) => (
-        <PanelSectionRow key={ri}>
-          <Focusable style={{ display: "flex", gap: 4 }}>
-            {row.map((b) => (
-              <div
-                key={b.key}
-                style={{ ...PAD_BTN, opacity: status?.gamepad ? 1 : 0.4 }}
-                onClick={() => padPress(b.key)}
-              >
-                {b.label}
-              </div>
-            ))}
-          </Focusable>
-        </PanelSectionRow>
-      ))}
+      <PanelSectionRow>
+        <TextField
+          label="问点什么"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+        />
+      </PanelSectionRow>
 
       <PanelSectionRow>
-        <ButtonItem layout="below" onClick={() => setTurns([])}>
-          清空这段对话记录
+        <ButtonItem layout="below" onClick={busy ? cancel : ask}>
+          {busy ? `中断（${elapsed}s）` : "发送"}
         </ButtonItem>
+      </PanelSectionRow>
+
+      <PanelSectionRow>
+        <ToggleField
+          label="带画面询问"
+          description="发送时抓当前游戏画面一起发给 AI；抓不到时这一轮自动退回纯文字"
+          checked={withShot}
+          onChange={setWithShot}
+        />
       </PanelSectionRow>
 
       <PanelSectionRow>
         <ButtonItem layout="below" onClick={lock}>
           锁定（退出解锁）
         </ButtonItem>
-      </PanelSectionRow>
-
-      <PanelSectionRow>
-        <Focusable
-          ref={scrollRef as any}
-          style={{ maxHeight: 260, overflowY: "auto", display: "block" }}
-        >
-          {turns.map((t, i) => (
-            <div
-              key={i}
-              style={{
-                ...CARD,
-                background: t.role === "user" ? "rgba(255,255,255,.06)" : "transparent",
-                borderLeft:
-                  t.role === "assistant" ? "2px solid #5aa9e6" : "2px solid transparent",
-              }}
-            >
-              <Md text={t.text} />
-              {t.streaming && <span style={{ color: DIM }}>▍</span>}
-            </div>
-          ))}
-        </Focusable>
       </PanelSectionRow>
     </PanelSection>
   );
