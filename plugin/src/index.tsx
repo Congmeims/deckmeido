@@ -306,19 +306,6 @@ function Content() {
     }
   };
 
-  const lock = async () => {
-    try {
-      await call<[string], { ok: boolean }>("lock", ticket);
-    } catch {
-      /* 锁不上不影响界面回到解锁框 */
-    }
-    setTicket("");
-    setItems([]);
-    setStreaming("");
-    setError("");
-    await refreshStatus();
-  };
-
   // 流式内容从插件后端来（前端不直连 :18765，绕开 CEF 的 CSP 限制）
   useEffect(() => {
     const onDelta = (msg: Delta) => {
@@ -659,12 +646,6 @@ function Content() {
           checked={withShot}
           onChange={setWithShot}
         />
-      </PanelSectionRow>
-
-      <PanelSectionRow>
-        <ButtonItem layout="below" onClick={lock}>
-          锁定（退出解锁）
-        </ButtonItem>
       </PanelSectionRow>
     </PanelSection>
   );
