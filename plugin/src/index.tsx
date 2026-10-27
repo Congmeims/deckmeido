@@ -20,6 +20,8 @@ type Status = {
   core_ok: boolean;
   core_reason: string;
   core_mode: string;
+  // 工作区绝对路径：面板底部显示，让主人知道 agent 能碰哪些文件
+  workspace: string;
   // 虚拟手柄能不能用（/dev/uinput 存在且可写）
   gamepad: boolean;
   // 设置区：语音播报（后端 tts.enable）
@@ -28,6 +30,8 @@ type Status = {
   version: string;
   // 本机鉴权：false 时面板只显示解锁框
   unlocked: boolean;
+  // 令牌是否还是默认值：是才给「一键解锁」，换过就得手输
+  default_token: boolean;
 };
 
 // 面板展示的一条对话（所有端的提问和回复都在这）
@@ -294,22 +298,36 @@ function Content() {
     }
   };
 
+  // 拿票据的公共动作：手动输入和「一键解锁」都走这里
+  const applyTicket = async (tk: string) => {
+    const r = (await call<[string], { ok: boolean; ticket?: string; error?: string }>(
+      "unlock",
+      tk
+    )) as { ok: boolean; ticket?: string; error?: string };
+    if (!r.ok || !r.ticket) {
+      setError(r.error ?? "解锁失败");
+      return;
+    }
+    setTicket(r.ticket);
+    setTokenInput("");
+    setError("");
+    await refreshStatus();
+  };
+
   const unlock = async () => {
     const tk = tokenInput.trim();
     if (!tk) return;
     try {
-      const r = (await call<[string], { ok: boolean; ticket?: string; error?: string }>(
-        "unlock",
-        tk
-      )) as { ok: boolean; ticket?: string; error?: string };
-      if (!r.ok || !r.ticket) {
-        setError(r.error ?? "解锁失败");
-        return;
-      }
-      setTicket(r.ticket);
-      setTokenInput("");
-      setError("");
-      await refreshStatus();
+      await applyTicket(tk);
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+    }
+  };
+
+  // 一键解锁：不传令牌，让插件后端用它自己从 config.toml 读到的那个
+  const unlockWithLocalToken = async () => {
+    try {
+      await applyTicket("");
     } catch (e: any) {
       setError(String(e?.message ?? e));
     }
@@ -540,9 +558,18 @@ function Content() {
       <PanelSection title="DeckMeido">
         <PanelSectionRow>
           <div style={{ fontSize: 10, color: DIM, lineHeight: 1.5 }}>
-            插件以 root 运行，需要先输入访问令牌解锁
+            插件以 root 运行，需要先解锁才能对话
           </div>
         </PanelSectionRow>
+        {status.default_token && (
+          <PanelSectionRow>
+            {/* 一键解锁：令牌就在本机（插件自己的 qam_token，默认 meido），
+                没必要让主人在游戏模式下用屏幕键盘一个字一个字敲 */}
+            <ButtonItem layout="below" onClick={unlockWithLocalToken}>
+              一键解锁
+            </ButtonItem>
+          </PanelSectionRow>
+        )}
         <PanelSectionRow>
           <TextField
             label="访问令牌"
