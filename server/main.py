@@ -60,32 +60,62 @@ def load_config() -> dict:
     return cfg
 
 
-def update_config(updates: dict):
-    """把 {section: {key: value}} 写回 config.toml（保留注释），并重载运行配置"""
-    import re
+def _toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    return '"' + str(value).replace('"', '\\"') + '"'
 
+
+def _toml_set(text: str, section: str, key: str, value) -> str:
+    """在 [section] 内改写 key = value，没有这条就追加到该段末尾"""
+    # 段内只匹配到下一个 [ 开头的表头为止，所以子表（如 [persona.style]）不会被误改
+    sec_pat = re.compile(rf"(^\[{re.escape(section)}\]\n(?:[^\[\n].*\n?)*)", re.M)
+    m = sec_pat.search(text)
+    kv_line = f"{key} = {_toml_value(value)}"
+    if m:
+        block = m.group(1)
+        if re.search(rf"^{re.escape(key)}\s*=", block, re.M):
+            new_block = re.sub(rf"^{re.escape(key)}\s*=.*$", kv_line, block, flags=re.M)
+        else:
+            new_block = block.rstrip("\n") + "\n" + kv_line + "\n"
+        return text[: m.start()] + new_block + text[m.end():]
+    return text.rstrip("\n") + f"\n\n[{section}]\n{kv_line}\n"
+
+
+def update_config(updates: dict):
+    """把 {section: {key: value}} 写回 config.toml（保留注释），并重载运行配置
+
+    值为 dict 时当作子表处理（写进 [section.key]），例如 persona.style。
+    旧实现一律按标量格式化，嵌套 dict 会被写成一行字符串，把整份配置弄坏。
+    """
     text = CONFIG_PATH.read_text(encoding="utf-8")
     for section, kv in updates.items():
         for key, value in kv.items():
-            if isinstance(value, bool):
-                v = "true" if value else "false"
-            elif isinstance(value, (int, float)):
-                v = str(value)
+            if isinstance(value, dict):
+                sub = f"{section}.{key}"
+                # 先清掉旧版本把整个子表写成一行字符串留下的 `key = "{...}"`：
+                # 它会让 [section.key] 表头变成「重复定义」，整个配置解析失败。
+                # 只在父段内删 —— 全文替换会误伤子表里的同名键。
+                # 注意父段里如果已经有 [section.key] 子表，规则会在表头处停下。
+                sec_m = re.search(rf"^\[{re.escape(section)}\]\n(?:[^\[\n].*\n?)*", text, re.M)
+                if sec_m is None:
+                    # 没有父段就整段现建，之后直接写子表头
+                    text = text.rstrip("\n") + f"\n\n[{section}]\n"
+                elif re.search(rf"^{re.escape(key)}\s*=", sec_m.group(0), re.M):
+                    cleaned = re.sub(rf"^{re.escape(key)}\s*=.*\n", "", sec_m.group(0),
+                                     count=1, flags=re.M)
+                    text = text[: sec_m.start()] + cleaned + text[sec_m.end():]
+                # 子表不存在时先建一个空表头，下面逐项往里写
+                if not re.search(rf"^\[{re.escape(sub)}\]\s*$", text, re.M):
+                    text = text.rstrip("\n") + f"\n\n[{sub}]\n"
+                for sub_key, sub_value in value.items():
+                    text = _toml_set(text, sub, sub_key, sub_value)
             else:
-                v = '"' + str(value).replace('"', '\\"') + '"'
-            # 在目标 section 内替换 key = ...，没有则在 section 末尾追加
-            sec_pat = re.compile(rf"(^\[{re.escape(section)}\]\n(?:[^\[\n].*\n?)*)", re.M)
-            m = sec_pat.search(text)
-            kv_line = f"{key} = {v}"
-            if m:
-                block = m.group(1)
-                if re.search(rf"^{re.escape(key)}\s*=", block, re.M):
-                    new_block = re.sub(rf"^{re.escape(key)}\s*=.*$", kv_line, block, flags=re.M)
-                else:
-                    new_block = block.rstrip("\n") + "\n" + kv_line + "\n"
-                text = text[: m.start()] + new_block + text[m.end():]
-            else:
-                text = text.rstrip("\n") + f"\n\n[{section}]\n{kv_line}\n"
+                text = _toml_set(text, section, key, value)
     CONFIG_PATH.write_text(text, encoding="utf-8")
     apply_config(tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8")))
 
@@ -266,6 +296,40 @@ def _split_usage(usage: dict) -> int:
 
 
 
+def _persona_style_block() -> str:
+    """把「人设」设置项拼成一段语气约束，挂在系统提示最后
+
+    语气单独成段、放在最后，是因为前面几十行都是 SteamOS/工具/审批规则，
+    人设夹在开头会被淹没：同一份配置，模型每次即兴发挥出来的性格都不一样
+    （一会儿正常、一会儿高冷、结尾突然带「喵」）。这里把称呼、语气、口癖
+    拆成明确条目，并列出禁用词，让跨会话的表现稳定下来。
+    """
+    style = PERSONA.get("style") or {}
+    name = str(PERSONA.get("name") or "DeckMeido").strip()
+    address = str(style.get("address") or "主人").strip()
+    tone = str(style.get("tone") or "").strip()
+    ending = str(style.get("ending") or "").strip()
+    suffix = str(style.get("suffix") or "").strip()
+    forbid = [str(x).strip() for x in (style.get("forbid") or []) if str(x).strip()]
+    lines = [
+        "【人设与语气】以下条目优先级高于上面所有规则，每次回复都必须遵守：",
+        f"- 你的名字是「{name}」，始终用「{address}」称呼用户，不要换成别的称呼。",
+    ]
+    if tone:
+        lines.append(f"- 语气：{tone}")
+    if ending:
+        lines.append(f"- 句尾习惯：{ending}")
+    if suffix:
+        lines.append(f"- 落款：{suffix}")
+    if forbid:
+        lines.append("- 以下词句一次都不许出现（包括句尾）：" + "、".join(f"「{w}」" for w in forbid))
+    lines += [
+        "- 拿不准风格时保持沉稳专业，不要自行添加口癖、拟声词或额外的性格设定。",
+        "- 语气只体现在措辞上：命令原文、报错、终端输出、文件内容一律原样给出，不加语气词。",
+    ]
+    return "\n".join(lines)
+
+
 def build_system_prompt(workspace: Path | None = None) -> str:
     root = workspace or tools.WORKSPACE
     name = PERSONA.get("name", "DeckMeido")
@@ -334,11 +398,13 @@ def build_system_prompt(workspace: Path | None = None) -> str:
         "覆盖你的其他判断；不要修改、不要拆分、不要先审查内容\n"
         "- 安装脚本优先 curl 下载成文件再执行（便于排查）；但用户明确要求原样执行时，直接执行\n"
         "- 命令需要交互输入时（密码/确认提示），用 stdin 参数喂入；长任务放后台并输出日志路径\n"
-        "- 回答简洁，中文优先，保持人设语气\n"
+        "- 回答简洁，中文优先\n"
         "- 需要 appid 时先用 find_game 查询，不要编造"
     )
     if extra:
         p += f"\n补充人设：{extra}"
+    # 语气约束放最后：这里的规则最贴近用户即将说的话，权重最高
+    p += "\n\n" + _persona_style_block()
     return p
 
 
@@ -356,8 +422,9 @@ tts = TTS(
 
 def apply_config(cfg: dict):
     """热更新运行配置（LLM / TTS / 权限模式 / 访问令牌），无需重启"""
-    global CFG, TOKEN, PERMISSION_MODE, SYSTEM_PROMPT, MAX_TOOL_ROUNDS
+    global CFG, TOKEN, PERMISSION_MODE, PERSONA, SYSTEM_PROMPT, MAX_TOOL_ROUNDS
     CFG = cfg
+    PERSONA = cfg.get("persona", {})
     TOKEN = (cfg["server"].get("token") or TOKEN).strip().lower()
     MAX_TOOL_ROUNDS = int(cfg.get("agent", {}).get("max_tool_rounds", 0))
     c = cfg["llm"]
@@ -1260,6 +1327,13 @@ class ConfigUpdate(BaseModel):
     permission_mode: str | None = None
     workspace: str | None = None
     token: str | None = None
+    # 人设：整体写回 [persona]，空字符串表示「恢复默认」
+    persona_name: str | None = None
+    persona_address: str | None = None
+    persona_tone: str | None = None
+    persona_ending: str | None = None
+    persona_suffix: str | None = None
+    persona_forbid: str | None = None
 
 
 def _mask_key(key: str) -> str:
@@ -1293,6 +1367,14 @@ async def api_get_config():
         "port": CFG["server"].get("port", 18765),
         "llm_configured": llm.configured,
         "version": VERSION,
+        # 人设：设置页表单用，默认值和后台提示词里的一致
+        "persona_name": PERSONA.get("name", "DeckMeido"),
+        "persona_address": (PERSONA.get("style") or {}).get("address", "主人"),
+        "persona_tone": (PERSONA.get("style") or {}).get("tone", ""),
+        "persona_ending": (PERSONA.get("style") or {}).get("ending", ""),
+        "persona_suffix": (PERSONA.get("style") or {}).get("suffix", ""),
+        # 禁用词列表在界面上是一行、用逗号隔开
+        "persona_forbid": "，".join((PERSONA.get("style") or {}).get("forbid") or []),
     }
 
 
@@ -1363,6 +1445,21 @@ async def api_set_config(req: ConfigUpdate):
         updates["security"] = {"permission_mode": req.permission_mode}
     if req.workspace is not None and req.workspace.strip():
         updates["workspace"] = {"dir": req.workspace.strip()}
+    if req.persona_name is not None:
+        # 人设走设置页写入，用户不需要（也不该被迫）去改 config.toml。
+        # 留空就写回默认值，避免空串把人设搞没。
+        forbid = [w.strip() for w in re.split(r"[,，、\s]+", req.persona_forbid or "") if w.strip()]
+        updates["persona"] = {
+            "name": req.persona_name.strip() or "DeckMeido",
+            "traits": PERSONA.get("traits", ""),
+            "style": {
+                "address": (req.persona_address or "").strip() or "主人",
+                "tone": (req.persona_tone or "").strip(),
+                "ending": (req.persona_ending or "").strip(),
+                "suffix": (req.persona_suffix or "").strip(),
+                "forbid": forbid,
+            },
+        }
     if req.token is not None:
         # 统一存成小写，避免 config 里大小写混着看花眼（校验本来就不分大小写）
         new_token = req.token.strip().lower()

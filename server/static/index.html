@@ -646,6 +646,20 @@
     cursor: pointer;
   }
   .mini-btn:hover { border-color: var(--brand); color: var(--brand); }
+  /* 「语气」这类多行输入：和单行输入框同一套外观，可拖高 */
+  .field textarea {
+    width: 100%;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--surface-2);
+    color: var(--text);
+    font-size: 15px;
+    line-height: 1.5;
+    font-family: inherit;
+    outline: none;
+    resize: vertical;
+  }
   .field-hint { font-size: 12px; color: var(--muted); margin-top: 6px; min-height: 16px; }
   /* 扫码连接 */
   .qr-box { display: none; margin-top: 10px; text-align: center; }
@@ -1096,6 +1110,34 @@
     <div class="field">
       <label>工作区目录（编程/文件任务默认位置）</label>
       <input id="cfgWorkspace" type="text" placeholder="~/deckmeido_workspace" autocomplete="off">
+    </div>
+    <div class="field">
+      <label>女仆的人设</label>
+      <div class="field-hint">决定她怎么称呼你、用什么语气说话，改完保存立即生效，新会话也保持一致。</div>
+    </div>
+    <div class="field">
+      <label>名字</label>
+      <input id="cfgPersonaName" type="text" placeholder="DeckMeido" autocomplete="off">
+    </div>
+    <div class="field">
+      <label>怎么称呼你</label>
+      <input id="cfgPersonaAddress" type="text" placeholder="主人" autocomplete="off">
+    </div>
+    <div class="field">
+      <label>语气</label>
+      <textarea id="cfgPersonaTone" rows="3" placeholder="礼貌、简洁、干练，偶尔一点俏皮，但不撒娇卖萌"></textarea>
+    </div>
+    <div class="field">
+      <label>句尾习惯（可留空）</label>
+      <input id="cfgPersonaEnding" type="text" placeholder="例如：说完结论就好，不加任何语气词" autocomplete="off">
+    </div>
+    <div class="field">
+      <label>落款（可留空）</label>
+      <input id="cfgPersonaSuffix" type="text" placeholder="例如：——女仆长" autocomplete="off">
+    </div>
+    <div class="field">
+      <label>禁用的词句（逗号隔开，一次都不许出现）</label>
+      <input id="cfgPersonaForbid" type="text" placeholder="喵，呢~，人家" autocomplete="off">
     </div>
     <div class="field">
       <label>访问令牌（连接这台 Deck 用，4-32 位数字或字母，不分大小写）</label>
@@ -2646,6 +2688,12 @@
         cfgTts.checked = c.tts_enable;
         cfgPerm.value = c.permission_mode || 'auto';
         cfgWorkspace.value = c.workspace || '';
+        document.getElementById('cfgPersonaName').value = c.persona_name || '';
+        document.getElementById('cfgPersonaAddress').value = c.persona_address || '';
+        document.getElementById('cfgPersonaTone').value = c.persona_tone || '';
+        document.getElementById('cfgPersonaEnding').value = c.persona_ending || '';
+        document.getElementById('cfgPersonaSuffix').value = c.persona_suffix || '';
+        document.getElementById('cfgPersonaForbid').value = c.persona_forbid || '';
         cfgToken.value = c.token || '';
         cfgUrl.value = location.origin + '/?token=' + encodeURIComponent(c.token || '');
         // 没配 Key 时直接把设置页顶到最显眼的位置当首次引导
@@ -2731,7 +2779,13 @@
       tts_enable: cfgTts.checked,
       permission_mode: cfgPerm.value,
       workspace: cfgWorkspace.value,
-      token: newToken
+      token: newToken,
+      persona_name: document.getElementById('cfgPersonaName').value,
+      persona_address: document.getElementById('cfgPersonaAddress').value,
+      persona_tone: document.getElementById('cfgPersonaTone').value,
+      persona_ending: document.getElementById('cfgPersonaEnding').value,
+      persona_suffix: document.getElementById('cfgPersonaSuffix').value,
+      persona_forbid: document.getElementById('cfgPersonaForbid').value
     };
     if (keyInput) { payload.api_key = keyInput; }
     if (apiKeyClear) { payload.clear_api_key = true; }

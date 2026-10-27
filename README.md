@@ -212,13 +212,15 @@ systemctl --user daemon-reload && systemctl --user enable --now deckmeido.servic
 | | `context_window` | 窗口大小，`0` 表示按模型名推断 |
 | | `compact_ratio` | 触发压缩的占用比例，默认 0.95 |
 | `[power]` | `keep_awake` | 执行命令或显示遮罩时阻止息屏与休眠，默认 `true`（游戏模式不干预） |
-| `[persona]` | `name` / `traits` / `extra` | 人格名称与性格描述，改这里就换人格 |
+| `[persona]` | `name` / `traits` / `extra` | 人格名称与性格描述。日常改人设请用网页「设置 → 女仆的人设」，这几项是由那里写入的 |
+| `[persona.style]` | `address` / `tone` | 怎么称呼用户；语气描述。同样是设置页在写 |
+| | `ending` / `suffix` / `forbid` | 句尾习惯；落款；禁用词句列表（逗号分隔） |
 | `[tts]` | `enable` / `engine` / `voice` | 语音播报开关（默认 `false`）与引擎、语言 |
 | | `speed` / `max_chars` | 语速（词/分钟，默认 170）；单次播报最长字符数（默认 300） |
 | `[security]` | `permission_mode` | `manual` / `auto` / `full` |
 | `[workspace]` | `dir` | 编程与文件任务的默认工作区，留空则用 `~/deckmeido_workspace` |
 
-配置文件位置：安装目录下的 `server/config.toml`（首次启动自动生成）。
+上表这些项都能在网页「设置」里改，保存即时生效，一般不需要手改文件。配置文件位置：安装目录下的 `server/config.toml`（首次启动自动生成）。
 
 ## 目录结构
 
