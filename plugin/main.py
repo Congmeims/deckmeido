@@ -260,8 +260,94 @@ def _read_vdf_apps(path: Path) -> dict[str, str]:
     return apps
 
 
+# 二进制 VDF（shortcuts.vdf）的类型字节
+_BVDict_NEST, _BVDict_STR, _BVDict_INT, _BVDict_END = 0x00, 0x01, 0x02, 0x08
+
+
+def _read_shortcuts(path: Path) -> dict[str, str]:
+    """从 shortcuts.vdf（二进制）里抽出「添加的非 Steam 游戏」appid → AppName
+
+    这个文件和 localconfig.vdf 不是一回事：它是二进制 VDF，
+    类型字节 + 以 \\0 结尾的键名，值再按类型读。结构详见
+    Valve 开发者 Wiki 的 Steam Library Shortcuts 条目：
+    root「shortcuts」→ 若干「0/1/2…」→ 每项里有 appid(int32) 和 AppName(string)。
+
+    库里改过的名字就是这里的 AppName，Steam 界面显示的就是它。
+    注意改过名之后 appid 不会重算（还是当初 crc32(原名+exe) 的值），
+    所以只能按 appid 精确匹配查 AppName，反推是行不通的。
+    """
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+
+    def cstr(pos: int) -> tuple[str, int]:
+        end = data.index(b"\0", pos)
+        return data[pos:end].decode("utf-8", "replace"), end + 1
+
+    def skip_dict(pos: int) -> int:
+        while pos < len(data):
+            t = data[pos]
+            pos += 1
+            if t == _BVDict_END:
+                return pos
+            key, pos = cstr(pos)
+            if t == _BVDict_NEST:
+                pos = skip_dict(pos)
+            elif t == _BVDict_STR:
+                _, pos = cstr(pos)
+            elif t == _BVDict_INT:
+                pos += 4
+            else:
+                return pos
+        return pos
+
+    try:
+        pos = 0
+        if data[pos] != _BVDict_NEST:
+            return {}
+        pos += 1
+        root, pos = cstr(pos)
+        if root != "shortcuts":
+            return {}
+        while pos < len(data):
+            t = data[pos]
+            pos += 1
+            if t == _BVDict_END:
+                break
+            _, pos = cstr(pos)  # "0"/"1"/…
+            appid, name = "", ""
+            while pos < len(data):
+                t2 = data[pos]
+                pos += 1
+                if t2 == _BVDict_END:
+                    break
+                k, pos = cstr(pos)
+                if t2 == _BVDict_NEST:
+                    pos = skip_dict(pos)
+                elif t2 == _BVDict_STR:
+                    v, pos = cstr(pos)
+                    if k == "AppName":
+                        name = v
+                elif t2 == _BVDict_INT:
+                    raw = data[pos:pos + 4]
+                    pos += 4
+                    if k == "appid" and len(raw) == 4:
+                        # 有符号存的，Steam 界面按无符号十位显示
+                        appid = str(int.from_bytes(raw, "little", signed=False))
+                else:
+                    break
+            if appid and name:
+                out[appid] = name
+    except (ValueError, IndexError):
+        # 文件被 Steam 写了一半或格式不认识：能捞多少算多少，别炸
+        pass
+    return out
+
+
 def _app_names() -> dict[str, str]:
-    """汇总所有 Steam 账号 localconfig 里的 appid → 名字"""
+    """汇总所有 Steam 账号的 appid → 名字（含非 Steam 游戏的备注名）"""
     home = INSTALL_DIR.parent
     out: dict[str, str] = {}
     base = home / ".steam/steam/userdata"
@@ -272,6 +358,30 @@ def _app_names() -> dict[str, str]:
     for cfg in base.glob("*/config/localconfig.vdf"):
         for k, v in _read_vdf_apps(cfg).items():
             out.setdefault(k, v)
+    # 非 Steam 游戏只存在 shortcuts.vdf 里，localconfig 里没有它们
+    for sc in base.glob("*/config/shortcuts.vdf"):
+        for k, v in _read_shortcuts(sc).items():
+            out.setdefault(k, v)
+    return out
+
+
+def _compat_app_id(compat_path: Path) -> list[str]:
+    """由 compatdata/<编号> 目录推出可能的 appid 写法
+
+    非 Steam 游戏没有商店 appid，Steam 拿 shortcuts.vdf 里那个 int32 当它的编号，
+    界面按无符号显示成十位数字（如 2914928358），compatdata 目录名也是它。
+    但目录名到底写成有符号还是无符号，不同 Steam 版本还没统一，
+    所以两种都返回，交给 _app_names() 去命中。
+    """
+    name = compat_path.name.strip()
+    if not name.lstrip("-").isdigit():
+        return []
+    n = int(name)
+    out = [name]
+    if n < 0:  # 写成了负数（-1380038938），换回无符号十位再试一次
+        alt = n & 0xFFFFFFFF
+        if str(alt) not in out:
+            out.append(str(alt))
     return out
 
 
@@ -279,6 +389,7 @@ def _running_app_ids() -> list[str]:
     """扫 /proc 找 SteamAppId，排除 Steam 自己和 gamescope
 
     只读 environ，不读 cmdline：命令行里常带 store 页面之类的 appid，会把结果带偏。
+    非 Steam 游戏的 SteamAppId 是 0，只能靠 STEAM_COMPAT_DATA_PATH 的目录名认。
     """
     ids: list[str] = []
     me = os.getpid()
@@ -293,12 +404,17 @@ def _running_app_ids() -> list[str]:
             env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
         except Exception:
             continue
+        compat = ""
         for kv in env:
-            if not kv.startswith(b"SteamAppId="):
-                continue
-            val = kv.split(b"=", 1)[1].decode(errors="ignore").strip()
-            if val and val != "0":
-                ids.append(val)
+            if kv.startswith(b"SteamAppId="):
+                val = kv.split(b"=", 1)[1].decode(errors="ignore").strip()
+                if val and val != "0":
+                    ids.append(val)
+            elif kv.startswith(b"STEAM_COMPAT_DATA_PATH="):
+                compat = kv.split(b"=", 1)[1].decode(errors="ignore").strip()
+        if compat:
+            # 变量指向 .../compatdata/<编号>，有时后面还跟着 /pfx
+            ids.extend(_compat_app_id(Path(compat.rstrip("/").removesuffix("/pfx"))))
     return ids
 
 
@@ -308,7 +424,9 @@ def _current_game() -> dict:
     if not ids:
         return {"appid": "", "name": ""}
     names = _app_names()
-    # 同一个游戏会有好几个子进程，环境变量一致；取第一个能查到名字的
+    # 同一个游戏会有好几个子进程，环境变量一致；取第一个能查到名字的。
+    # 非 Steam 游戏（库里那个十位编号）走的就是这条路：compatdata 目录名
+    # 命中 shortcuts.vdf 的 appid，拿到的是用户在库里改过的 AppName。
     for appid in ids:
         if names.get(appid):
             return {"appid": appid, "name": names[appid]}

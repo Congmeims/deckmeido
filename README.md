@@ -341,6 +341,9 @@ deckmeido/
   - 抓帧参数 `screenshot(ticket, hide=True)`：`pipewiresrc` 抓的是 gamescope 合成后的画面，QAM 本身也在里面，不收起来只能拍到半屏游戏
   - 游戏名不靠模型认：插件扫 `/proc/*/environ` 里的 `SteamAppId`（Steam 启动游戏时注入）拿到运行中 appid，再去 `userdata/*/config/localconfig.vdf` 的 `apps` 段取 `name`——用户在库里改过的名字（备注）就写在这个字段。拿到后拼成「当前游戏：《xxx》」放在问题开头，模型直接拿它搜；取不到才退回看画面判断
   - `localconfig.vdf` 用括号配对解析（app 块里夹着 `cloud` 等子块，按第一个 `}` 切会漏）
+  - 非 Steam 游戏（库里那个十位编号的容器）不在 `localconfig.vdf` 里，名字得读 `userdata/*/config/shortcuts.vdf`：这是**二进制** VDF（类型字节 + `\0` 结尾键名），`AppName` 就是库里显示的名字（手动改过的备注也是它）；改过名后 appid 不重算，只能按 appid 查名字，反推没用
+  - 非 Steam 游戏运行时 `SteamAppId=0`，退回 `STEAM_COMPAT_DATA_PATH` 的目录名（`compatdata/<编号>`）当编号；界面上按无符号十位显示，目录名却可能写成有符号负数，所以两种写法都拿去匹配
+  - 待真机确认：`compatdata` 目录名在 SteamOS 上到底是哪种写法（已双向兜底），以及部分非 Steam 游戏（如网页游戏、原生 Linux 程序）不走 Proton、没有 `STEAM_COMPAT_DATA_PATH` 时会拿不到名字
   - 系统提示词补了「带画面问攻略」的规范：先认场景 → 先搜再总结 → 中文不行换英文 → 只给步骤不编打法；并声明「当前游戏：《xxx》」是准确名字，别自己重新猜
   - 未做：全局热键（会与 Steam 输入争抢）、独立截图按钮、输入框开关
 
