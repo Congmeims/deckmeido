@@ -199,27 +199,41 @@ TOOLS: list[dict] = [
             "description": ("模拟手柄按键（写 /dev/uinput 虚拟手柄，游戏模式里唯一能被游戏认到的注入方式；"
                             "desktop 那套鼠标键盘在游戏里没用）。"
                             "action=press 按一下某个键；hold 按住某个键若干毫秒（跑动这类需要长按）；"
-                            "stick 把左摇杆推到 (x,y) 并保持；release 摇杆回中。"
+                            "stick 把摇杆推到 (x,y) 并保持；trigger 把扳机压到 value 力度；"
+                            "release 摇杆回中并松开扳机。"
                             "玩游戏、过对话、菜单导航时用。一次只能动一个键，"
                             "需要连续操作就多次调用"),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["press", "hold", "stick", "release"],
+                               "enum": ["press", "hold", "stick", "trigger", "release"],
                                "description": "要做的动作"},
                     "button": {"type": "string",
                                "enum": ["a", "b", "x", "y", "up", "down", "left", "right",
-                                        "lb", "rb", "start", "select"],
-                               "description": ("press/hold 的键位。a 通常是确认/跳跃，"
+                                        "lb", "rb", "lt", "rt", "start", "select", "guide",
+                                        "l3", "r3", "share"],
+                               "description": ("press/hold/trigger 的键位。a 通常是确认/跳跃，"
                                                "b 取消，x/y 视游戏而定；方向键是十字键不是摇杆，"
-                                               "需要模拟摇杆用 stick")},
+                                               "需要模拟摇杆用 stick。"
+                                               "lt/rt 是左右扳机（0..1 力度，press/hold 时按到底），"
+                                               "l3/r3 是左右摇杆按下（跑步/蹲/近战常见）。"
+                                               "start 是 Xbox 的 Menu 键（≡），select 是 View 键（◱），"
+                                               "两者在游戏里常被用来打开暂停菜单/地图；"
+                                               "guide 是 Xbox 的 Xbox/Guide 键，游戏内可呼出 overlay；"
+                                               "share 是 Xbox Series 的分享键，部分游戏不认；"
+                                               "guide 不是 Steam 键，无法呼出 Steam 菜单，需要那个请让用户自己按")},
                     "ms": {"type": "integer",
                            "description": "hold 按住多久（毫秒，默认 500，上限 5000）；press 默认 80"},
                     "x": {"type": "number",
                           "description": "stick 的横向，-1 最左、1 最右，0 居中"},
                     "y": {"type": "number",
                           "description": "stick 的纵向，-1 最上、1 最下，0 居中"},
+                    "side": {"type": "string",
+                             "enum": ["left", "right"],
+                             "description": "stick/release 用哪个摇杆，默认 left（右摇杆主要用来转视角）"},
+                    "value": {"type": "number",
+                              "description": "trigger 的力度，0 松开、1 按到底，默认 1"},
                 },
                 "required": ["action"],
             },
@@ -913,9 +927,12 @@ def summarize_tool(name: str, args: dict) -> str:
     if name == "gamepad":
         act = str(args.get("action", ""))
         if act == "stick":
-            return f"推摇杆 ({args.get('x', 0)}, {args.get('y', 0)})"
+            side = "右" if str(args.get("side", "left")) == "right" else "左"
+            return f"推{side}摇杆 ({args.get('x', 0)}, {args.get('y', 0)})"
+        if act == "trigger":
+            return f"{str(args.get('button', '')).upper()} 扳机 {args.get('value', 1)}"
         if act == "release":
-            return "摇杆回中"
+            return "摇杆回中、松开扳机"
         btn = str(args.get("button", "")).upper()
         if act == "hold":
             return f"按住 {btn} {args.get('ms', 500)}ms"
@@ -1219,14 +1236,21 @@ async def _raw_ok(raw: Path) -> bool:
         return False
 
 
-async def _screenshot_gamescope(path: Path) -> bool:
-    """游戏模式：从 gamescope 的 PipeWire 视频节点直接抓一帧（不经过桌面会话）"""
+async def _screenshot_gamescope(path: Path) -> str:
+    """游戏模式：从 gamescope 的 PipeWire 视频节点抓一帧，成功返回空串，失败返回原因
+
+    失败原因必须带出来：以前这里只返回 True/False，模型只能收到一句笼统的
+    「抓帧失败」，界面上也看不出「这张图没抓到」，用户会以为模型真的看了画面
+    然后按画布胡答。
+    """
     node = await _gamescope_pw_node()
-    if not node or not shutil.which("gst-launch-1.0"):
-        return False
+    if not node:
+        return "没找到 gamescope 的 PipeWire 视频节点（pw-dump 里没有 node.name=gamescope）"
+    if not shutil.which("gst-launch-1.0"):
+        return "没装 gst-launch-1.0（gstreamer1.0-tools），抓不了帧"
     sess = _session_user()
     if not sess:
-        return False
+        return "找不到 gamescope 所在的用户会话（/run/user/* 下没有活的图形会话）"
     uid, user = sess
     env = dict(os.environ)
     # 必须指向 gamescope 所属会话，不能是后端自己的 uid（root 时是 /run/user/0）
@@ -1241,18 +1265,27 @@ async def _screenshot_gamescope(path: Path) -> bool:
     # root 跑时降权到会话用户：PipeWire 的 socket 权限按用户隔离，root 直连会被拒
     if os.getuid() == 0 and uid != 0:
         cmd = ["runuser", "-u", user, "--", *cmd]
+    err_text = ""
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=env,
         )
-        await asyncio.wait_for(proc.wait(), timeout=25)
+        try:
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=25)
+            err_text = (err or b"").decode(errors="replace").strip()
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return "抓帧超时（25 秒内 gamescope 没吐出画面，游戏可能正在切场景或已挂起）"
         if not await _raw_ok(raw):
-            return False
+            # gst 的具体报错比「失败了」有用得多，取最后一行
+            line = err_text.splitlines()[-1] if err_text else ""
+            return "抓帧没拿到有效图像" + (f"：{line}" if line else "（gst 没有输出错误信息）")
         # pngenc 连续 6 帧会覆盖同一文件，取到的就是最后一帧，直接搬过来
         raw.replace(path)
-        return True
-    except Exception:
-        return False
+        return ""
+    except Exception as exc:
+        return f"抓帧进程启动失败：{exc}"
     finally:
         raw.unlink(missing_ok=True)
 
@@ -1276,8 +1309,9 @@ _UI_DEV_SETUP = 0x405C5503
 _UI_ABS_SETUP = 0x401C5504
 
 _EV_SYN, _EV_KEY, _EV_ABS = 0x00, 0x01, 0x03
-_ABS_X, _ABS_Y = 0x00, 0x01
+_ABS_X, _ABS_Y, _ABS_Z, _ABS_RX, _ABS_RY, _ABS_RZ = 0x00, 0x01, 0x02, 0x03, 0x04, 0x05
 _STICK_MAX = 32767
+_TRIG_MAX = 32767
 
 # 面板/工具里用的名字 → 键位。ABXY 按 Xbox 布局。
 _PAD_KEYS = {
@@ -1285,10 +1319,22 @@ _PAD_KEYS = {
     "lb": 0x136, "rb": 0x137,
     "up": 0x220, "down": 0x221, "left": 0x222, "right": 0x223,
     "start": 0x13B, "select": 0x13A,
+    # BTN_MODE：Xbox 手柄的 Guide 键。SteamOS 里物理 Steam 键由系统层拦截，
+    # 虚拟手柄发的这个键只会被游戏当成 Xbox/Guide 键，不会真的呼出 Steam 菜单
+    "guide": 0x13C,
+    # 摇杆按下（L3 / R3）
+    "l3": 0x13D, "r3": 0x13E,
+    # 分享键：Xbox Series X|S 才有，内核里报成 KEY_RECORD 而不是 BTN_*
+    "share": 0x0A7,
 }
 
-# 当前摇杆位置，用来判断 release 时要不要真的发一帧
+# 扳机名字 → 轴。手柄惯例走 0..32767，不是按键
+_PAD_TRIGGERS = {"lt": _ABS_Z, "rt": _ABS_RZ}
+
+# 当前摇杆/扳机状态，用来判断 release 时要不要真的发一帧
 _PAD_STICK = [0, 0]
+_PAD_STICK_R = [0, 0]
+_PAD_TRIG = {"lt": 0, "rt": 0}
 
 
 class _VirtualPad:
@@ -1325,12 +1371,20 @@ class _VirtualPad:
             fcntl.ioctl(fd, _UI_SET_EVBIT, _EV_ABS)
             for code in _PAD_KEYS.values():
                 fcntl.ioctl(fd, _UI_SET_KEYBIT, code)
-            for code in (_ABS_X, _ABS_Y):
+            for code, lo, hi in (
+                (_ABS_X, -_STICK_MAX, _STICK_MAX),
+                (_ABS_Y, -_STICK_MAX, _STICK_MAX),
+                # 右摇杆：不少游戏用右摇杆转视角
+                (_ABS_RX, -_STICK_MAX, _STICK_MAX),
+                (_ABS_RY, -_STICK_MAX, _STICK_MAX),
+                (_ABS_Z, 0, _TRIG_MAX),
+                (_ABS_RZ, 0, _TRIG_MAX),
+            ):
                 fcntl.ioctl(fd, _UI_SET_ABSBIT, code)
                 # uinput_abs_setup：code(2)+pad(2)+absinfo{value,min,max,fuzz,flat,resolution}
                 fcntl.ioctl(
                     fd, _UI_ABS_SETUP,
-                    struct.pack("HHiiiiii", code, 0, 0, -_STICK_MAX, _STICK_MAX, 0, 0, 0),
+                    struct.pack("HHiiiiii", code, 0, 0, lo, hi, 0, 0, 0),
                 )
             # uinput_setup：id{bus,vendor,product,version} + name(80) + ff_effects_max
             fcntl.ioctl(
@@ -1358,6 +1412,8 @@ class _VirtualPad:
             pass
         self._fd = None
         _PAD_STICK[0] = _PAD_STICK[1] = 0
+        _PAD_STICK_R[0] = _PAD_STICK_R[1] = 0
+        _PAD_TRIG["lt"] = _PAD_TRIG["rt"] = 0
 
     def _touch(self):
         if self._idle is not None:
@@ -1397,45 +1453,87 @@ class _VirtualPad:
             self._touch()
         return f"已按下手柄键 {name}（{max(30, min(hold_ms, 5000))}ms）"
 
-    async def stick(self, x: float, y: float) -> str:
+    async def stick(self, x: float, y: float, side: str = "left") -> str:
+        right = str(side or "left").strip().lower() == "right"
+        axes = (_ABS_RX, _ABS_RY) if right else (_ABS_X, _ABS_Y)
         vx = int(max(-1.0, min(1.0, x)) * _STICK_MAX)
         vy = int(max(-1.0, min(1.0, y)) * _STICK_MAX)
         async with self._lock:
             try:
                 await self._ensure()
-                self._emit(_EV_ABS, _ABS_X, vx)
-                self._emit(_EV_ABS, _ABS_Y, vy)
+                self._emit(_EV_ABS, axes[0], vx)
+                self._emit(_EV_ABS, axes[1], vy)
                 self._syn()
             except FileNotFoundError:
                 return "摇杆注入失败：没有 /dev/uinput，uinput 内核模块未加载"
             except PermissionError:
                 return "摇杆注入失败：没有写 /dev/uinput 的权限（需要 root）"
-            _PAD_STICK[0], _PAD_STICK[1] = vx, vy
+            state = _PAD_STICK_R if right else _PAD_STICK
+            state[0], state[1] = vx, vy
             self._touch()
-        return f"左摇杆已推到 ({x:.2f}, {y:.2f})"
+        return f"{'右' if right else '左'}摇杆已推到 ({x:.2f}, {y:.2f})"
+
+    async def trigger(self, which: str, value: float) -> str:
+        name = str(which or "").strip().lower()
+        code = _PAD_TRIGGERS.get(name)
+        if code is None:
+            return f"不认识的扳机：{which}（可用：lt、rt）"
+        level = int(max(0.0, min(1.0, value)) * _TRIG_MAX)
+        async with self._lock:
+            try:
+                await self._ensure()
+                self._emit(_EV_ABS, code, level)
+                self._syn()
+            except FileNotFoundError:
+                return "扳机注入失败：没有 /dev/uinput，uinput 内核模块未加载"
+            except PermissionError:
+                return "扳机注入失败：没有写 /dev/uinput 的权限（需要 root）"
+            _PAD_TRIG[name] = level
+            self._touch()
+        return f"{name.upper()} 扳机力度 {value:.2f}"
 
 
 _PAD = _VirtualPad()
 
 
 async def _gamepad(action: str, button: str = "", ms: int = 0,
-                   x: float = 0.0, y: float = 0.0) -> str:
-    """模拟手柄。press/hold 按键，stick 推左摇杆，release 摇杆回中"""
+                   x: float = 0.0, y: float = 0.0, side: str = "left",
+                   value: float = 1.0) -> str:
+    """模拟手柄。press/hold 按键，stick 推摇杆，trigger 压扳机，release 摇杆/扳机回中"""
     act = str(action or "").strip().lower()
     if act in ("press", "hold"):
         name = str(button or "").strip().lower()
         if not name:
             return "press/hold 需要填 button"
+        # lt/rt 是轴不是键，按一下等价于踩到底再松开
+        if name in _PAD_TRIGGERS:
+            default = 80 if act == "press" else 500
+            hold = max(30, min(int(ms or default), 5000))
+            await _PAD.trigger(name, 1.0)
+            await asyncio.sleep(hold / 1000)
+            return await _PAD.trigger(name, 0.0) + f"（按住 {hold}ms）"
         default = 80 if act == "press" else 500
         return await _PAD.key(name, int(ms or default))
     if act == "stick":
         try:
-            return await _PAD.stick(float(x), float(y))
+            return await _PAD.stick(float(x), float(y), side)
         except (TypeError, ValueError):
             return "stick 的 x/y 要填 -1..1 的数字"
+    if act == "trigger":
+        try:
+            return await _PAD.trigger(button, float(value))
+        except (TypeError, ValueError):
+            return "trigger 的 value 要填 0..1 的数字"
     if act == "release":
-        return await _PAD.stick(0.0, 0.0)
-    return f"不认识的 action：{action}（可用：press / hold / stick / release）"
+        if str(button or "").strip().lower() in _PAD_TRIGGERS:
+            return await _PAD.trigger(button, 0.0)
+        out = [await _PAD.stick(0.0, 0.0, side)]
+        # 扳机也一起松开，避免 release 之后还踩着油门
+        for name in _PAD_TRIGGERS:
+            if _PAD_TRIG[name]:
+                out.append(await _PAD.trigger(name, 0.0))
+        return "；".join(out)
+    return f"不认识的 action：{action}（可用：press / hold / stick / trigger / release）"
 
 
 async def _screenshot() -> str:
@@ -1451,11 +1549,20 @@ async def _screenshot() -> str:
     name = f"shot_{int(time.time())}.png"
     path = shots_dir / name
 
+    # 每次截图先把上一次的状态清干净，否则「上一张成功、这一张失败」时
+    # LAST_VISION 还留着旧图，模型会拿着上一帧回答
+    global LAST_SHOT_ERROR, LAST_VISION
+    LAST_SHOT_ERROR = None
+    LAST_VISION = None
+
     # 游戏模式：桌面会话已经结束，只能从 gamescope 抓
     if await _gamescope_pw_node():
-        if await _screenshot_gamescope(path):
+        err = await _screenshot_gamescope(path)
+        if not err:
             return await _finish_shot(path, name, shots_dir, time)
-        return "截图失败：检测到游戏模式，但从 gamescope 的 PipeWire 节点抓帧失败"
+        LAST_SHOT_ERROR = err
+        return (f"截图失败：{err}。现在没有当前画面可用，"
+                "请直接告诉用户这次没截到图、以及原因，不要凭空描述屏幕内容。")
 
     env = dict(os.environ)
     _fix_display_env(env)
@@ -1469,14 +1576,23 @@ async def _screenshot() -> str:
             )
             await proc.wait()
         if not path.exists() or path.stat().st_size < 10000:
-            # spectacle 不可用或截到黑屏（Xwayland rootless）时退回 mss
-            import mss
-            with mss.mss() as sct:
-                sct.shot(output=str(path))
+            # spectacle 不可用或截到黑屏（Xwayland rootless）时退回 mss。
+            # 没装 mss 时 import 会抛 ModuleNotFoundError，以前直接把工具调用
+            # 炸掉，下面那句「都不可用」的提示根本走不到
+            try:
+                import mss
+                with mss.mss() as sct:
+                    sct.shot(output=str(path))
+            except Exception:
+                pass
     finally:
         await _set_overlay_lift(False)
-    if not path.exists():
-        return "截图失败：spectacle 与 mss 都不可用"
+    if not path.exists() or path.stat().st_size < 10000:
+        LAST_SHOT_ERROR = "spectacle 与 mss 都不可用（或截到的是黑色画面）"
+        # 黑屏也会留下几十字节的残片，不删掉下次会被当成「已有截图」
+        path.unlink(missing_ok=True)
+        return (f"截图失败：{LAST_SHOT_ERROR}。现在没有当前画面可用，"
+                "请直接告诉用户这次没截到图，不要凭空描述屏幕内容。")
     return await _finish_shot(path, name, shots_dir, time)
 
 
@@ -1781,6 +1897,10 @@ async def _desktop(action: str, target: str = "", x: int = 0, y: int = 0, text: 
 
 # 最近一次截图的模型可读版本路径（供 run_agent 注入多模态消息）
 LAST_VISION: Path | None = None
+
+# 最近一次截图失败的原因（成功时为 None）；界面上要把它显示出来，
+# 否则用户只看到「已截屏」却等不来画面
+LAST_SHOT_ERROR: str | None = None
 
 # 最近一次文件写入/编辑的增删行数（供 UI 展示 diff 统计）
 LAST_DIFF: dict | None = None

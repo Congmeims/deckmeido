@@ -14,10 +14,14 @@
 
 import asyncio
 import base64
+import hashlib
 import itertools
+import hmac
 import json
 import os
+import secrets
 import shutil
+import time
 import tomllib
 from pathlib import Path
 
@@ -65,6 +69,147 @@ def _load_server_cfg() -> dict:
         return cfg.get("server") or {}
     except Exception:
         return {}
+
+
+# ---------- 本机鉴权 ----------
+#
+# 插件后端以 root 加载，get_status / screenshot / gamepad_press 这些方法一旦
+# 被别的东西调起来，等于把「root 写 /dev/uinput」「读游戏画面」直接送出去。
+# 这里加一道令牌门：插件的调用方必须先在 QAM 里解锁，之后每次调用带上会话票据。
+#
+# 令牌默认 meido（和后端 config.example.toml 的默认值一致，用户只需记一个）。
+# 票据是解锁时随机生成的，存在插件数据目录里，Decky 重启后不用重新输入。
+
+DEFAULT_PLUGIN_TOKEN = "meido"
+
+# 暴力猜令牌的限制：连续错这么多次就冷却
+_MAX_FAILS = 5
+_FAIL_COOLDOWN = 30.0
+_fails: list[float] = []
+
+_SESSION_PATH: Path | None = None
+_SESSION_TICKET = ""
+_TICKET_TTL = 12 * 3600.0
+_ticket_at = 0.0
+
+
+def _session_path() -> Path:
+    """票据落盘位置：插件数据目录（decky.DECKY_PLUGIN_SETTINGS_DIR）"""
+    global _SESSION_PATH
+    if _SESSION_PATH is not None:
+        return _SESSION_PATH
+    cand = ""
+    try:
+        cand = str(getattr(decky, "DECKY_PLUGIN_SETTINGS_DIR", "") or "")
+    except Exception:
+        cand = ""
+    if not cand:
+        # 老版本 Decky 没有这个属性，退到用户目录下的隐藏目录
+        cand = str(Path.home() / ".deckmeido")
+    p = Path(cand)
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        # 票据只有属主能读：root 跑的时候别让 deck 读到
+        os.chmod(p, 0o700)
+    except Exception:
+        pass
+    _SESSION_PATH = p / "qam_session.json"
+    return _SESSION_PATH
+
+
+def _load_ticket() -> str:
+    """读上次解锁留下的票据（没有或过期就当没解锁）"""
+    global _SESSION_TICKET, _ticket_at
+    if _SESSION_TICKET:
+        return _SESSION_TICKET
+    try:
+        data = json.loads(_session_path().read_text(encoding="utf-8"))
+        ticket = str(data.get("ticket") or "")
+        at = float(data.get("at") or 0)
+    except Exception:
+        return ""
+    if not ticket or time.time() - at > _TICKET_TTL:
+        return ""
+    _SESSION_TICKET, _ticket_at = ticket, at
+    return ticket
+
+
+def _save_ticket(ticket: str):
+    global _SESSION_TICKET, _ticket_at
+    _SESSION_TICKET = ticket
+    _ticket_at = time.time()
+    path = _session_path()
+    try:
+        path.write_text(
+            json.dumps({"ticket": ticket, "at": _ticket_at}), encoding="utf-8"
+        )
+        os.chmod(path, 0o600)
+    except Exception as exc:
+        decky.logger.warning(f"票据落盘失败（本次仍可用）：{exc}")
+
+
+def _clear_ticket():
+    global _SESSION_TICKET, _ticket_at
+    _SESSION_TICKET, _ticket_at = "", 0.0
+    try:
+        _session_path().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _token() -> str:
+    """插件自己的令牌：环境变量 > 插件配置 > 默认 meido。
+
+    环境变量 DECKMEIDO_QAM_TOKEN 优先，方便排查时临时换一个，不用改盘上的配置；
+    插件配置指 <插件设置目录>/plugin.toml 里的 [plugin] qam_token。
+    """
+    env = os.environ.get("DECKMEIDO_QAM_TOKEN", "").strip().lower()
+    if env:
+        return env
+    settings = str(getattr(decky, "DECKY_PLUGIN_SETTINGS_DIR", "") or "")
+    if settings:
+        try:
+            cfg = tomllib.loads((Path(settings) / "plugin.toml").read_text(encoding="utf-8"))
+            val = str((cfg.get("plugin") or {}).get("qam_token") or "").strip().lower()
+            if val:
+                return val
+        except Exception:
+            pass
+    return DEFAULT_PLUGIN_TOKEN
+
+
+def _same(a: str, b: str) -> bool:
+    """定长比较，避免按字符猜令牌"""
+    return hmac.compare_digest(
+        hashlib.sha256(a.encode()).digest(), hashlib.sha256(b.encode()).digest()
+    )
+
+
+def _unlocked() -> bool:
+    """当前是否有有效的解锁票据"""
+    if not _load_ticket():
+        return False
+    if time.time() - _ticket_at > _TICKET_TTL:
+        _clear_ticket()
+        return False
+    return True
+
+
+def _require(ticket: str, method: str):
+    """每个受保护方法进来先过这道门，没过就抛，前端会收到错误字符串"""
+    if not _unlocked():
+        raise PermissionError(f"{method}: 未解锁，先在 QAM 面板输入访问令牌")
+    if not _same(str(ticket or ""), _SESSION_TICKET):
+        raise PermissionError(f"{method}: 票据不对，请重新解锁")
+
+
+def _too_many_fails() -> int:
+    """返回还要等几秒才能重试；0 表示可以试"""
+    now = time.time()
+    _fails[:] = [t for t in _fails if now - t < _FAIL_COOLDOWN]
+    if len(_fails) < _MAX_FAILS:
+        return 0
+    return int(_FAIL_COOLDOWN - (now - _fails[0])) + 1
 
 
 # ---------- 身份与运行目录 ----------
@@ -239,9 +384,13 @@ _UI_ABS_SETUP = 0x401C5504
 _UI_GET_VERSION = 0x80045505
 
 _EV_SYN, _EV_KEY, _EV_ABS = 0x00, 0x01, 0x03
-_ABS_X, _ABS_Y, _ABS_Z, _ABS_RZ = 0x00, 0x01, 0x02, 0x05
+_ABS_X, _ABS_Y, _ABS_Z, _ABS_RX, _ABS_RY, _ABS_RZ = 0x00, 0x01, 0x02, 0x03, 0x04, 0x05
 _BTN_SOUTH, _BTN_EAST, _BTN_NORTH, _BTN_WEST = 0x130, 0x131, 0x133, 0x134
 _BTN_TL, _BTN_TR = 0x136, 0x137
+_BTN_THUMBL, _BTN_THUMBR = 0x13D, 0x13E
+# Series X|S 的分享键。内核里没有专用 BTN_*，xpad 驱动把它报成 KEY_RECORD
+# （HID consumer 0xB2），所以这里也按键盘键注册
+_KEY_RECORD = 0x0A7
 
 # 摇杆量程按 Linux 手柄惯例走 -32767..32767，死区留 0
 _STICK_MIN, _STICK_MAX = -32767, 32767
@@ -263,7 +412,17 @@ _GAMEPAD_KEYS = {
     "right": 0x223,
     "start": 0x13B,
     "select": 0x13A,
+    # BTN_MODE：Xbox 手柄的 Guide 键
+    "guide": 0x13C,
+    # 摇杆按下（L3 / R3）
+    "l3": _BTN_THUMBL,
+    "r3": _BTN_THUMBR,
+    # 分享键：Xbox Series X|S 才有，部分驱动/游戏不认
+    "share": _KEY_RECORD,
 }
+
+# 扳机名字 → 轴。按手柄惯例走 0..32767
+_GAMEPAD_TRIGGERS = {"lt": _ABS_Z, "rt": _ABS_RZ}
 
 
 class _Gamepad:
@@ -311,6 +470,9 @@ class _Gamepad:
             for code, lo, hi in (
                 (_ABS_X, _STICK_MIN, _STICK_MAX),
                 (_ABS_Y, _STICK_MIN, _STICK_MAX),
+                # 右摇杆：不少游戏用右摇杆转视角，没有它只能动左摇杆
+                (_ABS_RX, _STICK_MIN, _STICK_MAX),
+                (_ABS_RY, _STICK_MIN, _STICK_MAX),
                 (_ABS_Z, 0, _TRIG_MAX),
                 (_ABS_RZ, 0, _TRIG_MAX),
             ):
@@ -390,8 +552,9 @@ class _Gamepad:
             self._touch_idle()
         return {"ok": True, "key": name, "ms": ms}
 
-    async def stick(self, x: float, y: float) -> dict:
-        """左摇杆，两个参数都是 -1..1（1 是右/下）"""
+    async def stick(self, x: float, y: float, side: str = "left") -> dict:
+        """摇杆，两个参数都是 -1..1（1 是右/下）。side 取 left / right"""
+        axes = (_ABS_RX, _ABS_RY) if str(side).lower() == "right" else (_ABS_X, _ABS_Y)
         try:
             vx = int(max(-1.0, min(1.0, float(x))) * _STICK_MAX)
             vy = int(max(-1.0, min(1.0, float(y))) * _STICK_MAX)
@@ -401,8 +564,8 @@ class _Gamepad:
             try:
                 if self._fd is None:
                     self._create()
-                self._emit(_EV_ABS, _ABS_X, vx)
-                self._emit(_EV_ABS, _ABS_Y, vy)
+                self._emit(_EV_ABS, axes[0], vx)
+                self._emit(_EV_ABS, axes[1], vy)
                 self._syn()
             except FileNotFoundError:
                 return {"ok": False, "error": "没有 /dev/uinput：uinput 内核模块未加载"}
@@ -412,6 +575,31 @@ class _Gamepad:
                 return {"ok": False, "error": f"摇杆注入失败：{exc}"}
             self._touch_idle()
         return {"ok": True, "x": vx, "y": vy}
+
+    async def trigger(self, which: str, value: float = 1.0) -> dict:
+        """扳机力度：value 是 0..1（0 松开、1 到底）。松开请显式传 0"""
+        name = str(which or "").strip().lower()
+        code = _GAMEPAD_TRIGGERS.get(name)
+        if code is None:
+            return {"ok": False, "error": f"不认识的扳机：{which}（可用：lt、rt）"}
+        try:
+            level = int(max(0.0, min(1.0, float(value))) * _TRIG_MAX)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "扳机力度要是 0..1 的数字"}
+        async with self._lock:
+            try:
+                if self._fd is None:
+                    self._create()
+                self._emit(_EV_ABS, code, level)
+                self._syn()
+            except FileNotFoundError:
+                return {"ok": False, "error": "没有 /dev/uinput：uinput 内核模块未加载"}
+            except PermissionError:
+                return {"ok": False, "error": "打不开 /dev/uinput：插件需要以 root 加载"}
+            except Exception as exc:
+                return {"ok": False, "error": f"扳机注入失败：{exc}"}
+            self._touch_idle()
+        return {"ok": True, "trigger": name, "value": level}
 
     async def close(self):
         if self._idle is not None:
@@ -744,7 +932,11 @@ async def _drop_backend():
 
 class Plugin:
     async def get_status(self) -> dict:
-        """QAM 打开时先问一次：后端连得上吗、截图能不能用"""
+        """QAM 打开时先问一次：后端连得上吗、截图能不能用
+
+        这个方法故意不要求解锁：前端要先知道「解锁了没」才能决定显示
+        输入框还是正常面板，而且它只报能力，不含任何画面或对话内容。
+        """
         cfg = _load_server_cfg()
         port = cfg.get("port", 18765)
         node, why = await _gamescope_pw_node()
@@ -762,30 +954,72 @@ class Plugin:
             "proxy": "websockets" if _ws_connect else "raw",
             # 虚拟手柄能不能用：设备节点在 + 进程有写权限
             "gamepad": os.access("/dev/uinput", os.W_OK) if os.path.exists("/dev/uinput") else False,
+            # 本机鉴权状态：false 时前端只显示解锁框
+            "unlocked": _unlocked(),
         }
 
-    async def screenshot(self) -> dict:
+    async def unlock(self, token: str) -> dict:
+        """用访问令牌解锁插件能力，成功后拿到票据，之后的调用都要带上
+
+        连续错 _MAX_FAILS 次会冷却 _FAIL_COOLDOWN 秒：QAM 上的输入框是唯一入口，
+        不设限的话可以脚本化穷举 4 位令牌。
+        """
+        wait = _too_many_fails()
+        if wait:
+            return {"ok": False, "error": f"错误次数太多，{wait} 秒后再试"}
+        if _same(str(token or "").strip().lower(), _token()):
+            _fails.clear()
+            ticket = secrets.token_urlsafe(24)
+            _save_ticket(ticket)
+            decky.logger.info("QAM 已解锁")
+            return {"ok": True, "ticket": ticket}
+        _fails.append(time.time())
+        left = max(0, _MAX_FAILS - len(_fails))
+        hint = f"，还可以试 {left} 次" if left else f"，冷却 {int(_FAIL_COOLDOWN)} 秒"
+        return {"ok": False, "error": f"令牌不对{hint}"}
+
+    async def lock(self, ticket: str = "") -> dict:
+        """退出解锁（换人用这台机器时用），票据落盘一并删掉"""
+        _require(ticket, "lock")
+        _clear_ticket()
+        return {"ok": True}
+
+    async def screenshot(self, ticket: str = "") -> dict:
+        _require(ticket, "screenshot")
         ok, payload = await grab_screenshot()
         if ok:
             return {"ok": True, "image": payload}
         return {"ok": False, "error": payload}
 
-    async def gamepad_press(self, key: str, ms: int = 80) -> dict:
-        """模拟按一下手柄键：a/b/x/y/lb/rb/up/down/left/right/start/select"""
+    async def gamepad_press(self, key: str, ms: int = 80, ticket: str = "") -> dict:
+        """模拟按一下手柄键：a/b/x/y/lb/rb/up/down/left/right/start/select/guide/l3/r3/share"""
+        _require(ticket, "gamepad_press")
         return await _GAMEPAD.press(key, ms)
 
-    async def gamepad_stick(self, x: float, y: float) -> dict:
-        """左摇杆推到 (x, y)，范围 -1..1；推完不会自动回中，
-        面板松手时会再调一次 gamepad_stick(0, 0)"""
-        return await _GAMEPAD.stick(x, y)
+    async def gamepad_stick(self, x: float, y: float, ticket: str = "",
+                            side: str = "left") -> dict:
+        """摇杆推到 (x, y)，范围 -1..1；推完不会自动回中，
+        面板松手时会再调一次 gamepad_stick(0, 0)。side 取 left / right"""
+        _require(ticket, "gamepad_stick")
+        return await _GAMEPAD.stick(x, y, side)
 
-    async def gamepad_close(self) -> dict:
+    async def gamepad_trigger(self, which: str, value: float = 1.0,
+                              ticket: str = "") -> dict:
+        """扳机力度：which 取 lt / rt，value 是 0..1（0 松开、1 到底）"""
+        _require(ticket, "gamepad_trigger")
+        return await _GAMEPAD.trigger(which, value)
+
+    async def gamepad_close(self, ticket: str = "") -> dict:
         """收掉虚拟手柄设备（不再需要时才调，避免 Steam 一直以为接了手柄）"""
+        _require(ticket, "gamepad_close")
         await _GAMEPAD.close()
         return {"ok": True}
 
-    async def start_turn(self, text: str, image: str | None = None) -> dict:
+    async def start_turn(
+        self, text: str, image: str | None = None, ticket: str = ""
+    ) -> dict:
         """把一轮对话发给后端。返回后流式内容通过 deckmeido_delta 推给前端"""
+        _require(ticket, "start_turn")
         global _ACC, _LAST_REPLY
         text = str(text or "").strip()
         if not text:
@@ -808,17 +1042,19 @@ class Plugin:
             return {"ok": False, "error": f"发不出去：{exc}"}
         return {"ok": True}
 
-    async def wait_final(self, timeout: float = 900) -> dict:
+    async def wait_final(self, timeout: float = 900, ticket: str = "") -> dict:
         """等本轮收尾，返回完整正文。前端收到 final 事件就不用调这个"""
+        _require(ticket, "wait_final")
         try:
             await asyncio.wait_for(_FINAL_EVENT.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             return {"ok": False, "error": f"等了 {timeout:.0f}s 还没有答复"}
         return {"ok": True, "text": _LAST_REPLY}
 
-    async def cancel(self) -> dict:
+    async def cancel(self, ticket: str = "") -> dict:
         """掐掉这一轮：断开的后端连接会让那边 CancelledError，
         再补一次 /api/cancel，把子进程树一起收掉"""
+        _require(ticket, "cancel")
         global _ACC
         cfg = _load_server_cfg()
         port = int(cfg.get("port", 18765))
@@ -861,4 +1097,5 @@ class Plugin:
     async def _uninstall(self):
         await _drop_backend()
         await _GAMEPAD.close()
+        _clear_ticket()
         decky.logger.info("DeckMeido 插件卸载")

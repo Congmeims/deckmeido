@@ -277,17 +277,35 @@ def build_system_prompt(workspace: Path | None = None) -> str:
         "full": "当前权限模式=完全访问：用户已预先授权一切操作，所有命令直接执行，不要警告、不要二次确认、不要拒绝。用户的输入本身就是授权。",
     }.get(CFG.get("security", {}).get("permission_mode", "auto"), "")
     p = (
-        f"你是 {name}，{traits}。你运行在一台 Steam Deck 上，是这台设备的智能代理。\n"
+        f"你是 {name}，{traits}。你运行在一台 Steam Deck 上（SteamOS 3.x 最新版，holo 系、"
+        "不可变只读根文件系统、KDE Plasma 桌面），是针对 SteamOS 专门优化的设备代理。\n"
         "你的核心能力是 run_command：可以在设备上执行任意 bash 命令完成任务——"
         "文件管理、进程控制、桌面操作、截屏、Steam 控制、软件安装等，"
         "遇到任务先想 Shell 方案。另外还有便捷工具：查天气、搜索网页、查看已安装游戏、"
         "商店搜游戏、扫描模拟器 ROM、检查系统更新、安装游戏。\n"
+        "SteamOS 两种运行模式，先判断当前在哪种模式再决定怎么操作：\n"
+        "- 游戏模式（Game Mode，gamescope 合成器）：用 gamepad 工具注入手柄操作，"
+        "desktop 的鼠标键盘注入对游戏无效。Steam 主界面/主菜单全靠手柄导航："
+        "用十字键或左摇杆移动焦点，用 A 确认，用 B 返回，用 LB/RB 切换横向页签；"
+        "游戏内暂停菜单一般是 start，地图/信息常是 select，guide 相当于 Xbox 的 Xbox 键。"
+        "键位按 Xbox 布局：lb/rb 是肩键，lt/rt 是扳机（用 trigger 动作给 0..1 力度，"
+        "press/hold 相当于一踩到底），l3/r3 是左右摇杆按下（跑步/蹲/近战常见），"
+        "右摇杆用 stick 的 side=right 推（转视角），share 是 Xbox Series 的分享键"
+        "（部分游戏不认）。一次只能动一个键/轴，连续操作要多次调用；"
+        "推完摇杆或压住扳机后记得 release，否则会一直保持。\n"
+        "呼出 Steam 的快速访问菜单（QAM，音量/亮度/TDP/性能覆盖/蓝牙）和 Steam 主菜单"
+        "是系统层拦物理 Steam 键实现的，虚拟手柄做不到，需要时请用户自己按 Steam 键。\n"
+        "- 桌面模式（Desktop Mode，KDE Plasma + Wayland）：用 desktop 工具点按输入，"
+        "装软件走 Discovery（Flatpak）而不是 pacman；系统目录只读，别试图改 /usr。"
+        "两种模式互切在 Steam 键 → 电源 → 切换到桌面/切换到游戏模式，同样请用户自己按。\n"
         "编程能力：你有自己的工作区（当前：" + str(root) + "）。写代码/改文件用专用工具："
         "list_dir 看结构、read_file 读文件（带行号）、write_file 创建、edit_file 精确替换；"
         "运行测试/脚本再用 run_command。用户让做项目时，先规划再逐步实施，像一个编程搭档。\n"
-        "screenshot 工具可截取当前桌面画面展示给用户：排查问题、确认状态或用户要求看屏幕时主动使用"
-        "（画面会同时显示在聊天里并附给你，你可以直接看图回答用户问题）。\n"
-        f"环境：SteamOS holo、Wayland 桌面会话（Xwayland 在 DISPLAY=:0）、家目录 {Path.home()}、SD 卡在 /run/media 下。\n"
+        "screenshot 工具可截取当前画面展示给用户：排查问题、确认状态或用户要求看屏幕时主动使用"
+        "（画面会同时显示在聊天里并附给你，你可以直接看图回答用户问题；"
+        "游戏模式从 gamescope 抓、桌面模式走 spectacle/mss，工具内部已自动判断）。\n"
+        f"环境：SteamOS holo、Wayland 桌面会话（Xwayland 在 DISPLAY=:0）、家目录 {Path.home()}、"
+        "SD 卡在 /run/media 下、Steam 库默认在 ~/.local/share/Steam。\n"
         "桌面操作分两种：Wayland 原生窗口（如 Flatpak 应用）只能用合成输入。\n"
         "点击/输入一律用 desktop 工具：先 desktop action=focus target=窗口标题关键词 把目标切到前台，\n"
         "截图确认按钮位置后用 action=click 点它，需要打字用 action=type。\n"
@@ -2657,6 +2675,10 @@ async def run_agent(events: list[dict], extra_system: str = "",
                     m = re.search(r"/shots/\S+?\.png", result)
                     if m:
                         event["image"] = m.group(0)
+                    else:
+                        # 抓帧失败：接口层要把原因带到前端，不能让用户只看到
+                        # 一行「已截屏」却一直没有画面
+                        event["error"] = tools.LAST_SHOT_ERROR or "未知原因"
                 events.append(event)
                 await manager.broadcast({"type": "tool_done", "event": event, "ts": time.time(), **_turn_tag()})
                 msgs.append({"role": "tool", "tool_call_id": call["id"], "content": result})

@@ -16,6 +16,8 @@ type Status = {
   proxy: string;
   // 虚拟手柄能不能用（/dev/uinput 存在且可写）
   gamepad: boolean;
+  // 本机鉴权：false 时面板只显示解锁框
+  unlocked: boolean;
 };
 
 // 插件后端推上来的流式消息
@@ -55,8 +57,16 @@ const PAD_ROWS: { key: string; label: string }[][] = [
   [
     { key: "lb", label: "LB" },
     { key: "rb", label: "RB" },
+    { key: "lt", label: "LT" },
+    { key: "rt", label: "RT" },
+  ],
+  [
+    { key: "l3", label: "L3" },
+    { key: "r3", label: "R3" },
     { key: "start", label: "≡" },
     { key: "select", label: "◱" },
+    { key: "guide", label: "Xbox" },
+    { key: "share", label: "分享" },
   ],
   [
     { key: "up", label: "↑" },
@@ -97,6 +107,9 @@ function Content() {
   const [withShot, setWithShot] = useState(true);
   // 手柄区最近一次操作的结果，只用来给一句提示
   const [padMsg, setPadMsg] = useState("");
+  // 解锁：令牌输入框 + 后端给的票据（之后每次调用都要带上）
+  const [tokenInput, setTokenInput] = useState("");
+  const [ticket, setTicket] = useState("");
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   // 流式正文先在 ref 里攒，避免每个 token 都触发一次全量状态重排
@@ -107,11 +120,47 @@ function Content() {
     try {
       const st = (await call<[], Status>("get_status")) as Status;
       setStatus(st);
+      // 后端说没解锁就把本地票据丢掉：插件可能重启过，旧票据已经作废，
+      // 留着只会让每次调用都报「票据不对」
+      if (!st.unlocked) setTicket("");
       return st;
     } catch (e) {
       setError(`插件后端未就绪：${e}`);
       return null;
     }
+  };
+
+  const unlock = async () => {
+    const tk = tokenInput.trim();
+    if (!tk) return;
+    try {
+      const r = (await call<[string], { ok: boolean; ticket?: string; error?: string }>(
+        "unlock",
+        tk
+      )) as { ok: boolean; ticket?: string; error?: string };
+      if (!r.ok || !r.ticket) {
+        setError(r.error ?? "解锁失败");
+        return;
+      }
+      setTicket(r.ticket);
+      setTokenInput("");
+      setError("");
+      await refreshStatus();
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+    }
+  };
+
+  const lock = async () => {
+    try {
+      await call<[string], { ok: boolean }>("lock", ticket);
+    } catch {
+      /* 锁不上不影响界面回到解锁框 */
+    }
+    setTicket("");
+    setTurns([]);
+    setError("");
+    await refreshStatus();
   };
 
   // 流式内容从插件后端来（前端不直连 :18765，绕开 CEF 的 CSP 限制）
@@ -199,11 +248,13 @@ function Content() {
       if (!st) throw new Error("插件后端未就绪");
       if (!st.config_ok) throw new Error(`找不到配置：${st.install_dir}/server/config.toml`);
       if (!st.token_ok) throw new Error("后端配置里的 token 是空的，先在网页设置页生成一个");
+      if (!st.unlocked || !ticket) throw new Error("插件未解锁，先输入访问令牌");
 
       let image: string | null = null;
       if (withShot) {
-        const shot = (await call<[], { ok: boolean; image?: string; error?: string }>(
-          "screenshot"
+        const shot = (await call<[string], { ok: boolean; image?: string; error?: string }>(
+          "screenshot",
+          ticket
         )) as { ok: boolean; image?: string; error?: string };
         if (shot.ok && shot.image) {
           image = shot.image;
@@ -213,16 +264,19 @@ function Content() {
         }
       }
 
-      const res = (await call<[string, string | null], { ok: boolean; error?: string }>(
+      const res = (await call<[string, string | null, string], { ok: boolean; error?: string }>(
         "start_turn",
         text,
-        image
+        image,
+        ticket
       )) as { ok: boolean; error?: string };
       if (!res.ok) throw new Error(res.error ?? "发不出去");
 
       // 正常情况下面的那个 final 事件会先把 busy 关掉；这里是超时兜底
-      const fin = (await call<[], { ok: boolean; text?: string; error?: string }>(
-        "wait_final"
+      const fin = (await call<[number, string], { ok: boolean; text?: string; error?: string }>(
+        "wait_final",
+        900,
+        ticket
       )) as { ok: boolean; text?: string; error?: string };
       if (busyRef.current) {
         if (fin.ok && fin.text) {
@@ -244,7 +298,7 @@ function Content() {
     setBusyBoth(false);
     setActivity("");
     try {
-      await call<[], { ok: boolean; error?: string }>("cancel");
+      await call<[string], { ok: boolean; error?: string }>("cancel", ticket);
     } catch {
       /* 断开本身已经够用，取消失败不再打扰用户 */
     }
@@ -257,15 +311,49 @@ function Content() {
       return;
     }
     try {
-      const r = (await call<[string], { ok: boolean; error?: string }>(
+      const r = (await call<[string, number, string], { ok: boolean; error?: string }>(
         "gamepad_press",
-        key
+        key,
+        80,
+        ticket
       )) as { ok: boolean; error?: string };
       setPadMsg(r.ok ? `已发送 ${key.toUpperCase()}` : (r.error ?? "发送失败"));
     } catch (e: any) {
       setPadMsg(String(e?.message ?? e));
     }
   };
+
+  // 未解锁：面板只留解锁框，提问和手柄一律不显示，避免用户点了才发现没权限
+  if (status && !status.unlocked) {
+    return (
+      <PanelSection title="DeckMeido">
+        <PanelSectionRow>
+          <div style={{ fontSize: 10, color: DIM, lineHeight: 1.5 }}>
+            插件以 root 运行，需要先输入访问令牌解锁
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <TextField
+            label="访问令牌"
+            value={tokenInput}
+            onChange={(e) => setTokenInput(e.target.value)}
+          />
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={unlock}>
+            解锁
+          </ButtonItem>
+        </PanelSectionRow>
+        {error && (
+          <PanelSectionRow>
+            <div style={{ ...CARD, color: ERR_COLOR, background: "rgba(224,108,117,.1)" }}>
+              {error}
+            </div>
+          </PanelSectionRow>
+        )}
+      </PanelSection>
+    );
+  }
 
   return (
     <PanelSection title="DeckMeido">
@@ -342,6 +430,12 @@ function Content() {
           </ButtonItem>
         </PanelSectionRow>
       )}
+
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={lock}>
+          锁定（退出解锁）
+        </ButtonItem>
+      </PanelSectionRow>
 
       <PanelSectionRow>
         <Focusable

@@ -308,12 +308,25 @@ deckmeido/
 
 - ~~**Decky 插件载体**~~ — 已做：`plugin/` 是独立 Decky 插件，`plugin/deploy.sh` 装到 `~/homebrew/plugins`（目录属 `root:root`，需要 sudo，或建软链接指向 `~/deckmeido/plugin`）。QAM 面板里能对话、看流式回答、点虚拟手柄
 - ~~**游戏内截帧**~~ — 已做：`pw-dump` 找到 `node.name=gamescope` 且 `media.class=Video/Source` 的节点，`gst-launch-1.0` 抓帧。踩过两个坑：① root 跑时要 `runuser -u deck` 降权，`XDG_RUNTIME_DIR` 必须指向 `/run/user/1000`；② `pipewiresrc path=N num-buffers=6` 必须拆成独立 argv token，整段塞一个 token 会让 gst 报 `syntax error` 并静默降级成纯文本
-- ~~**虚拟手柄**~~ — 已做：`plugin` 侧 `_VirtualPad` 走 `/dev/uinput`，ABXY / 十字键 / 摇杆可用；`deck` 用户对 `/dev/uinput` 有 ACL（`user:deck:rw-`）
+- ~~**虚拟手柄**~~ — 已做：`plugin` 侧 `_Gamepad` 走 `/dev/uinput`，ABXY / 十字键 / 摇杆可用；`deck` 用户对 `/dev/uinput` 有 ACL（`user:deck:rw-`）
+- ~~**手柄补全 Xbox 布局**~~ — 已做：在 `guide` 之外补齐 `lt`/`rt`（`ABS_Z`/`ABS_RZ`，`trigger` 动作给 0..1 力度，`press`/`hold` 等于一踩到底）、`l3`/`r3`（`BTN_THUMBL`/`BTN_THUMBR`）、右摇杆（`ABS_RX`/`ABS_RY`，`stick` 加 `side=right`）、`share`（`KEY_RECORD` 0xA7，Series X|S 才有，部分驱动/游戏不认）。`release` 除摇杆回中外还会松开仍踩着的扳机，避免「松开后车还在开」
+- ~~**系统提示词针对 SteamOS 优化**~~ — 已做：`build_system_prompt` 明确「SteamOS 3.x holo、只读根、KDE Plasma」身份，并分出两种运行模式的操作要点：游戏模式（gamescope，只能用手柄注入，十字键移动焦点 / A 确认 / B 返回 / LB·RB 切页签 / start 暂停菜单 / select 地图 / guide 为 Xbox 键 / LT·RT 扳机 / L3·R3 摇杆按下 / 右摇杆转视角 / share 分享键）与桌面模式（KDE Plasma，用 desktop 工具点按、装软件走 Discovery 的 Flatpak、`/usr` 只读）
+  - 明确告知模型：QAM 与 Steam 主菜单靠系统层拦物理 Steam 键，虚拟手柄发不出来，需要时请用户自己按；模式互切同理
+- ~~**手柄补 Xbox/Guide 键**~~ — 已做：`_PAD_KEYS` / `_GAMEPAD_KEYS` 新增 `guide` → `BTN_MODE`(0x13C)，工具 `gamepad` 的 `button` 枚举与 QAM 面板同步加上（面板标签「Xbox」）。SteamOS 里它只会被游戏当成 Xbox Guide 键，呼不出 Steam 菜单 —— 这条限制已写进提示词
+- ~~**Decky 插件本机鉴权**~~ — 已做：插件后端以 root 加载，`screenshot` / `gamepad_*` / `start_turn` / `wait_final` / `cancel` / `lock` 全部要过 `_require(ticket, 方法名)`，未解锁直接抛 `PermissionError`。`get_status` 故意不设门（前端要先知道解锁态才决定显示哪个界面，且它只报端口与抓帧能力）
+  - 令牌优先级：环境变量 `DECKMEIDO_QAM_TOKEN` > 插件设置目录 `plugin.toml` 的 `[plugin] qam_token` > **默认 `meido`**（与后端 `config.example.toml` 默认值一致，用户只需记一个）
+  - 解锁后发 32 字节随机票据，落盘到 `decky.DECKY_PLUGIN_SETTINGS_DIR/qam_session.json`（目录 `0700`、文件 `0600`），12 小时有效，Decky 重启不用重输；`lock` 与插件卸载都会删掉它
+  - 令牌比较走 `hmac.compare_digest`（先各自 sha256 成定长再比），连续错 5 次冷却 30 秒，避免 4 位级令牌被脚本穷举
+  - 前端：未解锁时 QAM 只渲染解锁框（输入令牌 → 解锁），解锁后才显示提问区与手柄区，底部有「锁定（退出解锁）」
+  - 已验证：13 项（默认令牌、8 个受保护方法在未解锁时全部拒绝、大小写无关、票据落盘、错票据拒绝、盘上恢复、过期失效、lock 清除、连续失败冷却、环境变量覆盖）
 - **远程控制** — 让局域网设备通过 HTTP 注入按键与触摸，实现「远程下一句指令，agent 代为操作」。路线已确认：`ydotool`（键鼠，`ydotoold` 已在跑）+ `/dev/uinput`（手柄，`deck` 已在 `input` 组且设备可写）；decky-flow 的 EIS 桥是本机 Unix socket 而非网桥，这一层可以省掉
   - 前置：**先做网络鉴权**。`:18765` 目前无 token 监听 `0.0.0.0`，等于把「可执行命令」的入口开放给整个局域网
   - 已实测：切到 gamescope 后后端存活、`:18765` 正常监听、`ydotoold` 未断、QAM 的 WebSocket 连通
   - 定位：LLM 推理一来一回 1~3 秒，不适合动作游戏，适合「帮我跑日常 / 挂机刷素材」
-- **抓帧失败要有提示** — 现在 PipeWire 抓帧失败会静默降级成纯文本问答，界面上看不出「这张图没抓到」，用户会以为模型没看画面
+- ~~**抓帧失败要有提示**~~ — 已做：`_screenshot_gamescope` 从 `bool` 改成返回「成功即空串 / 失败即原因」，逐层给出具体原因（找不到 gamescope 节点 / 没装 gst-launch-1.0 / 找不到用户会话 / 25s 超时并 kill 掉进程 / gst stderr 最后一行）。失败文本会明确要求模型「告诉用户没截到图，不要凭空描述屏幕内容」，并新增 `tools.LAST_SHOT_ERROR` 经 `tool_done` 事件的 `error` 字段送到前端：时间线那一行变红、显示「截屏失败」并默认展开原因
+  - 顺带修掉两个真 bug：① 未装 `mss` 时 `import mss` 抛 `ModuleNotFoundError` 直接把工具调用炸掉，那句「spectacle 与 mss 都不可用」的提示永远走不到；② 桌面模式失败分支没有清 `LAST_VISION`，模型会拿上一张成功截图回答（现在每次截图开始就把它置空）
+  - 黑屏残片（<10KB）现在会被删掉并计入失败，不再被当成「已有截图」沿用
+  - 已验证：游戏模式三种前置失败、桌面模式双后端不可用共四条路径的原因文本与状态清理均符合预期
 
 ### 已知问题
 

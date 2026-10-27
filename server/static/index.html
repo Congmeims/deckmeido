@@ -266,6 +266,10 @@
   }
   .tl-head.clickable { cursor: pointer; }
   .tl-head.clickable:hover { color: var(--text); background: var(--hover); }
+  /* 失败行：截图没抓到这类「说完成了但其实没完成」的情况要显眼 */
+  .tl-head.err { color: #d9534f; }
+  .tl-head.err .tl-ico { background: #d9534f; opacity: .9; }
+  .tl-err { color: #d9534f; word-break: break-word; }
   .tl-ico {
     position: absolute; left: -19px; top: 8px;
     width: 7px; height: 7px; border-radius: 50%;
@@ -1388,7 +1392,7 @@
       case 'write_file':
       case 'edit_file':   return { text: '已编辑 1个文件' };
       case 'run_command': return { text: '已运行', chip: ev.summary };
-      case 'screenshot':  return { text: '已截屏' };
+      case 'screenshot':  return { text: ev.error ? '截屏失败' : '已截屏' };
       case 'get_weather': return { text: '已查询天气', chip: ev.summary };
       case 'web_search':  return { text: '已搜索', chip: ev.summary };
       case 'list_installed_games': return { text: '已查询游戏库' };
@@ -1467,9 +1471,11 @@
     }
     if (ev.type !== 'tool') return;
     var info = toolRowInfo(ev);
-    var hasBody = !!(ev.output || ev.image || ev.diff || (ev.files && ev.files.length));
+    var hasBody = !!(ev.output || ev.image || ev.diff || ev.error || (ev.files && ev.files.length));
     var r = makeTlRow(ev.approved ? ('已批准：' + (ev.summary || '')) : info.text,
                       null, false);
+    // 失败行标红，和「已完成」的灰行一眼区分开
+    if (ev.error) r.head.classList.add('err');
     if (!ev.approved && info.chip) {
       var chipEl = document.createElement('span');
       chipEl.className = 'tl-chip';
@@ -1483,8 +1489,8 @@
       arrow.className = 'tl-arrow';
       // 三角由 CSS 绘制，方向交给 .tl.open 旋转（截图行默认展开）
       r.head.appendChild(arrow);
-      // 截图默认展开，让用户直接看到画面
-      if (ev.image) r.tl.classList.add('open');
+      // 截图默认展开，让用户直接看到画面；失败也展开，原因要一眼可见
+      if (ev.image || ev.error) r.tl.classList.add('open');
       var body = document.createElement('div');
       body.className = 'tl-body' + (ev.name === 'run_command' ? ' term' : '')
                        + (ev.image ? ' pic' : '');
@@ -1513,6 +1519,12 @@
         img.src = ev.image + '?token=' + encodeURIComponent(token);
         img.alt = '屏幕截图';
         body.appendChild(img);
+      } else if (ev.error) {
+        // 失败原因单独显示：模型会据此告诉用户，界面上也要能直接看到
+        var em = document.createElement('div');
+        em.className = 'tl-err';
+        em.textContent = '截图没有成功：' + ev.error;
+        body.appendChild(em);
       } else if (ev.output) {
         body.textContent = ev.output;
       }
