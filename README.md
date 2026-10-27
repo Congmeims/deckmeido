@@ -294,12 +294,15 @@ deckmeido/
 
 ### 实时画面
 
-- **网页端实时画面（MJPEG 推流）** — 网页端以 30fps 或可变帧率查看设备实时画面，用于遥控时确认状态
-  - 路线：游戏模式复用现有 gamescope PipeWire 节点，`pipewiresrc ! videorate ! videoscale ! jpegenc ! multipartmux ! fdsink` 常驻管线，前端 `<img src="/api/stream?token=…">` 走浏览器原生 MJPEG；桌面模式只能走 portal `ScreenCast`（`CreateSession` / `SelectSources` / `Start` / `OpenPipeWireRemote` 接口齐全，但首次需用户在弹出的系统对话框里授权）
-  - 实测数据：`gst-launch-1.0` 的 `pipewiresrc` / `jpegenc` / `multipartmux` 三个插件齐备；1280×800 q70 约 16KB/帧（PIL 编码 129fps，CPU 有余量），30fps ≈ 0.5MB/s，960×600 q60 ≈ 0.3MB/s
-  - 已排除：`mss` 抓 30 帧仅 0.12s 但 Wayland 原生 gamescope 表面全黑；`spectacle` 单次 806ms，约 1.2fps
-  - 已知坑：遮罩是独立 Layer Shell 窗口，游戏模式截不到但桌面模式会混入画面，推流期间需自动 `lift` 或由前端叠加；持续 30fps 编码在掌机上有耗电与发热代价，默认按需（静止降帧 / 帧差触发）；MJPEG 流必须挂 `check_token`，否则等于新开一个免密看屏入口
-  - 待定：分辨率与画质档位、是否只在对话框打开时推流、要不要另做 WebRTC 备选（延迟更低但实现重）
+- ~~**网页端实时画面（H.264 硬编 / fragmented MP4）**~~ — 已做：`server/stream.py` 起一条常驻 `gst-launch-1.0` 管线（`pipewiresrc ! videoconvert ! videorate ! vaapih264enc ! h264parse ! mp4mux ! fdsink`），从 stdout 的 MP4 字节流里按 ISO BMFF box 边界切开后广播；`GET /api/stream`（必带 `check_token`）返回 `video/mp4` 分片流，前端 `<video muted autoplay playsinline>` 边下边播
+  - 为什么换掉 MJPEG：60fps 下 MJPEG 每帧整图编码，jpegenc 单帧 7~8ms、要吃半个核并明显发热；H.264 只编帧间差异，`vaapih264enc` 走 AMD VCN 固定单元，CPU 基本不参与
+  - 编码器探测：按「最终运行身份」（root 时先 `runuser` 降权到 deck）实跑 `videotestsrc ! vah264enc ! fakesink`，能返回 0 才用 vaapi；否则回落 `x264enc speed-preset=ultrafast tune=zerolatency`，两者都不行才报错——避免前端挂一个永远黑着的框
+  - 实现要点：多浏览器共用同一条 gst 管线（只编码一次）；`ftyp+moov`（含 SPS/PPS）缓存下来，后接入的客户端先收到它才不会解码失败；每客户端队列 maxsize=3（约 300ms，太深延迟累积、太浅丢 fragment 会卡到下一个关键帧，`keyframe-period=60` 即 1s 一个 IDR）；最后一条流断开自动停管线
+  - 前端：「画面」按钮仅游戏模式显示，面板可拖动 / 拖右下角缩放（几何存 localStorage）；用 `loadedmetadata` 判定出画（分片 MP4 不会触发 `load`），8s 无画面自动重连 3 次；`stalled` 提示卡住、`error` 提示断流；播放器解出的 `videoWidth/videoHeight` 回传 `POST /api/stream/report` 供角标显示
+  - 遮罩：推流期间后台每 0.5s 重申一次 `ON_OVERLAY_LIFT(True)`，工具收尾复位也追不上，保证遮罩不进画面
+  - 已知取舍：默认 60fps、vaapi CBR 4000kbps（约 0.5MB/s，1280×800 下肉眼无损；软编回落时按 `DEFAULT_QUALITY` 折算），未做 WebRTC；桌面模式仍需走 portal ScreenCast，暂未实现
+  - 已验证：MP4 box 切分在 1B / 7B / 64B / 4KB 分块边界下都能完整还原（header 与 6 个 fragment 字节一致），错位数据不会炸掉；`_probe_encoder` 需要 Deck 上实测
+  - 复用依据：`pipewiresrc` / `vaapih264enc` / `h264parse` / `mp4mux` 插件在 SteamOS 上齐备，AMD VCN 支持 H.264 high profile；`mss` 抓 gamescope 表面全黑、`spectacle` 仅约 1.2fps，均排除
 
 ### 游戏模式
 

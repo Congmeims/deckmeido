@@ -18,12 +18,12 @@ from pathlib import Path
 
 import tomllib
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Header, HTTPException, Depends, UploadFile, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .llm import LLMClient
-from . import depcheck, power, singleton, tools, updater
+from . import depcheck, power, singleton, stream, tools, updater
 from .tts import TTS
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -2344,6 +2344,40 @@ async def api_overlay_state(ack: int = 0, hidden: int = 1):
             _overlay_ack["passthrough"] = want
         _overlay_ack["lift"] = _overlay_state["lift"]
     return _overlay_state
+
+
+# ---------- 实时画面 ----------
+
+@app.get("/api/stream/status", dependencies=[Depends(check_token)])
+async def api_stream_status():
+    return stream.STREAM.status()
+
+
+@app.get("/api/stream")
+async def api_stream(token: str | None = Query(default=None),
+                     x_token: str | None = Header(default=None)):
+    """实时画面（H.264 / fragmented MP4）。
+
+    前端用 `<video src="/api/stream?token=…">` 边下边播：mp4mux 以分片模式输出，
+    moov 在最前面，浏览器拿到就能解。这条流必须挂令牌校验——否则等于
+    新开一个免密看屏入口。最后一条流断开时自动停掉 gst 管线，不空烧 CPU。
+    """
+    check_token(token, x_token)
+    # 起点失败（没有 gamescope 节点 / 缺编码器）要让前端知道原因，而不是挂一个黑框
+    if not stream.STREAM.running and not (await stream._gamescope_pw_node()):
+        raise HTTPException(status_code=503, detail="实时画面仅游戏模式可用（未找到 gamescope 节点）")
+    return StreamingResponse(
+        stream.STREAM.mp4(),
+        media_type="video/mp4",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/stream/report", dependencies=[Depends(check_token)])
+async def api_stream_report(width: int = Query(...), height: int = Query(...)):
+    """前端播放器解出实际分辨率后回报一次，供角标显示"""
+    stream.STREAM.set_size(width, height)
+    return {"ok": True}
 
 
 @app.on_event("startup")
