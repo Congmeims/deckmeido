@@ -27,6 +27,7 @@ import subprocess
 import time
 import tomllib
 from pathlib import Path
+from urllib.parse import quote
 
 import decky
 
@@ -1223,6 +1224,10 @@ _THREAD: list[dict] = []
 _THREAD_MAX = 200     # 只留最近这么多条，再往前翻也用不上
 # 最近一次推给面板的 thread 快照，等界面 ready 时补发（见 _emit）
 _LAST_THREAD: dict | None = None
+# 最近一次截图落盘的本地路径：它比后端回显的 /shots/ 更早可用。
+# 后端要等 ws 把 16MB 的图收完才落盘，这段空窗里各端（尤其电脑网页）只看到
+# 一条没有画面的提问，看起来就像「插件截的图在电脑端不显示」
+_LAST_SHOT_PATH = ""
 # 面板展示的来源标记，和后端、网页端的叫法保持一致：
 # 电脑（PC 浏览器）/ 手机（手机浏览器）/ 掌机（Deck 桌面客户端）/ 插件（QAM）
 _CLIENT_LABEL = {"web": "电脑", "mobile": "手机", "client": "掌机", "qam": "插件"}
@@ -1257,17 +1262,20 @@ def _push_thread(item: dict):
 
 
 def _shot_url(path: str) -> str:
-    """把后端给的 /shots/xxx 拼成面板能直接加载的地址
+    """把截图路径拼成面板能直接加载的地址
 
-    面板跑在 Deck 本机的 CEF 里，和后端同机，走回环即可；
-    token 必须带上，静态图也走鉴权。
+    后端给的 /shots/xxx 走回环；插件自己截的那张在 /tmp 下，交给后端落盘以后
+    才会有 /shots/ 的地址。所以这里两种都认：以 / 开头的当后端静态路径，
+    其余的当本机文件路径。token 必须带上，静态图也走鉴权。
     """
     if not path:
         return ""
     cfg = _load_server_cfg()
     port = int(cfg.get("port", 18765))
     token = str(cfg.get("token", "") or "")
-    return f"http://127.0.0.1:{port}{path}?token={token}"
+    if path.startswith("/"):
+        return f"http://127.0.0.1:{port}{path}?token={token}"
+    return f"http://127.0.0.1:{port}/shots/local?path={quote(path)}&token={token}"
 
 
 def _sync_thread(hist: list):
@@ -1402,6 +1410,10 @@ async def _read_loop(bk: _Backend):
                 if isinstance(ev, dict) and ev.get("image"):
                     item["image"] = _shot_url(str(ev["image"]))
                     break
+            # 后端那条广播里带不出图（落盘失败）时，若这一轮就是本机刚截的那张，
+            # 用本地那份顶上：面板上总得有一张能看到的画面
+            if not item.get("image") and _LAST_SHOT_PATH and item["client"] == "qam":
+                item["image"] = _shot_url(_LAST_SHOT_PATH)
             _push_thread(item)
             continue
         if typ == "assistant_message":
@@ -1767,6 +1779,8 @@ class Plugin:
         shot.parent.mkdir(parents=True, exist_ok=True)
         shot.write_bytes(base64.b64decode(payload))
         decky.logger.info(f"screenshot 返回 ok，图存到 {shot}（{shot.stat().st_size} 字节）")
+        global _LAST_SHOT_PATH
+        _LAST_SHOT_PATH = str(shot)
         # 面板上的预览另存一张缩略图：确认「截到的是哪一帧」不需要原图，
         # 几十 KB 的 JPEG 才塞得进返回值
         return {"ok": True, "shot": str(shot), "thumb": _make_thumb(shot), "game": game}
@@ -1848,13 +1862,10 @@ class Plugin:
         decky.logger.info("start_turn：已发出")
         # 提问不等后端回声，先在面板上落一条：后端广播回来时会按 ts 去重，
         # 不会出现两条一模一样的「插件端」。
-        # 显示用 brief（截屏询问只有一句短语），空的时候才退回正文
-        _push_thread({
-            "role": "user",
-            "text": str(brief or "").strip() or text,
-            "client": "qam",
-            "ts": time.time(),
-        })
+        # 本机这次截的图连同上面这份 payload 一起交给后端了：清掉本地记录，
+        # 免得下一次别的端发来的、恰好也没带图的提问被塞上这张
+        global _LAST_SHOT_PATH
+        _LAST_SHOT_PATH = ""
         return {"ok": True}
 
     async def wait_final(self, timeout: float = 900, ticket: str = "") -> dict:

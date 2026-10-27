@@ -248,6 +248,8 @@ def _build_llm_msgs(hist: list[dict], sys_prompt: str, sid: str = "") -> list[di
 # 单张图 base64 的上限。网关实测 1600 万字符必挂；给到 200 万字符（约 1.5MB 原图）
 # 已经远超正常截图，留足余量的同时保证单个请求体不会把链路撑爆
 _MAX_IMG_CHARS = 2_000_000
+# 原图字节数的对应上限（base64 大约是原图的 1.37 倍）
+_MAX_IMG_BYTES = int(_MAX_IMG_CHARS / 1.37 * 0.9)
 
 
 def _shrink_oversized_images(content):
@@ -1159,10 +1161,60 @@ def _image_part(data: str, prompt: str) -> dict | None:
             mime = "image/jpeg"
         elif blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
             mime = "image/webp"
+    # 大图在这里就压成 JPEG：不然 base64 越过 _MAX_IMG_CHARS 之后，
+    # 重发历史时会被替换成「图片过大」的说明，模型从来就没看到过这张图
+    big = len(blob) > _MAX_IMG_BYTES or len(raw) > _MAX_IMG_CHARS * 0.7
+    if big:
+        packed = _jpeg_for_llm(blob)
+        if packed is not blob:
+            blob, mime = packed, "image/jpeg"
+            raw = base64.b64encode(blob).decode()
     return {"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{raw}"}},
         {"type": "text", "text": prompt},
     ]}
+
+
+def _shot_caption(seq: int) -> str:
+    """给随提问附带的画面配一句说明
+
+    同一条会话里连着截几次，上下文里就并排躺着好几张图，文案还一字不差。
+    模型分不清哪张对应当前这一问，经常拿着上一张回答（用户看到的就是
+    「截的是游戏画面，答的还是几分钟前的 Steam 菜单」）。所以给这张编号，
+    并明确告诉它只看最新这张，前面的都已过时。
+    """
+    if seq <= 1:
+        return "（这是本次提问时截取的当前画面，请依据这张图回答）"
+    return (f"（这是本次提问时截取的当前画面，第 {seq} 张。"
+            "前面的画面都是更早的提问，已经过时；请只依据这一张回答）")
+
+
+def _jpeg_for_llm(blob: bytes, max_side: int = 1280, quality: int = 72) -> bytes:
+    """把一张图压成适合发给模型的 JPEG
+
+    插件截的是 1280x800 全屏 JPEG q90，一张两百多 KB，base64 之后三十多万字符，
+    这是正常量级；但别的端（PC 网页、手机）随手拖进来的截图动辄几 MB 的 PNG，
+    base64 之后会越过 _MAX_IMG_CHARS，被 _shrink_oversized_images 换成一句
+    「这张图太大无法重新发送」—— 表现就是模型说「我这边只收到图片过大的提示，
+    画面内容看不到」。既然历史上重发时一定会被压掉，不如收进来的那一刻就压好：
+    模型看到的是同一张画面，界面上留的也是压过的那份（还省磁盘）。
+    压不动就原样返回，交给原来的保护逻辑兜底。
+    """
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+        img = Image.open(BytesIO(blob))
+        img.load()
+        if max(img.size) > max_side:
+            img.thumbnail((max_side, max_side))
+        buf = BytesIO()
+        img.convert("RGB").save(buf, "JPEG", quality=quality, optimize=True)
+        out = buf.getvalue()
+        # 小图（已经在限额内的 PNG）压完反而更大时，优先小的那份
+        return out if len(out) < len(blob) or max(img.size) > max_side else blob
+    except Exception:
+        return blob
 
 
 def _save_incoming_shot(data: str) -> dict | None:
@@ -1723,6 +1775,17 @@ async def handle_chat(text: str, announce: bool = True,
     # 前端删除消息时靠这个 ts 找回后端对应的那条：两处各自 time.time() 会差几毫秒，
     # 按 ts 精确匹配就永远对不上，删除按钮会退化成「删最后一条同角色消息」
     user_ts = time.time()
+    # 上下文里已经有几张随提问附带的画面：这一张要编号，并声明自己才是「当前画面」。
+    # 同一条会话里连着截两次，两张图在上下文里长得几乎一样、文案也一字不差，
+    # 模型会挑上一张来回答（截的是游戏画面，答的还是早前那张 Steam 菜单）
+    if image_part:
+        total = sum(1 for m in hist
+                    if isinstance(m.get("content"), list)
+                    and any(p.get("type") == "image_url" for p in m["content"]
+                            if isinstance(p, dict))) + 1
+        for p in image_part["content"]:
+            if isinstance(p, dict) and p.get("type") == "text":
+                p["text"] = _shot_caption(total)
     # 来源标记：网页/手机/桌面客户端/QAM 插件各标各的，同一条对话里混着来
     # 也能看清谁说的。只挂在 user 消息上，且为空时不写字段，老数据零影响。
     # device 是每台浏览器各自的身份：client 只说「哪种浏览器」，两台电脑都是 web，
@@ -1781,9 +1844,11 @@ async def handle_chat(text: str, announce: bool = True,
         elif pending_action:
             # 有新消息但未确认，取消挂起操作
             action, pending_action = pending_action, None
-            reply = f"已取消：{action['description']}。\n\n" + await run_agent(events, hist=hist)
+            reply = f"已取消：{action['description']}。\n\n" + await run_agent(
+                events, hist=hist, image_part=image_part)
         else:
-            reply = await _run_agent_guarded(events, hist=hist)
+            # 画面要一路传进 run_agent：它才知道这一轮不用自己再截图
+            reply = await _run_agent_guarded(events, hist=hist, image_part=image_part)
     except asyncio.CancelledError:
         # 用户点了终止：广播终止消息并向上传递
         await manager.broadcast({"type": "assistant_message", "text": "已终止当前操作",
@@ -2683,13 +2748,20 @@ def _looks_like_refusal(reply: str) -> bool:
     return any(m in reply for m in _REFUSAL_MARKS)
 
 
-async def _run_agent_guarded(events: list[dict], hist: list[dict] | None = None) -> str:
-    """带总超时和拒绝重试的 agent 入口：任何环节卡死都不会让对话无限挂起"""
+async def _run_agent_guarded(events: list[dict], hist: list[dict] | None = None,
+                             image_part: dict | None = None) -> str:
+    """带总超时和拒绝重试的 agent 入口：任何环节卡死都不会让对话无限挂起
+
+    image_part 是本轮提问自带的画面：传下去后 run_agent 不再让模型自己截图
+    （它拍到的往往是面板本身，或者和用户发的那张不是同一帧，多一张图只会
+    让它挑错图来回答）
+    """
     hist = history if hist is None else hist
     # 单轮超时：配了 max_tool_rounds 才有上限；不限轮数时给足时间（仍有硬超时兜底）
     agent_timeout = 280 if MAX_TOOL_ROUNDS > 0 else 1800
     try:
-        reply = await asyncio.wait_for(run_agent(events, hist=hist), timeout=agent_timeout)
+        reply = await asyncio.wait_for(
+            run_agent(events, hist=hist, image_part=image_part), timeout=agent_timeout)
     except asyncio.TimeoutError:
         return "（这轮处理超时了——可能是模型响应慢或命令太久。任务可能已在后台执行，换个问法或让我检查下结果）"
     # 系统层兜底：full 模式下模型空口拒绝（没调任何工具）→ 注入纠正指令重试一次
@@ -2709,8 +2781,12 @@ async def _run_agent_guarded(events: list[dict], hist: list[dict] | None = None)
 
 
 async def run_agent(events: list[dict], extra_system: str = "",
-                   hist: list[dict] | None = None) -> str:
-    """LLM + 工具调用循环（流式），思考链/工具调用/终端输出写入 events 供 UI 展示"""
+                   hist: list[dict] | None = None,
+                   image_part: dict | None = None) -> str:
+    """LLM + 工具调用循环（流式），思考链/工具调用/终端输出写入 events 供 UI 展示
+
+    image_part 非空表示本轮提问自带画面：这一轮把截图工具摘掉（见 round_tools）
+    """
     global pending_action, _ctx_used
     hist = history if hist is None else hist
     # 本轮归属（中途切会话也不改这份 sid）
@@ -2722,6 +2798,9 @@ async def run_agent(events: list[dict], extra_system: str = "",
     streaming = False  # 是否已开始向用户流式输出正文
     # 本轮正文累积：流式回调里按节流频率落盘，进程被杀最多丢一小段
     stream_text: list[str] = []
+    # 上下文里一共有几张画面（含本轮提问自带的那张）。模型自己截图时，新注入的
+    # 那张要接着编号，否则它和旧图的说明一字不差，模型分不清哪张是当前的
+    turn_shot_no = sum(1 for m in hist if isinstance(m.get("content"), list))
 
     def _stamp_parts(tail: str = "") -> list[dict]:
         """当前「屏幕上出现过的内容」快照，按原顺序
@@ -2785,6 +2864,11 @@ async def run_agent(events: list[dict], extra_system: str = "",
         round_no = 0
         # 本轮是否已经往对话里塞过一张截图（塞过就不再塞第二张）
         turn_shot_seen = False
+        # 本轮提问自带画面时，模型再自己截一张就是多余的：它拍到的往往是
+        # DeckMeido 面板本身，或者和用户发的那张不是同一帧，多一张图只会让
+        # 它挑错图回答。这时把截图工具从这一轮的清单里摘掉
+        round_tools = tools.TOOLS if image_part is None else [
+            t for t in tools.TOOLS if t["function"]["name"] != "screenshot"]
         while MAX_TOOL_ROUNDS <= 0 or round_no < MAX_TOOL_ROUNDS:
             round_no += 1
             # 单轮里工具往返也会堆积上下文，超过阈值就先压缩再继续。
@@ -2803,7 +2887,7 @@ async def run_agent(events: list[dict], extra_system: str = "",
                     events.append({"type": "text", "text": "".join(stream_text)})
                 stream_text.clear()
 
-            msg = await llm.chat_with_tools_stream(msgs, tools.TOOLS, on_delta=on_delta,
+            msg = await llm.chat_with_tools_stream(msgs, round_tools, on_delta=on_delta,
                                                    on_thought=on_thought,
                                                    max_tokens=_output_budget(msgs))
             if thought_open:
@@ -2942,12 +3026,13 @@ async def run_agent(events: list[dict], extra_system: str = "",
                                      "（本轮已经截过图，画面就在上面，直接看图回答，不要重复截图）"})
                     else:
                         turn_shot_seen = True
+                        turn_shot_no += 1
                         try:
                             import base64
                             b64 = base64.b64encode(Path(tools.LAST_VISION).read_bytes()).decode()
                             msgs.append({"role": "user", "content": [
                                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                                {"type": "text", "text": "（这是刚才截取的当前桌面画面，根据画面回答用户的问题）"},
+                                {"type": "text", "text": _shot_caption(max(turn_shot_no, 1))},
                             ]})
                         except Exception:
                             pass
@@ -3027,6 +3112,26 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
     finally:
         # 兜底：不管怎么退出都要摘掉连接，否则 broadcast 会一直往死连接上发
         manager.disconnect(ws)
+
+
+@app.get("/shots/local", dependencies=[Depends(check_token)])
+async def shots_local(path: str = Query(default="")):
+    """把插件截图落在本机 /tmp 下的那份读出来给各端显示
+
+    插件的图在交给后端之前只存在于 Deck 的临时目录：电脑网页那头刷新历史时，
+    后端这边还没落盘，屏幕上就只有一条没有画面的提问。所以允许按绝对路径取。
+    只认 /tmp 下、JPEG 结尾的文件，别的一概不认——否则这个接口等于开放整台
+    Deck 的文件读取。
+    """
+    p = Path(path)
+    try:
+        real = p.resolve()
+    except OSError:
+        raise HTTPException(status_code=404, detail="file not found")
+    if (real.suffix.lower() not in (".jpg", ".jpeg")
+            or not str(real).startswith("/tmp/") or not real.is_file()):
+        raise HTTPException(status_code=404, detail="file not found")
+    return FileResponse(real, media_type="image/jpeg")
 
 
 # 静态网页控制台（放最后挂载，避免覆盖 API 路由）

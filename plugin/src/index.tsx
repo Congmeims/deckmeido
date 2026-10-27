@@ -266,7 +266,7 @@ const CLIENT_LABEL: Record<string, string> = {
 
 // 截屏询问在面板上留的那句配文：真正的提示词有一百多字，
 // 长显会把整个面板撑开，用户也不用读它
-const SHOT_ASK_BRIEF = "看看这关怎么过";
+const SHOT_ASK_BRIEF = "看看这个，我该怎么做？";
 
 export default definePlugin(() => ({
   name: "DeckMeido",
@@ -778,12 +778,14 @@ function Content() {
           style={{ maxHeight: 330, overflowY: "auto", display: "block" }}
         >
           {streaming && (
-            <div style={{ display: "flex", justifyContent: "flex-start", marginBottom: 6 }}>
+            <div style={{ display: "flex", justifyContent: "flex-start", marginBottom: 4 }}>
               <div
                 style={{
                   ...CARD,
-                  marginBottom: 0,
-                  maxWidth: "82%",
+                  margin: "0",
+                  padding: "5px 6px",
+                  maxWidth: "100%",
+                  minWidth: 0,
                   background: "rgba(255,255,255,.06)",
                   borderLeft: "2px solid #5aa9e6",
                 }}
@@ -807,15 +809,19 @@ function Content() {
                 style={{
                   display: "flex",
                   justifyContent: mine ? "flex-end" : "flex-start",
-                  marginBottom: 6,
+                  marginBottom: 4,
                 }}
               >
                 <div
                   style={{
                     ...CARD,
-                    marginBottom: 0,
-                    // 气泡只占八成长度，太满就看不出左右分别了
-                    maxWidth: "82%",
+                    // 气泡吃满整行宽度、左右内边距压到最小：QAM 只有 ~300px，
+                    // 每省下一点横向留白，一行就能多塞几个字
+                    margin: "0",
+                    padding: "5px 6px",
+                    // 去掉 82% 的宽度上限：那点留白换来的「左右区分」远不如多显示的字值钱
+                    maxWidth: "100%",
+                    minWidth: 0,
                     background: mine ? "rgba(90,169,230,.14)" : "rgba(255,255,255,.06)",
                     borderLeft: mine ? "2px solid transparent" : "2px solid #5aa9e6",
                     borderRight: mine ? "2px solid #5aa9e6" : "2px solid transparent",
@@ -853,7 +859,7 @@ function Content() {
       </PanelSectionRow>
 
       {/* 隔断：上面是可滚动的对话区，下面是输入区。没有这条线时，
-          消息滚到底会和「问点什么」粘成一片，看不出哪块能滚 */}
+          消息滚到底会和「问问 Meido...」粘成一片，看不出哪块能滚 */}
       <div
         style={{
           height: 1,
@@ -866,7 +872,7 @@ function Content() {
         {/* 提示语做输入框里的占位符：外面再挂一行标签会白占一行高度 */}
         <TextField
           value={input}
-          placeholder="问点什么"
+          placeholder="问问 Meido..."
           onChange={(e) => setInput(e.target.value)}
         />
       </PanelSectionRow>
@@ -878,11 +884,13 @@ function Content() {
       </PanelSectionRow>
 
       {/* 「新会话」和「设置」并排一行：两枚都是低频按钮，各占一行太浪费面板高度。
+          宽度贴着文字走（inline-flex），不设 flex:1 —— 撑满整行会和上方「发送」
+          一样宽，在 QAM 的窄栏里直接顶出可视区。
           新会话要靠后端的 history 广播才能用，core 没连上时只留设置 */}
       <PanelSectionRow>
         <div style={{ display: "flex", gap: 8 }}>
           {status?.core_ok && !busy && (
-            <div style={{ flex: 1 }}>
+            <div style={{ display: "inline-flex", flex: "0 0 auto", width: 108 }}>
               <ButtonItem layout="below" onClick={newSession} disabled={newing}>
                 {newing ? "正在新建…" : "新会话"}
               </ButtonItem>
@@ -890,7 +898,7 @@ function Content() {
           )}
           {/* 文案固定为「设置」：上下三角一进一出会把按钮宽度撑得跳来跳去，
               展开与否看下面的设置项本身更直观 */}
-          <div style={{ flex: 1 }}>
+          <div style={{ display: "inline-flex", flex: "0 0 auto", width: 72 }}>
             <ButtonItem layout="below" onClick={() => setShowSettings((v) => !v)}>
               设置
             </ButtonItem>
@@ -930,7 +938,7 @@ function Content() {
           不一致时会一眼看出来，省得怀疑装错了包 */}
       <PanelSectionRow>
         <div style={{ fontSize: 10, color: DIM, textAlign: "center" }}>
-          v{status?.version || "—"} · 插件 {PLUGIN_VERSION}
+          核心 {status?.version || "—"} · 插件 {PLUGIN_VERSION}
         </div>
       </PanelSectionRow>
     </PanelSection>
