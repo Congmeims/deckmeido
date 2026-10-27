@@ -287,6 +287,9 @@ function Content() {
   // 解锁：令牌输入框 + 后端给的票据（之后每次调用都要带上）
   const [tokenInput, setTokenInput] = useState("");
   const [ticket, setTicket] = useState("");
+  // 探测进行中 / 上次探测失败的原因：两者都没有时面板才能说「探测失败」
+  const [probing, setProbing] = useState(true);
+  const [probeWhy, setProbeWhy] = useState("");
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   // 流式正文先在 ref 里攒，避免每个 token 都触发一次全量状态重排
@@ -294,17 +297,23 @@ function Content() {
   const busyRef = useRef(false);
 
   const refreshStatus = async () => {
+    setProbing(true);
     try {
       const st = (await call<[], Status>("get_status")) as Status;
       setStatus(st);
       setTts(!!st.tts);
+      setProbeWhy("");
       // 票据以后端为准：面板重挂载后本地是空的，这里补回来；
       // 后端说没解锁（插件重启过、票据过期）就把本地那张丢掉
       setTicket(st.ticket || "");
       return st;
-    } catch (e) {
-      setError(`插件后端未就绪：${e}`);
+    } catch (e: any) {
+      const why = String(e?.message ?? e);
+      setProbeWhy(why);
+      setError(`插件后端未就绪：${why}`);
       return null;
+    } finally {
+      setProbing(false);
     }
   };
 
@@ -620,12 +629,22 @@ function Content() {
     );
   }
 
+  // 探测失败时把原因留在面板上：只写「Unknown」用户没法判断是插件没起来、
+  // 后端没起来，还是 Decky 那边调用直接抛了异常
   const captureLine = status
     ? status.capture_ok
       ? "自动截图可用"
       : `自动截图不可用${status.capture_reason ? `（${status.capture_reason}）` : ""}`
-    : "正在探测后端…";
-  const coreLine = status ? (status.core_ok ? "女仆核心 正常" : "女仆核心 异常") : "女仆核心 未知";
+    : probing
+      ? "正在探测后端…"
+      : `探测失败${probeWhy ? `（${probeWhy}）` : ""}`;
+  const coreLine = status
+    ? status.core_ok
+      ? "女仆核心 正常"
+      : "女仆核心 异常"
+    : probing
+      ? "女仆核心 未知"
+      : "女仆核心 未连上";
   const coreWhy = status && !status.core_ok ? status.core_reason : "";
 
   return (

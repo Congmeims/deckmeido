@@ -1181,10 +1181,22 @@ def _emit(msg: dict):
         return
     if inspect.isawaitable(res):
         try:
-            asyncio.get_running_loop().create_task(res)
+            task = asyncio.get_running_loop().create_task(res)
         except RuntimeError:
             # 没有运行中的循环（不该发生），至少别把结果丢掉
             decky.logger.warning("推送前端失败：没有事件循环")
+            return
+        # 推送失败不能只留在「Task exception was never retrieved」里，
+        # 更要紧的是别让它冒泡回去把调用方（比如 start_turn）一起带死
+        task.add_done_callback(_emit_done)
+
+
+def _emit_done(task: asyncio.Task):
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        decky.logger.warning(f"推送前端失败：{exc}")
 
 
 def _finalize(cancelled: bool = False):
