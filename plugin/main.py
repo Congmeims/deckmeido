@@ -579,9 +579,12 @@ def _find_gst() -> str | None:
 async def _capture_once(node: str, gst: str, timeout: int = 25) -> tuple[bool, str]:
     """抓一帧，返回 (成功, base64 或错误说明)"""
     tmp = Path("/tmp") / f"deckmeido_shot_{os.getpid()}_{next(_SHOT_SEQ)}.png"
+    # 注意：pipewiresrc 的 path=... 不能和 num-buffers 塞进同一个 argv。
+    # gst-launch 按 argv 逐个解析元素，两个属性挤在一项里就会被当成非法元素名，
+    # 直接报 "erroneous pipeline: syntax error" 而一帧都不抓。
     cmd = _run_as() + [
-        gst, "-q", f"pipewiresrc path={node} num-buffers=6", "!",
-        "videoconvert", "!", "pngenc", "!", f"filesink location={tmp}",
+        gst, "-q", "pipewiresrc", f"path={node}", "num-buffers=6", "!",
+        "videoconvert", "!", "pngenc", "!", "filesink", f"location={tmp}",
     ]
     try:
         proc = await asyncio.create_subprocess_exec(
