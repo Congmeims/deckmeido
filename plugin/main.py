@@ -984,8 +984,16 @@ class Plugin:
         _clear_ticket()
         return {"ok": True}
 
-    async def screenshot(self, ticket: str = "") -> dict:
+    async def screenshot(self, ticket: str = "", hide: bool = False) -> dict:
+        """抓当前游戏画面
+
+        hide=True 时抓帧前留一段空档，让前端先收起 QAM：gamescope 的 pipewiresrc
+        抓的是合成后的画面，QAM 面板本身也在里面，不收起来就只能拍到半屏游戏。
+        菜单收起的动画大约 200ms，这里给 450ms 再抓。
+        """
         _require(ticket, "screenshot")
+        if hide:
+            await asyncio.sleep(0.45)
         ok, payload = await grab_screenshot()
         if ok:
             return {"ok": True, "image": payload}

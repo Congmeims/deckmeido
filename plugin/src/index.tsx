@@ -1,6 +1,6 @@
 import { definePlugin, call, addEventListener, removeEventListener } from "@decky/api";
 import { useEffect, useRef, useState } from "react";
-import { PanelSection, PanelSectionRow, ButtonItem, TextField, ToggleField, Focusable } from "@decky/ui";
+import { Navigation, PanelSection, PanelSectionRow, ButtonItem, TextField, ToggleField, Focusable } from "@decky/ui";
 
 // 后端在不在、截图能不能用、代理走哪条路，由插件后端探测
 type Status = {
@@ -236,10 +236,19 @@ function Content() {
   const ask = async () => {
     const text = input.trim();
     if (!text || busyRef.current) return;
+    setInput("");
+    await runTurn(text, withShot);
+  };
+
+  /**
+   * 发一轮对话。grab=true 时连画面一起发；hideQam=true 时先收起 QAM 再抓帧
+   * （否则截到的是「QAM 半屏 + 游戏半屏」）。
+   */
+  const runTurn = async (text: string, grab: boolean, hideQam = false) => {
+    if (busyRef.current) return;
     setError("");
     setActivity("");
     setTurns((prev) => [...prev, { role: "user", text }]);
-    setInput("");
     curRef.current = "";
     setBusyBoth(true);
 
@@ -251,11 +260,17 @@ function Content() {
       if (!st.unlocked || !ticket) throw new Error("插件未解锁，先输入访问令牌");
 
       let image: string | null = null;
-      if (withShot) {
-        const shot = (await call<[string], { ok: boolean; image?: string; error?: string }>(
+      if (grab) {
+        // 先收面板：CloseSideMenus 走的是 Steam 的 MenuStore，等于替用户按了
+        // 一次「关闭侧栏」，和按 B 不是一回事（B 在菜单里是「回上一级」）
+        if (hideQam) Navigation.CloseSideMenus();
+        const shot = (await call<[string, boolean], { ok: boolean; image?: string; error?: string }>(
           "screenshot",
-          ticket
+          ticket,
+          hideQam
         )) as { ok: boolean; image?: string; error?: string };
+        // 抓完立刻把 QAM 弹回来：后面还有几十秒的生成时间，用户不该盯着一片游戏画面
+        if (hideQam) Navigation.OpenQuickAccessMenu();
         if (shot.ok && shot.image) {
           image = shot.image;
         } else {
@@ -292,6 +307,20 @@ function Content() {
       setActivity("");
       if (curRef.current) flushAssistant(true);
     }
+  };
+
+  /**
+   * 一键查攻略：语音/打字都不方便时，直接拿当前画面去问。
+   * 提示词写死「先搜再总结」，是因为攻略类问题答案更新快，
+   * 单靠模型记忆容易给出过期的打法或道具位置。
+   */
+  const guide = async () => {
+    if (busyRef.current) return;
+    await runTurn(
+      "看这个游戏画面，判断我在哪个游戏、卡在什么位置，然后先联网搜索最新攻略，再总结成几条可以直接照做的步骤（控制在 200 字内）。",
+      true,
+      true
+    );
   };
 
   const cancel = async () => {
@@ -385,6 +414,12 @@ function Content() {
           checked={withShot}
           onChange={setWithShot}
         />
+      </PanelSectionRow>
+
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={guide}>
+          查攻略（看当前画面）
+        </ButtonItem>
       </PanelSectionRow>
 
       <PanelSectionRow>
