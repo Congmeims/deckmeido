@@ -6,6 +6,7 @@
 #
 # 用法：
 #   bash plugin/deploy.sh               构建并部署
+#   bash plugin/deploy.sh --detect      只查装没装 Decky 框架（install.sh 用）
 #   bash plugin/deploy.sh --remove      卸载插件
 #   bash plugin/deploy.sh --no-build    跳过前端构建（dist 已存在时用）
 #   bash plugin/deploy.sh --check       只报状态，不改任何东西（install.sh 用）
@@ -31,15 +32,60 @@ dim()  { printf '%s    %s%s\n' "$C_DIM" "$*" "$C_END"; }
 case "${1:-}" in
   --remove) MODE=remove ;;
   --check)  MODE=check ;;
+  --detect) MODE=detect ;;
   --no-build) MODE=deploy; BUILD=0 ;;
   "")       MODE=deploy; BUILD=1 ;;
-  *)        die "不认识的参数：$1（可用：--remove / --check / --no-build）" ;;
+  *)        die "不认识的参数：$1（可用：--detect / --check / --remove / --no-build）" ;;
 esac
 BUILD="${BUILD:-1}"
 
+# ---- 检测 Decky 框架 ----
+# 判断「装没装 Decky」。最可靠的信号是插件根目录 ~/homebrew/plugins 是否存在：
+# 这个目录由 Decky 自己创建（属 root:root），没装 Decky 的机器上不会有。
+# 目录空着不算没装 —— 可能刚重装还没装其它插件。再补两条兜底信号：
+# 前端 bundle 目录存在、或 systemd 里有 decky 单元。
+decky_status() {
+  local root="$PLUGINS_ROOT" hit=1 why=""
+  # 1. 插件根目录本身：Decky 装好后它一定存在（属 root:root），
+  #    只有「连目录都没有」才是真的没装。目录空着也可能是刚更新完还没装插件
+  if [ -d "$root" ]; then
+    hit=0; why="$root"
+    # 顺手记下里面有没有别的插件，只是给提示用
+    local others
+    others=$(find "$root" -mindepth 1 -maxdepth 1 ! -name 'DeckMeido' 2>/dev/null | head -n1)
+    [ -n "$others" ] && why="$root（含其他插件）"
+  fi
+  # 2. Decky 的前端 bundle / 配置目录
+  if [ "$hit" != 0 ]; then
+    local d
+    for d in "$HOME/homebrew/services" "$HOME/.local/share/decky" "$HOME/.config/decky"; do
+      if [ -e "$d" ]; then hit=0; why="$d"; break; fi
+    done
+  fi
+  # 3. systemd 里有 decky 相关单元
+  if [ "$hit" != 0 ] && command -v systemctl >/dev/null 2>&1; then
+    if systemctl list-unit-files 2>/dev/null | grep -qi '^decky'; then
+      hit=0; why="systemd 里有 decky 单元"
+    fi
+  fi
+  [ "$hit" = 0 ] && { DECKY_WHY="$why"; return 0; }
+  return 1
+}
+
+# 只看状态：给 install.sh 判断要不要部署插件用。
+# 退出码：0 = 框架在（不论插件装没装），2 = 没装 Decky，1 = 框架在但插件没就绪
+if [ "$MODE" = "detect" ]; then
+  if ! decky_status; then
+    dim "没装 Decky Loader，跳过插件部署"
+    exit 2
+  fi
+  dim "检测到 Decky Loader（$DECKY_WHY）"
+  exit 0
+fi
+
 # ---- 只看状态 ----
 if [ "$MODE" = "check" ]; then
-  [ -d "$PLUGINS_ROOT" ] || { dim "没装 Decky Loader（$PLUGINS_ROOT 不存在），跳过插件"; exit 2; }
+  decky_status || { dim "没装 Decky Loader（$PLUGINS_ROOT 不存在），跳过插件"; exit 2; }
   [ -L "$TARGET" ] && info "Decky 插件已链接到 $PLUGIN_DIR" || { warn "Decky 插件未部署"; exit 1; }
   [ -f "$PLUGIN_DIR/dist/index.js" ] || { warn "插件缺 dist/index.js，需要构建"; exit 1; }
   exit 0
@@ -58,11 +104,13 @@ if [ "$MODE" = "remove" ]; then
 fi
 
 # ---- 前置检查 ----
-if [ ! -d "$PLUGINS_ROOT" ]; then
-  warn "没找到 $PLUGINS_ROOT，跳过插件部署"
-  dim "装好 Decky Loader 后再跑一次：bash plugin/deploy.sh"
+# 先确认框架装没装，再谈部署；没装就直接退出 2，install.sh 不会当错误处理
+if ! decky_status; then
+  warn "没装 Decky Loader，跳过插件部署"
+  dim "装好 Decky Loader（https://github.com/SteamDeckHomebrew/decky-loader）后再跑一次：bash plugin/deploy.sh"
   exit 2
 fi
+dim "检测到 Decky Loader（$DECKY_WHY）"
 
 if [ "$(id -u)" = "0" ]; then
   die "不要用 sudo/root 执行：插件要装在当前用户家目录下"

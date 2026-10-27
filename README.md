@@ -309,6 +309,10 @@ deckmeido/
 ### 游戏模式
 
 - ~~**Decky 插件载体**~~ — 已做：`plugin/` 是独立 Decky 插件，`plugin/deploy.sh` 装到 `~/homebrew/plugins`（目录属 `root:root`，需要 sudo，或建软链接指向 `~/deckmeido/plugin`）。QAM 面板里能对话、看各端流式回答，「截屏询问」一键带图问（手柄键位区已删，改由模型调 `gamepad` 工具）
+- ~~**安装时检测 Decky 框架**~~ — 已做：`install.sh` / `upgrade` 会先跑 `plugin/deploy.sh --detect`，没装 Decky 就整段跳过（不构建、不报错），装了才构建并部署
+  - 判定信号：`~/homebrew/plugins` 存在（Decky 自己创建，最可靠）> `~/.local/share/decky` 等 bundle 目录 > systemd 里有 decky 单元。目录空着也算装了（刚装完还没装别的插件）
+  - 退出码约定：`0` 框架在 / `2` 没装或构建环境不具备（install.sh 不当错误）/ `1` 失败
+  - `plugin/` 之前没被 `sync_files` 带进安装目录，这次补上（`CODE_DIRS` 与同步清单、`make_release.sh` 的打包清单均已加入，发布包**不含** `plugin/node_modules`）
 - ~~**游戏内截帧**~~ — 已做：`pw-dump` 找到 `node.name=gamescope` 且 `media.class=Video/Source` 的节点，`gst-launch-1.0` 抓帧。踩过两个坑：① root 跑时要 `runuser -u deck` 降权，`XDG_RUNTIME_DIR` 必须指向 `/run/user/1000`；② `pipewiresrc path=N num-buffers=6` 必须拆成独立 argv token，整段塞一个 token 会让 gst 报 `syntax error` 并静默降级成纯文本
 - ~~**虚拟手柄**~~ — 已做：`plugin` 侧 `_Gamepad` 走 `/dev/uinput`，ABXY / 十字键 / 摇杆可用；`deck` 用户对 `/dev/uinput` 有 ACL（`user:deck:rw-`）
 - ~~**手柄补全 Xbox 布局**~~ — 已做：在 `guide` 之外补齐 `lt`/`rt`（`ABS_Z`/`ABS_RZ`，`trigger` 动作给 0..1 力度，`press`/`hold` 等于一踩到底）、`l3`/`r3`（`BTN_THUMBL`/`BTN_THUMBR`）、右摇杆（`ABS_RX`/`ABS_RY`，`stick` 加 `side=right`）、`share`（`KEY_RECORD` 0xA7，Series X|S 才有，部分驱动/游戏不认）。`release` 除摇杆回中外还会松开仍踩着的扳机，避免「松开后车还在开」

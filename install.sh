@@ -747,7 +747,7 @@ install_deps() {
 # 这里反向再走一遍：安装目录里存在、源码目录里已不存在的代码文件，删掉。
 # 只处理下面这些已知代码目录，用户数据（config.toml / sessions / uploads /
 # shots / *.log / VERSION）一概不碰。
-CODE_DIRS=(server client assets deploy tools)
+CODE_DIRS=(server client assets deploy tools plugin)
 USER_DATA_RE='(^|/)(config\.toml|sessions|uploads|shots)(/|$)|\.log$|(^|/)VERSION$|(^|/)__pycache__(/|$)'
 
 prune_stale() {
@@ -786,7 +786,7 @@ sync_files() {
     info "安装到 $INSTALL_DIR"
   fi
   mkdir -p "$INSTALL_DIR"
-  local items=(server client assets deploy tools requirements.txt README.md install.sh)
+  local items=(server client assets deploy tools plugin requirements.txt README.md install.sh)
   # RELEASE-NOTES.md 只在发布包里存在，有就一起带上，方便用户在安装目录里查更新内容
   [ -f "$HERE/RELEASE-NOTES.md" ] && items+=(RELEASE-NOTES.md)
   for it in "${items[@]}"; do
@@ -856,6 +856,36 @@ stop_service() {
 render_service() {
   sed "s|__INSTALL_DIR__|$INSTALL_DIR|g; s|__PORT__|$PORT|g" \
     "$INSTALL_DIR/deploy/$UNIT" > "$UNIT_DIR/$UNIT"
+}
+
+# ---------- Decky 插件 ----------
+# 插件只在装了 Decky Loader 的机器上有意义。先问框架在不在，不在就整段跳过，
+# 不构建、不报错 —— 大部分桌面模式用户根本没装 Decky。
+#   deploy.sh --detect：0 = 框架在，2 = 没装（1 当没装处理，宁可跳过也别乱装）
+PLUGIN_SKIP_REASON=""
+
+decky_ready() {
+  local d="$INSTALL_DIR/plugin/deploy.sh"
+  [ -f "$d" ] || { PLUGIN_SKIP_REASON="安装包里没有 plugin/deploy.sh"; return 1; }
+  DECKMEIDO_NONINTERACTIVE=1 bash "$d" --detect >/dev/null 2>&1
+}
+
+install_plugin() {
+  if ! decky_ready; then
+    dim "跳过 Decky 插件：${PLUGIN_SKIP_REASON:-没装 Decky Loader}"
+    [ -n "$PLUGIN_SKIP_REASON" ] || dim "想用游戏模式面板，先装 Decky Loader，再跑：bash $INSTALL_DIR/plugin/deploy.sh"
+    return 0
+  fi
+  info "检测到 Decky Loader，部署 QAM 插件"
+  # deploy.sh 退出码 2 是「环境不具备」（没 npm / 没 Decky），不算失败
+  local rc=0
+  DECKMEIDO_NONINTERACTIVE=1 bash "$INSTALL_DIR/plugin/deploy.sh" || rc=$?
+  case "$rc" in
+    0) dim "插件已就绪，到 设置 → Decky Loader 点「重新载入」即可在 QAM 里看到" ;;
+    2) dim "插件暂未部署（构建环境不具备），装好 nodejs/npm 后重跑：bash $INSTALL_DIR/plugin/deploy.sh" ;;
+    *) warn "插件部署失败（退出码 $rc），可单独重跑：bash $INSTALL_DIR/plugin/deploy.sh" ;;
+  esac
+  return 0
 }
 
 install_desktop() {
@@ -1053,6 +1083,8 @@ do_install() {
   install_service
   install_desktop
   install_uninstaller
+  section "Decky 插件（游戏模式）"
+  install_plugin
   if [ "$deps" = "--deps" ]; then
     deps_intro
     maybe_autorepair_after_image_update
@@ -1106,6 +1138,8 @@ do_upgrade() {
   install_service
   install_desktop
   install_uninstaller
+  section "Decky 插件（游戏模式）"
+  install_plugin
   if [ "$deps" = "--deps" ]; then
     maybe_autorepair_after_image_update
     install_deps

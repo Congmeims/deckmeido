@@ -46,13 +46,14 @@ gen_notes() {
 
 mkdir -p "$OUT" "$STAGE/$NAME"
 cd "$ROOT"
-cp -r server client assets deploy tools requirements.txt README.md install.sh "$STAGE/$NAME/"
+cp -r server client assets deploy tools plugin requirements.txt README.md install.sh "$STAGE/$NAME/"
 # 清掉不该进包的东西
 rm -rf "$STAGE/$NAME/server/config.toml" \
        "$STAGE/$NAME/server/sessions" \
        "$STAGE/$NAME/server/uploads" \
        "$STAGE/$NAME/server/static/shots" \
-       "$STAGE/$NAME/server/overlay.log"
+       "$STAGE/$NAME/server/overlay.log" \
+       "$STAGE/$NAME/plugin/node_modules"
 find "$STAGE/$NAME" -name '__pycache__' -type d -prune -exec rm -rf {} +
 chmod +x "$STAGE/$NAME/install.sh"
 
