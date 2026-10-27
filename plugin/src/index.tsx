@@ -282,6 +282,8 @@ function Content() {
   const [showSettings, setShowSettings] = useState(false);
   // 语音播报的实际值以后端为准：status 回来后同步过来，切换时先乐观更新
   const [tts, setTts] = useState(false);
+  // 本端最近一次抓到的画面（data: URL），只用于在面板里确认「刚才截到的是什么」
+  const [shot, setShot] = useState<string>("");
   // 解锁：令牌输入框 + 后端给的票据（之后每次调用都要带上）
   const [tokenInput, setTokenInput] = useState("");
   const [ticket, setTicket] = useState("");
@@ -423,6 +425,27 @@ function Content() {
   };
 
   /**
+   * 收拾完面板再开回来。OpenQuickAccessMenu() 不带参时会按「上一次停留的
+   * 那一层」恢复，截屏这一路刚 CloseSideMenus 过，回来常常落到通知中心而不是 Decky，
+   * 所以这里显式指定 QAM 并给出要跳到的标签页，保证回到插件自己的界面。
+   */
+  const restoreQam = () => {
+    try {
+      Navigation.OpenQuickAccessMenu(1);
+    } catch {
+      Navigation.OpenQuickAccessMenu();
+    }
+    setTimeout(() => {
+      try {
+        // NavigateToRoute 不在 @decky/api 的类型里，但运行时存在；老版本没有就保持默认页
+        (Navigation as any).NavigateToRoute?.("/decky");
+      } catch {
+        // 老版本 Decky 没有这个路由，保持默认页即可
+      }
+    }, 250);
+  };
+
+  /**
    * 发一轮对话。grab=true 时连画面一起发；hideQam=true 时先收起 QAM 再抓帧
    * （否则截到的是「QAM 半屏 + 游戏半屏」）。
    */
@@ -434,6 +457,7 @@ function Content() {
     // 否则同一句话会先本地显示一次、再被所有端同步的消息覆盖
     curRef.current = "";
     setStreaming("");
+    setShot("");
     setBusyBoth(true);
 
     try {
@@ -449,9 +473,12 @@ function Content() {
       let game: { appid?: string; name?: string } | null = null;
       if (grab) {
         // 先收面板：CloseSideMenus 走的是 Steam 的 MenuStore，等于替用户按了
-        // 一次「关闭侧栏」，和按 B 不是一回事（B 在菜单里是「回上一级」）
+        // 一次「关闭侧栏」，和按 B 不是一回事（B 在菜单里是「回上一级」）。
+        // 必须等这一帧真的画完再抓，否则抓到的还是「游戏 + QAM」的合成画面，
+        // 和收起动画赛跑是没有意义的。
         if (hideQam) Navigation.CloseSideMenus();
-        const shot = (await call<
+        if (hideQam) await new Promise((r) => setTimeout(r, 550));
+        const snap = (await call<
           [string, boolean],
           { ok: boolean; image?: string; error?: string; game?: { appid?: string; name?: string } }
         >("screenshot", tk, hideQam)) as {
@@ -460,15 +487,17 @@ function Content() {
           error?: string;
           game?: { appid?: string; name?: string };
         };
-        // 抓完立刻把 QAM 弹回来：后面还有几十秒的生成时间，用户不该盯着一片游戏画面
-        if (hideQam) Navigation.OpenQuickAccessMenu();
-        if (shot.ok && shot.image) {
-          image = shot.image;
+        // 抓完立刻把面板连同预览一起摆出来：后面还有几十秒生成时间，
+        // 用户应该能在这段时间里确认「发给 AI 的到底是哪一帧」
+        if (hideQam) restoreQam();
+        if (snap.ok && snap.image) {
+          image = snap.image;
+          setShot(`data:image/png;base64,${snap.image}`);
         } else {
           // 截图失败不阻断提问：这一轮退回纯文字，并在界面上说清楚原因
-          setError(`截图失败，这轮只发文字：${shot.error ?? "未知原因"}`);
+          setError(`截图失败，这轮只发文字：${snap.error ?? "未知原因"}`);
         }
-        game = shot.game ?? null;
+        game = snap.game ?? null;
       }
 
       // 游戏名从 Steam 侧拿到就直接写进问题里，免得模型看画面认错游戏、
@@ -615,6 +644,20 @@ function Content() {
           {busy ? `中断（${elapsed}s）` : "截屏询问"}
         </ButtonItem>
       </PanelSectionRow>
+
+      {shot && (
+        <PanelSectionRow>
+          {/* 抓到的画面直接摆出来：抓错帧、抓到黑屏、抓到菜单，一眼就能看出来 */}
+          <div style={{ ...CARD, padding: 0, overflow: "hidden", border: "1px solid rgba(255,255,255,.12)" }}>
+            <img
+              src={shot}
+              alt="本轮截到的画面"
+              style={{ display: "block", width: "100%", height: "auto" }}
+            />
+            <div style={{ padding: "4px 8px", fontSize: 10, color: DIM }}>本轮发给 AI 的画面</div>
+          </div>
+        </PanelSectionRow>
+      )}
 
       {error && (
         <PanelSectionRow>
