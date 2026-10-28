@@ -288,7 +288,8 @@ const SHOT_ASK_BRIEF = "看看这个，我该怎么做？";
 
 // 后端还没读到模板时用的兜底：和后端 DEFAULT_ASK_TEMPLATE 保持一致
 const DEFAULT_ASK_TPL =
-  "看我卡在哪一步，说说现在这个画面里我该做什么。需要的话先联网查一下这款游戏的攻略，" +
+  "看我卡在哪一步，说说现在这个画面里我该做什么。" +
+  "已经能从上图判断就不要搜索；最多搜 2 次，得到一个答案就停。\n" +
   "再总结成几条可以直接照做的步骤，200 字以内。\n" +
   "不要剧透：只讲眼前这一步怎么过，不要提前说后面的剧情、结局或其他关卡的解法。";
 
@@ -331,6 +332,8 @@ function Content() {
   const [ticket, setTicket] = useState("");
   // 探测进行中：没有结果时才显示「探测中」，避免把「连不上」说成「未知」
   const [probing, setProbing] = useState(true);
+  // 重启核心进行中：按钮置灰，等后端起来再刷新状态
+  const [restarting, setRestarting] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   // 流式正文先在 ref 里攒，避免每个 token 都触发一次全量状态重排
@@ -516,7 +519,26 @@ function Content() {
     try {
       Navigation.OpenQuickAccessMenu(999);
     } catch {
-      Navigation.OpenQuickAccessMenu();
+      try {
+        Navigation.OpenQuickAccessMenu();
+      } catch {
+        /* 面板已经开着时再开一次会抛，忽略即可 */
+      }
+    }
+  };
+
+  /** 面板被截图流程收起来过：无论后面成功还是失败，都要把它开回来 */
+  const restoreQamSafe = async (tk: string) => {
+    // 抓帧失败时面板是关着的，用户看不见面板里的报错，只能盯着空屏幕。
+    // 所以这里不看这次抓帧的结果，先开回来再说
+    restoreQam();
+    if (!tk) return;
+    // 收回来的面板会重新挂载：本地 ticket 被清空，面板会退回「未解锁」。
+    // 补回来按解锁处理（失败就把错误摆到面板上，而不是静默丢掉）
+    try {
+      await applyTicket(tk);
+    } catch (e: any) {
+      setError(`${String(e?.message ?? e)}（面板已打开，需要重新输入访问令牌）`);
     }
   };
 
@@ -560,7 +582,12 @@ function Content() {
         const snap = (await call<
           [string, boolean],
           { ok: boolean; shot?: string; thumb?: string; error?: string; game?: { appid?: string; name?: string } }
-        >("screenshot", tk, hideQam)) as {
+        >("screenshot", tk, hideQam).catch((e: any) => ({
+          // 调用本身也可能抛（插件侧异常 / IPC 断掉）：不接住的话会一路跳到
+          // 最外层 catch，把面板留在关着的状态
+          ok: false,
+          error: String(e?.message ?? e),
+        }))) as {
           ok: boolean;
           shot?: string;
           thumb?: string;
@@ -568,8 +595,9 @@ function Content() {
           game?: { appid?: string; name?: string };
         };
         // 抓完立刻把面板连同预览一起摆出来：后面还有几十秒生成时间，
-        // 用户应该能在这段时间里确认「发给 AI 的到底是哪一帧」
-        if (hideQam) restoreQam();
+        // 用户应该能在这段时间里确认「发给 AI 的到底是哪一帧」。
+        // 这一步不看抓帧成败 —— 失败了更要开回来，错误是要显示在面板里的
+        if (hideQam) await restoreQamSafe(tk);
         if (snap.ok && snap.shot) {
           shotPath = snap.shot;
           setShot(snap.thumb ? `data:image/jpeg;base64,${snap.thumb}` : "");
@@ -617,6 +645,8 @@ function Content() {
       setBusyBoth(false);
       setActivity("");
       setStreaming("");
+      // 面板已经被收起来时，异常也要负责把它开回来（比如上面 start_turn 失败）
+      if (grab && hideQam) void restoreQamSafe("");
     }
   };
 
@@ -682,6 +712,29 @@ function Content() {
     }
   };
 
+  /**
+   * 重启核心：后端先回 ok，再等半秒退出、一秒后重新拉起。
+   * 插件这边只管等它回来（main.py 里最多轮询 12 秒），回来后刷新一次状态，
+   * 让顶部「核心已连接」和版本号都换成重启后的值。
+   */
+  const restartCore = async () => {
+    if (restarting) return;
+    setRestarting(true);
+    setError("");
+    try {
+      const r = (await call<[string], { ok: boolean; version?: string; error?: string }>(
+        "restart_core",
+        ticket
+      )) as { ok: boolean; version?: string; error?: string };
+      if (!r.ok) throw new Error(r.error ?? "核心没有回来");
+      await refreshStatus();
+    } catch (e: any) {
+      setError(`重启核心失败：${String(e?.message ?? e)}`);
+    } finally {
+      setRestarting(false);
+    }
+  };
+
   const cancel = async () => {
     setBusyBoth(false);
     setActivity("");
@@ -701,11 +754,17 @@ function Content() {
     setNewing(true);
     setError("");
     try {
-      const r = (await call<[string], { ok: boolean; error?: string }>(
+      const r = (await call<[string], { ok: boolean; error?: string; unchanged?: boolean }>(
         "session_new",
         ticket
-      )) as { ok: boolean; error?: string };
+      )) as { ok: boolean; error?: string; unchanged?: boolean };
       if (!r.ok) throw new Error(r.error ?? "后端没有接受");
+      // 后端在「当前会话本来就一句没说」时不会新建（防止连点刷出一排空会话）。
+      // 这时不广播 history，本地也别清 —— 空着还是空着，清了反而像出错
+      if (r.unchanged) {
+        setError("当前就是个空会话，直接问吧");
+        return;
+      }
       // 不依赖广播的到达时机：本地先把列表和临时状态清干净，
       // 否则按下的瞬间下面还挂着上一段对话，看起来像「没清掉」
       setItems([]);
@@ -780,14 +839,25 @@ function Content() {
 
       {/* 放在按钮上面：抓帧那一分钟面板是收着的，回来第一眼就该看见进度和取消。
           按钮下多留一点：它和下面的对话区之间原本只隔 row 的默认间距，
-          第一句话几乎贴着按钮，看着像挤在一起 */}
+          第一句话几乎贴着按钮，看着像挤在一起。
+          生成期间改成「思考中」并置灰：文字和点击都别再给出「还能再发一次」的暗示 */}
       <PanelSectionRow>
         <div style={{ paddingBottom: 6 }}>
-          <ButtonItem layout="below" onClick={busy ? cancel : shotAsk}>
-            {busy ? `中断（${elapsed}s）` : "截屏询问"}
+          <ButtonItem layout="below" onClick={busy ? undefined : shotAsk} disabled={busy}>
+            {busy ? `思考中…（${elapsed}s）` : "截屏询问"}
           </ButtonItem>
         </div>
       </PanelSectionRow>
+
+      {/* 中断单独给一个出口：主按钮在生成期间已经不可点了，
+          想停下来的话就从这里走，否则面板上就没有能中止的地方了 */}
+      {busy && (
+        <PanelSectionRow>
+          <div role="button" onClick={cancel} style={{ width: "100%", ...FAKE_BTN }}>
+            中断这一轮
+          </div>
+        </PanelSectionRow>
+      )}
 
       {/* 后端没起来时把「启动」放在最显眼的位置：不改什么设置就能用 */}
       {status && !status.core_ok && (
@@ -920,14 +990,22 @@ function Content() {
         />
       </PanelSectionRow>
 
-      {/* 发送单独一行：与输入框之间留一点距离 */}
+      {/* 发送单独一行：与输入框之间留一点距离。
+          生成期间置灰并写「思考中」：这一轮没答完之前不让再发，
+          免得上一轮还在跑、下一轮又压进去（后端会排队，界面上却分不清谁是谁） */}
       <PanelSectionRow>
         <div
           role="button"
-          onClick={busy ? cancel : ask}
-          style={{ width: "100%", marginTop: 6, ...FAKE_BTN }}
+          onClick={busy ? undefined : ask}
+          style={{
+            width: "100%",
+            marginTop: 6,
+            ...FAKE_BTN,
+            opacity: busy ? 0.5 : 1,
+            cursor: busy ? "default" : "pointer",
+          }}
         >
-          {busy ? "中断" : "发送"}
+          {busy ? `思考中…（${elapsed}s）` : "发送"}
         </div>
       </PanelSectionRow>
 
@@ -986,16 +1064,18 @@ function Content() {
           <PanelSectionRow>
             {/* 「截屏询问」的提示词：默认就是「看我卡在哪一步…不要剧透，200 字以内」。
                 放在这里可以直接改，和网页设置页是同一份；清空保存即恢复默认 */}
-            <div style={{ fontSize: 10, color: DIM, marginBottom: 4 }}>
-              截屏询问的提示词{status?.game_name ? `（当前游戏：${status.game_name}）` : ""}
+            <div style={{ marginTop: 12 }}>
+              <div style={{ color: "#dcdedf", fontSize: 14, marginBottom: 8 }}>
+                截屏询问的提示词{status?.game_name ? `（当前游戏：${status.game_name}）` : ""}
+              </div>
+              <TextField
+                value={askTplEdit}
+                onChange={(e) => setAskTplEdit(e.target.value)}
+              />
             </div>
-            <TextField
-              value={askTplEdit}
-              onChange={(e) => setAskTplEdit(e.target.value)}
-            />
           </PanelSectionRow>
           <PanelSectionRow>
-            <div style={{ display: "flex", gap: 8, width: "100%" }}>
+            <div style={{ display: "flex", gap: 8, width: "100%", marginTop: 8 }}>
               <div role="button" onClick={saveAskTpl} style={{ flex: "1 1 0", ...FAKE_BTN }}>
                 保存提示词
               </div>
@@ -1008,8 +1088,29 @@ function Content() {
               </div>
             </div>
           </PanelSectionRow>
+          <div
+            style={{ height: 1, background: "rgba(255,255,255,.12)", margin: "12px 0 12px" }}
+          />
+          <PanelSectionRow>
+            <div
+              role="button"
+              onClick={restartCore}
+              style={{
+                width: "100%",
+                ...FAKE_BTN,
+                opacity: restarting ? 0.5 : 1,
+                pointerEvents: restarting ? "none" : "auto",
+              }}
+            >
+              {restarting ? "正在重启…" : "重启核心"}
+            </div>
+          </PanelSectionRow>
           </>
       )}
+
+      <div
+        style={{ height: 1, background: "rgba(255,255,255,.12)", margin: "12px 0 12px" }}
+      />
 
       {/* 底部版本号：主程序版本在前，插件自己的在后。
           两边版本号要求一致（都是 package.json / VERSION 里的那一版），

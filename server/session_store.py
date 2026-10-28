@@ -222,12 +222,20 @@ store = SessionStore()
 
 
 def set_title(data: dict, hist: list[dict]) -> None:
-    """给没有标题的空会话补一个带时间的标题，避免侧栏出现两个一模一样的「新会话」"""
+    """给没有标题的空会话补一个标题，避免侧栏出现两个一模一样的「新会话」
+
+    优先用 brief：截屏询问那轮真正的 content 是整段提示词（一百多字），
+    拿它当标题，侧栏里就出现「看我卡在哪一步，说说现在这个画面里我该做什么。需…」，
+    跟用户自己说的话毫无关系，还容易和别的同类会话撞成一样的名字
+    """
     if data.get("title") and data["title"] != "新会话":
         return
-    first_user = next((m.get("content") for m in hist
-                       if m.get("role") == "user" and str(m.get("content") or "").strip()), None)
+    first_user = next((m for m in hist if m.get("role") == "user"),
+                      None)
+    text = ""
     if first_user:
-        data["title"] = str(first_user).strip().replace("\n", " ")[:24]
+        text = str(first_user.get("brief") or first_user.get("content") or "").strip()
+    if text:
+        data["title"] = text.replace("\n", " ")[:24]
     else:
         data["title"] = "新会话 " + time.strftime("%H:%M", time.localtime(data.get("created") or time.time()))

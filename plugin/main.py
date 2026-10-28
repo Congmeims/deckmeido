@@ -807,8 +807,11 @@ def _find_gst() -> str | None:
     return None
 
 
-async def _capture_once(node: str, gst: str, timeout: int = 25) -> tuple[bool, str]:
-    """抓一帧，返回 (成功, base64 或错误说明)"""
+async def _capture_once(node: str, gst: str, timeout: int = 12) -> tuple[bool, str]:
+    """抓一帧，返回 (成功, base64 或错误说明)
+
+    超时收在 12 秒：正常一帧只要 0.2 秒，真卡住时用户不该对着「思考中…」干等 25 秒。
+    """
     tmp = Path("/tmp") / f"deckmeido_shot_{os.getpid()}_{next(_SHOT_SEQ)}.jpg"
     # 注意：pipewiresrc 的 path=... 不能和 num-buffers 塞进同一个 argv。
     # gst-launch 按 argv 逐个解析元素，两个属性挤在一项里就会被当成非法元素名，
@@ -819,8 +822,9 @@ async def _capture_once(node: str, gst: str, timeout: int = 25) -> tuple[bool, s
     # （unexpected EOF → 503 no_healthy_account），看着就像「LLM 调用失败」，
     # 而同样配置下发纯文字是正常的。JPEG q90 大约 200KB，画质对看图问答绰绰有余。
     cmd = _run_as() + [
-        gst, "-q", "pipewiresrc", f"path={node}", "num-buffers=6", "!",
-        "videoconvert", "!", "jpegenc", "quality=90", "!", "filesink", f"location={tmp}",
+        gst, "-q", "pipewiresrc", f"path={node}", "num-buffers=2",
+        "do-timestamp=true", "!", "videoconvert", "!", "jpegenc", "quality=90", "!",
+        "filesink", f"location={tmp}",
     ]
     proc = None
     try:
@@ -863,13 +867,34 @@ _SHOT_SEQ = itertools.count()
 _SHOT_LOCK = asyncio.Lock()
 
 
+async def _node_state_note() -> str:
+    """抓帧失败时附带的现场说明：节点还在不在、PipeWire 说它什么状态"""
+    node, why = await _gamescope_pw_node()
+    if not node:
+        return f"节点已消失：{why}"
+    cmd = _run_as() + ["pw-dump"]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            env={**os.environ, "XDG_RUNTIME_DIR": _runtime_dir()},
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        for o in json.loads(out or b"[]"):
+            if str(o.get("id")) == node:
+                state = (o.get("info") or {}).get("state") or "?"
+                return f"节点 {node} 状态 {state}"
+    except Exception:
+        pass
+    return f"节点 {node}"
+
+
 async def grab_screenshot() -> tuple[bool, str]:
     """抓一帧游戏画面，返回 (成功, base64 或错误说明)
 
-    写法和 server/tools.py 的 _screenshot_gamescope 保持一致：连抓 6 帧覆盖
-    同一个文件，拿到的是最后一帧（避免拿到刚启动时的黑帧）。
-    节点找不到或第一次抓失败时，给一次短等待再试 —— 刚进游戏的那几秒
-    gamescope 的节点常常还没稳定。
+    写法和 server/tools.py 的 _screenshot_gamescope 保持一致：连抓两帧覆盖
+    同一个文件，拿到的是最后一帧（避免拿到刚切场景时的黑帧）。
+    第一次失败就重探一次节点再试 —— 节点 id 在游戏重启/切场景后可能变，
+    拿着旧 id 重试只会再超时一次，白白多等十几秒。
     """
     node, why = await _gamescope_pw_node()
     if not node:
@@ -883,8 +908,17 @@ async def grab_screenshot() -> tuple[bool, str]:
     async with _SHOT_LOCK:
         ok, payload = await _capture_once(node, gst)
         if not ok:
-            await asyncio.sleep(1.0)
-            ok, payload = await _capture_once(node, gst, timeout=20)
+            first = payload
+            await asyncio.sleep(0.5)
+            node2, why2 = await _gamescope_pw_node()
+            if not node2:
+                return False, why2
+            ok, payload = await _capture_once(node2, gst)
+            if not ok:
+                # 两次都失败：把节点状态一起带回去，否则只看到「超时」不知道
+                # 是节点没了、还是不吐帧
+                decky.logger.error(f"抓帧两次失败：{first} / {payload}（节点 {node}->{node2}）")
+                return False, f"{payload}（连试两次；节点 {node2}，第一次：{first}）"
     return ok, payload
 
 
@@ -1373,6 +1407,10 @@ _LAST_THREAD: dict | None = None
 # 后端要等 ws 把 16MB 的图收完才落盘，这段空窗里各端（尤其电脑网页）只看到
 # 一条没有画面的提问，看起来就像「插件截的图在电脑端不显示」
 _LAST_SHOT_PATH = ""
+# 本轮正在发出去的那张图：从截图落盘一直留到这一轮收尾。
+# 以前只在 start_turn 里清，而且 user_message 只认 _LAST_SHOT_PATH，
+# 于是「后端广播没带 events」这条路上就没有图可补
+_TURN_SHOT_PATH = ""
 # 面板展示的来源标记，和后端、网页端的叫法保持一致：
 # 电脑（PC 浏览器）/ 手机（手机浏览器）/ 掌机（Deck 桌面客户端）/ 插件（QAM）
 _CLIENT_LABEL = {"web": "电脑", "mobile": "手机", "client": "掌机", "qam": "插件"}
@@ -1504,13 +1542,15 @@ def _finalize(cancelled: bool = False):
     带完整正文的（没有正文的一轮后端压根不发）。status.running 不能当收尾依据：
     current_task 在回复广播之前就被置空，那一刻正文还没到。
     """
-    global _LAST_REPLY, _STREAM_RUNNING
+    global _LAST_REPLY, _STREAM_RUNNING, _TURN_SHOT_PATH
     # 同一轮可能被两条路径冻结（正常收尾一条，连接断开兜底一条）：
     # 已经冻结过就别重复发 final，也别再动锁
     if _FINAL_EVENT.is_set():
         return
     _LAST_REPLY = _ACC
     _STREAM_RUNNING = False
+    # 这一轮结束了，本地那张图不再回落给别的端的提问
+    _TURN_SHOT_PATH = ""
     _emit({"kind": "final", "text": _ACC, "cancelled": cancelled})
     _FINAL_EVENT.set()
     if _TURN_LOCK.locked():
@@ -1588,8 +1628,10 @@ async def _read_loop(bk: _Backend):
                     break
             # 后端那条广播里带不出图（落盘失败）时，若这一轮就是本机刚截的那张，
             # 用本地那份顶上：面板上总得有一张能看到的画面
-            if not item.get("image") and _LAST_SHOT_PATH and item["client"] == "qam":
-                item["image"] = _shot_url(_LAST_SHOT_PATH)
+            if not item.get("image") and item["client"] == "qam":
+                local = _TURN_SHOT_PATH or _LAST_SHOT_PATH
+                if local:
+                    item["image"] = _shot_url(local)
             _push_thread(item)
             continue
         if typ == "assistant_message":
@@ -1815,7 +1857,13 @@ async def _session_post(what: str, path: str) -> dict:
         # 后端在跑但 reject 了，和根本没跑是两回事，错误里带上原始原因
         decky.logger.error(f"{what} 失败：{r.get('error')}")
         return {"ok": False, "error": str(r.get("error") or "后端没有应答")}
-    return {"ok": True, "id": str((r.get("data") or {}).get("id") or "")}
+    data = r.get("data") or {}
+    out = {"ok": True, "id": str(data.get("id") or "")}
+    # 后端在「当前会话本来就没说过话」时不会新建（防止连点刷出一排空会话），
+    # 把它翻成前端能看懂的字段，否则按钮看起来毫无反应
+    if data.get("unchanged"):
+        out["unchanged"] = True
+    return out
 
 
 class Plugin:
@@ -1998,6 +2046,28 @@ class Plugin:
             return {"ok": False, "error": r.get("error") or "后端没有接受这次修改"}
         return {"ok": True, "text": str((r.get("data") or {}).get("text") or "")}
 
+    async def restart_core(self, ticket: str = "") -> dict:
+        """重启女仆核心：后端自己拉一个独立进程把自己换掉
+
+        请求发出后后端会先返回 ok，再等半秒才真的退出重启，所以这里
+        等一小会儿再确认它活着——立刻去问必然是连不上的。
+        """
+        _require(ticket, "restart_core")
+        cfg = _load_server_cfg()
+        port = int(cfg.get("port", 18765))
+        token = str(cfg.get("token", "") or "").strip()
+        r = await _core_http(port, token, "POST", "/api/restart", timeout=10.0)
+        if not r["ok"]:
+            return {"ok": False, "error": r.get("error") or "后端没有接受重启请求"}
+        # 给它时间退干净再起来（脚本里是 0.5s 后 kill、1s 后拉起）
+        for _ in range(12):
+            await asyncio.sleep(1.0)
+            back = await _core_http(port, token, "GET", "/api/version", timeout=3.0)
+            if back["ok"]:
+                ver = str((back.get("data") or {}).get("version") or "")
+                return {"ok": True, "version": ver}
+        return {"ok": False, "error": "重启指令已发出，但 12 秒内没等到核心回来"} 
+
     async def screenshot(self, ticket: str = "", hide: bool = False) -> dict:
         """抓当前游戏画面
 
@@ -2015,8 +2085,11 @@ class Plugin:
             await asyncio.sleep(1.2)
         ok, payload = await grab_screenshot()
         if not ok:
-            decky.logger.error(f"screenshot 失败：{payload}")
-            return {"ok": False, "error": payload, "game": game}
+            # 失败时顺手把节点状态记一笔：gamescope 节点在 idle 时是 suspended，
+            # 「节点在但状态不对」和「节点没了」要分得开，否则只能反复猜
+            state = await _node_state_note()
+            decky.logger.error(f"screenshot 失败：{payload}；{state}")
+            return {"ok": False, "error": f"{payload}（{state}）", "game": game}
         # 图片只落到本地文件，不经过 Decky 的 IPC 回传：一张 1280x800 的 PNG
         # base64 有 16MB 左右，这么大的字符串塞进 JS↔Python 的调用会静默失败
         # ——前端既收不到图，随后的 start_turn 也整个派发不到后端。
@@ -2066,7 +2139,7 @@ class Plugin:
         """
         decky.logger.info(f"start_turn 被调用：{len(text or '')} 字，图 {shot or '(无)'}")
         _require(ticket, "start_turn")
-        global _ACC, _LAST_REPLY, _STREAM_RUNNING
+        global _ACC, _LAST_REPLY, _STREAM_RUNNING, _TURN_SHOT_PATH
         text = str(text or "").strip()
         if not text:
             return {"ok": False, "error": "问题是空的"}
@@ -2106,6 +2179,9 @@ class Plugin:
         if image:
             payload["image"] = image
             payload["image_prompt"] = "（这是当前游戏画面，结合画面回答用户的问题）"
+        # 这一轮的画面路径留到收尾：后端广播里万一没带 events（落盘失败、
+        # 历史被裁），user_message 还能用本地这份把面板的图补上
+        _TURN_SHOT_PATH = str(shot) if image else ""
         ws = _workspace()
         if ws:
             payload["workspace"] = ws

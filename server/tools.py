@@ -40,6 +40,7 @@ TOOL_CN: dict[str, str] = {
     "edit_file": "编辑文件",
     "self_update": "更新软件",
     "remember": "记住这件事",
+    "ask_user": "向你提问",
 }
 
 
@@ -184,6 +185,33 @@ TOOLS: list[dict] = [
                     "text": {"type": "string", "description": "type 时要输入的文本，中英文均可（走 KDE 剪贴板粘贴）"},
                 },
                 "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user",
+            # 只把问题交给界面，不执行任何东西。给了 options 就在对话框里摆成
+            # 可点的按钮（像 IDE 里的选择支），用户点一下就是回答；不给就是
+            # 开放提问，等用户自己打字
+            "description": ("向用户提问，让对话里出现选项按钮或问题卡片。"
+                            "信息不足、需要用户在几个方案里挑一个、或要确认偏好时用它，"
+                            "比在正文里列 1/2/3 更清楚。给了 options 就渲染成可点的按钮，"
+                            "用户点的那一项会作为他的回答发回来；"
+                            "不给 options 就是单纯把问题抛出来，等用户自己输入。"
+                            "调用后这一轮就结束，不要自己替用户选"),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "要问用户的问题，一句话说清"},
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选项（最多 6 个，每个一行短句）。不需要选项就不传",
+                    },
+                },
+                "required": ["question"],
             },
         },
     },
@@ -1138,6 +1166,9 @@ def summarize_tool(name: str, args: dict) -> str:
     if name == "remember":
         t = str(args.get("text", ""))
         return t if len(t) <= 60 else t[:60] + "…"
+    if name == "ask_user":
+        q = str(args.get("question", ""))
+        return q if len(q) <= 60 else q[:60] + "…"
     if name == "run_command":
         cmd = str(args.get("command", ""))
         return cmd if len(cmd) <= 120 else cmd[:120] + "…"
@@ -1552,8 +1583,9 @@ async def _screenshot_gamescope(path: Path) -> str:
     # gst-launch 把每个 argv 当成一个独立 token，元素名和属性必须分开传，
     # 写成 "pipewiresrc path=78" 会被判成语法错误
     cmd = [
-        "gst-launch-1.0", "-q", "pipewiresrc", f"path={node}", "num-buffers=6", "!",
-        "videoconvert", "!", "pngenc", "!", "filesink", f"location={raw}",
+        "gst-launch-1.0", "-q", "pipewiresrc", f"path={node}", "num-buffers=2",
+        "do-timestamp=true", "!", "videoconvert", "!", "pngenc", "!",
+        "filesink", f"location={raw}",
     ]
     # root 跑时降权到会话用户：PipeWire 的 socket 权限按用户隔离，root 直连会被拒
     if os.getuid() == 0 and uid != 0:
@@ -1564,12 +1596,12 @@ async def _screenshot_gamescope(path: Path) -> str:
             *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=env,
         )
         try:
-            _, err = await asyncio.wait_for(proc.communicate(), timeout=25)
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=12)
             err_text = (err or b"").decode(errors="replace").strip()
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            return "抓帧超时（25 秒内 gamescope 没吐出画面，游戏可能正在切场景或已挂起）"
+            return "抓帧超时（12 秒内 gamescope 没吐出画面，游戏可能正在切场景或已挂起）"
         if not _raw_ok(raw):
             # gst 的具体报错比「失败了」有用得多，取最后一行
             line = err_text.splitlines()[-1] if err_text else ""

@@ -95,16 +95,14 @@ class LLMClient:
     def normalize(self) -> None:
         """把「照抄别人家的写法」纠正成 DeepSeek 认的写法
 
-        三处最常见的手填错误：地址带 /v1（那是兼容别名，官方域名本身就已经是
-        .../chat/completions 的根）、模型名填了 OpenAI 的 gpt-*、模型名填了要
-        单开的思考模型（deepseek-reasoner 不支持工具调用，本插件全靠工具干活）。
-        前两种是直接 400 或「模型不存在」，第三种要等第一句才失败，所以一起归一。
+        两处最常见的手填错误：模型名填了 OpenAI 的 gpt-*、模型名填了要单开的
+        思考模型（deepseek-reasoner 不支持工具调用，本插件全靠工具干活）。
+        前者直接 400「模型不存在」，后者要等第一句才失败，所以一起归一。
+        地址不做改动：带不带 /v1 都能用（见 is_deepseek 的判断），
+        界面上的值也不该因为服务商被悄悄改掉。
         """
         if not self.is_deepseek:
             return
-        url = self.base_url.rstrip("/")
-        if url.lower().endswith("/v1"):
-            self.base_url = url[:-3].rstrip("/")
         m = (self.model or "").strip().lower()
         if (not m or m.startswith("gpt-") or m.startswith("o1") or m.startswith("o3")
                 or "reasoner" in m):

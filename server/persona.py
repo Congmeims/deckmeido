@@ -51,7 +51,12 @@ def _clean(data: dict) -> dict:
     out = {}
     for key in ("name", "traits", "extra"):
         val = str(data.get(key) or "").strip()
-        out[key] = val[:MAX_CHARS[key]] if val else DEFAULTS[key]
+        # extra 是「自由补充设定」，清空就是真的不要了；name/traits 清空则回默认，
+        # 否则提示词第一句会变成「你是 ，。」
+        if val or key == "extra":
+            out[key] = val[:MAX_CHARS[key]]
+        else:
+            out[key] = DEFAULTS[key]
     forbid = style.get("forbid")
     if not isinstance(forbid, list):
         forbid = DEFAULTS["style"]["forbid"]

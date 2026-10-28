@@ -89,9 +89,8 @@
     display: flex; align-items: center; justify-content: flex-end;
     gap: 8px; flex-wrap: wrap;
   }
-  /* 实时画面入口：桌面模式下也留着，只是置灰——直接藏起来会让人以为功能没了 */
+  /* 实时画面入口：只在游戏模式下出现（见 mode 处理），和旁边的徽章同一套胶囊样式 */
   #btnLive { flex: 0 0 auto; white-space: nowrap; }
-  #btnLive.off { opacity: .45; }
 
   /* 通用胶囊按钮（分享弹窗等） */
   .menu-btn {
@@ -116,9 +115,12 @@
   .msg {
     position: relative;
     max-width: 85%;
-    /* 下方多留 20px 给悬停时浮出的操作行。这段空隙必须常驻，不能靠 :hover 撑高，
-       否则鼠标停在气泡下沿会触发「撑高→指针移出→回缩→指针落回」的每帧循环抖动 */
-    padding: 10px 14px 20px;
+    /* 上下内边距必须对称，字才真正居中。悬停操作行常驻的 20px 空隙放在气泡外面
+       （margin-bottom），放进 padding 会让每个气泡看起来字都偏上；
+       这段空隙不能靠 :hover 撑高，否则鼠标停在气泡下沿会触发
+       「撑高→指针移出→回缩→指针落回」的每帧循环抖动 */
+    padding: 10px 14px;
+    margin-bottom: 20px;
     border-radius: 16px;
     line-height: 1.55;
     font-size: 15.5px;
@@ -146,8 +148,40 @@
     padding: 2px 8px;
   }
   .msg .time { display: block; margin-top: 4px; font-size: 11px; opacity: .55; }
+  /* 提问气泡里附带的画面（截屏询问）：缩略图跟在正文下面，不再另起一条
+     「截图」时间线行。宽度跟着气泡上限收，点开看原图 */
+  .msg .msg-shot {
+    display: block;
+    width: auto;
+    max-width: min(34vw, 420px);
+    max-height: 40vh;
+    height: auto;
+    margin-top: 8px;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, .18);
+    cursor: zoom-in;
+  }
+  .msg .msg-shot-gone { margin-top: 8px; font-size: 12px; opacity: .7; }
+  /* 点缩略图后的原图覆盖层 */
+  .shot-viewer {
+    position: fixed;
+    inset: 0;
+    z-index: 999;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, .82);
+    cursor: zoom-out;
+  }
+  .shot-viewer img {
+    max-width: 94vw;
+    max-height: 92vh;
+    border-radius: 10px;
+    box-shadow: 0 18px 60px rgba(0, 0, 0, .6);
+  }
   /* 来源角标：只在用户气泡上显示，用来区分 QAM 插件 / 网页 / 手机 / 客户端。
-     自己发的标「本端」，别人发的标具体来源，跨端接着聊时一眼看清谁说的 */
+     自己发的就不标（屏幕前的人知道自己刚说了什么），只标别的端发来的，
+     跨端接着聊时一眼看清谁说的 */
   .msg-src {
     display: inline-block;
     font-size: 10px;
@@ -164,10 +198,12 @@
      注意：必须用绝对定位脱离文档流。它一旦参与布局，即使高度为 0、
      透明度为 0，那排按钮的宽度仍会被算进气泡的收缩宽度，
      导致「继续」这种两个字的短句也被撑到近 200px 宽。 */
+  /* 操作行贴在气泡正下方：气泡的底部空隙已经移到 margin 里，所以这里要
+     用负的 bottom 把整行拉进那段 margin，而不是 top:100%（那会顶到气泡外框下） */
   .msg-foot {
     position: absolute;
     left: 0; right: auto;
-    top: 100%; margin-top: 1px;
+    bottom: -18px;
     display: flex; align-items: center; gap: 10px;
     white-space: nowrap;
     opacity: 0; visibility: hidden; pointer-events: none;
@@ -320,11 +356,14 @@
   .tl.open .tl-body { display: block; }
   /* 截图行：正文块收缩到图片宽度，并解除 280px 高度裁切，完整显示整张图 */
   .tl.open .tl-body.pic {
-    width: fit-content; max-width: 92%;
+    /* 宽度按 max-content 算：气泡宽度取自图片的固有宽度，padding/border
+       算在气泡自己身上，不会出现「图比气泡大一圈」那种错位 */
+    width: max-content; max-width: 92%;
     max-height: none; overflow: visible;
     padding: 6px; white-space: normal;
   }
-  .tl-body.pic .shot { display: block; width: auto; max-width: 100%; height: auto; }
+  /* 图片宽度只按窗口算，不再用 100%（那是相对图自身，会形成回环，浏览器算不准就溢出） */
+  .tl-body.pic .shot { display: block; width: auto; max-width: min(30vw, 400px); height: auto; }
   .tl-body.term {
     background: var(--code-bg); color: var(--code-text);
     font-family: ui-monospace, monospace; font-size: 12px;
@@ -337,16 +376,58 @@
   .tl-file .add { color: #2ecc71; }
   .tl-file .del { color: #e8463a; }
   .tl-body .shot { display: block; width: auto; max-width: 100%; height: auto; border-radius: 8px; border: 1px solid var(--line); cursor: zoom-in; }
-  /* 截图缩略图：按对话区宽度的 30% 显示，气泡跟着收缩；窄屏保底 160px */
-  .tl-body.pic .shot { width: 30vw; min-width: 160px; max-width: 100%; }
+  /* 截图缩略图：按窗口宽度的 30% 显示，宽度只跟窗口走，
+     气泡再按图片的固有宽度撑开（见上面 .tl-body.pic），两边永远齐 */
+  .tl-body.pic .shot { max-width: min(30vw, 400px); }
   /* 附带的画面（提问里那张）只当缩略图用：16:9 裁切、高度封顶，
      点开才是原图。整张铺开会把一段对话挤成一屏以上 */
   .tl-body.pic .shot.thumb {
-    width: 40vw; max-width: 280px; height: auto; max-height: 22dvh;
+    width: min(40vw, 280px); max-width: 100%; height: auto; max-height: 22dvh;
     object-fit: cover; object-position: top left;
   }
   .stream-body { white-space: pre-wrap; word-break: break-word; }
   #send.stop { background: var(--danger); }
+
+  /* 提问的候选答案：问题已经由上面那条气泡说了，这里只是紧贴在下面的
+     一组按钮，所以不用外框，跟普通气泡一样往左对齐、同一个缩进。
+     宽度对齐上面的气泡（stretch），否则每行按钮会各按自己文字长短缩成不同宽 */
+  .ask-card { margin: 4px 0 2px; align-self: stretch; min-width: 0; }
+  .ask-opts { display: flex; flex-direction: column; gap: 6px; }
+  .ask-opt {
+    display: flex; gap: 8px; align-items: flex-start; text-align: left;
+    width: 100%; padding: 7px 10px; cursor: pointer;
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px;
+    font: inherit; font-size: 13px; line-height: 1.45;
+  }
+  .ask-opt:hover:not(:disabled) { border-color: var(--brand); background: var(--hover); }
+  .ask-opt .ask-n {
+    flex: 0 0 auto; width: 17px; height: 17px; border-radius: 5px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; color: var(--fg2);
+    background: var(--surface-2); border: 1px solid var(--line);
+  }
+  .ask-opt .ask-t { flex: 1 1 auto; word-break: break-word; }
+  /* 最后那格永远是空的自填行：跟选项长得一样，但里面是输入框 */
+  .ask-custom { cursor: text; background: transparent; border-style: dashed; }
+  .ask-custom:hover { border-color: var(--line); background: transparent; }
+  .ask-custom:focus-within { border-color: var(--brand); border-style: solid; }
+  .ask-input {
+    flex: 1 1 auto; min-width: 0; padding: 0; border: 0; background: transparent;
+    color: var(--text); font: inherit; font-size: 13px; outline: none;
+  }
+  .ask-input::placeholder { color: var(--muted); }
+  .ask-go {
+    flex: 0 0 auto; padding: 2px 9px; border-radius: 6px; cursor: pointer;
+    background: var(--brand); color: #fff; border: 1px solid var(--brand);
+    font: inherit; font-size: 12px;
+  }
+  .ask-go:disabled { opacity: .5; cursor: default; }
+  /* 已经答过的这组就定住：再点也不该发第二条，视觉上也要看得出来 */
+  .ask-card.answered { opacity: .55; }
+  .ask-card.answered .ask-opt { cursor: default; }
+  .ask-opt.picked { border-color: var(--brand); background: var(--hover); }
+  .ask-opt.picked .ask-n { color: var(--brand); border-color: var(--brand); }
 
   /* 分享图片预览 */
   #shareOverlay {
@@ -655,40 +736,37 @@
     content: ''; position: absolute; top: 3px; right: 3px;
     width: 7px; height: 7px; border-radius: 50%; background: #e5484d;
   }
-  /* 设置：全屏页，左边分区导航、右边内容。内容区单独滚动，
-     顶部标题栏和底部操作条固定，滚动时始终能看见「保存」 */
-  #settingsPanel {
-    position: fixed; inset: 0;
-    background: var(--bg);
-    display: none;
-    z-index: 20;
-  }
-  #settingsPanel.show { display: flex; }
-  .set-nav {
-    flex: 0 0 208px;
-    display: flex; flex-direction: column;
-    background: var(--surface);
-    border-right: 1px solid var(--line);
-    padding: 18px 12px;
-    padding-top: calc(18px + env(safe-area-inset-top));
-    padding-bottom: calc(18px + env(safe-area-inset-bottom));
-  }
-  .set-nav h2 {
-    font-size: 15px; font-weight: 600;
-    padding: 0 10px 14px; letter-spacing: .02em;
-  }
+  /* 设置：不另开一层浮层，直接顶替对话主界面 —— 左栏会话列表换成设置分区导航
+     （logo / 版本 / 主题 / 设置按钮原地不动），右栏换成一页设置。
+     这样进设置不会「跳到一个别的界面」，两边的间距和字号也跟对话页一致 */
+  body.settings-mode .sb-sess-block,
+  body.settings-mode #chatView { display: none; }
+  /* 顶栏不归 #chatView 管：它留在 #main 顶上，所以设置页顶上看到的
+     就是对话页那一模一样的一条 */
+  .sb-set-block { display: none; flex-direction: column; min-height: 0; }
+  body.settings-mode .sb-set-block { display: flex; flex: 1; }
+  #setNav { flex: 1; overflow-y: auto; padding: 4px 8px 8px; }
+  /* 分区导航复用会话条目的观感（同宽、同圆角、同字号），一眼就是同一条侧栏 */
   .set-tab {
     display: flex; align-items: center; gap: 8px;
-    width: 100%; padding: 10px 12px; margin-bottom: 4px;
-    border: 0; border-radius: 10px; background: transparent;
-    color: var(--muted); font-size: 14px; text-align: left; cursor: pointer;
+    width: 100%; padding: 8px 10px; margin-bottom: 2px;
+    border: 0; border-radius: 9px; background: transparent;
+    color: var(--text); font-size: 13px; text-align: left; cursor: pointer;
     font-family: inherit;
   }
-  .set-tab:hover { background: var(--hover); color: var(--text); }
-  .set-tab.on { background: var(--surface-2); color: var(--text); font-weight: 600; }
-  .set-nav .spacer { flex: 1; }
+  .set-tab:hover { background: var(--hover); }
+  .set-tab.on { background: var(--surface-2); font-weight: 600; }
+  /* 「返回」和会话区的「＋」同一块砖，只换宽度装得下两个字 */
+  #setClose {
+    min-width: 24px; height: 24px; padding: 0 8px;
+    border: 1px solid var(--line); background: var(--surface-2); color: var(--text);
+    border-radius: 7px; cursor: pointer; font-size: 12px; line-height: 1;
+  }
+  #setClose:hover { border-color: var(--brand); color: var(--brand); }
+  #settingsPanel { display: none; flex: 1; min-height: 0; flex-direction: column; }
+  body.settings-mode #settingsPanel { display: flex; }
   .set-main {
-    flex: 1; min-width: 0;
+    flex: 1; min-width: 0; min-height: 0;
     display: flex; flex-direction: column;
   }
   .set-body {
@@ -706,6 +784,14 @@
   .set-pane > .pane-desc {
     font-size: 13px; color: var(--muted); margin-bottom: 20px; line-height: 1.6;
   }
+  /* 页内小节标题（如「女仆人设」里的长期记忆）：比卡片标题重一点，比页标题轻 */
+  .set-sub {
+    font-size: 14.5px; font-weight: 600; color: var(--text);
+    margin: 26px 0 4px; padding-top: 18px; border-top: 1px solid var(--line);
+  }
+  .set-sub + .pane-desc {
+    font-size: 13px; color: var(--muted); margin-bottom: 16px; line-height: 1.6;
+  }
   /* 一页里的一组字段：灰底卡片，用边线分隔，比一堆裸输入框整齐 */
   .card {
     background: var(--surface);
@@ -719,47 +805,34 @@
     margin-bottom: 12px; letter-spacing: .02em;
   }
   .card > .field:last-child { margin-bottom: 0; }
+  /* 底栏的垂直尺寸要和侧栏那条 .sb-foot 完全一样（上 8 / 下 10 / 按钮 34），
+     两个分隔线才会落在同一条水平线上，不然左右各画一条、高低差一截 */
   .set-foot {
     flex: 0 0 auto;
     display: flex; align-items: center; gap: 10px;
-    padding: 12px 26px;
-    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+    padding: 8px 12px;
+    padding-bottom: calc(10px + env(safe-area-inset-bottom));
     border-top: 1px solid var(--line);
     background: var(--surface);
   }
-  .set-foot #cfgHint { flex: 1; margin: 0; text-align: left; }
-  #saveCfg {
+  .set-foot #cfgHint { flex: 1; margin: 0; text-align: left; line-height: 1.4; }
+  /* 主按钮只有一套：设置页的「保存」和关于页的「立即升级」同高同宽同色，
+     尺寸直接照抄对话页的发送键（34 高 / 0 16 内边距 / 15px 600），
+     底栏右内边距也跟输入区一样是 12，两个按钮的右边缘就落在同一条线上 */
+  #saveCfg, #updApply {
     flex: none;
-    padding: 10px 26px;
+    height: 34px; min-width: 52px; padding: 0 16px;
     border: none; border-radius: 10px;
     background: var(--brand); color: #fff;
-    font-size: 14px; font-weight: 600;
+    font-size: 15px; font-weight: 600; font-family: inherit;
+    cursor: pointer;
   }
-  #saveCfg:active { filter: brightness(.92); }
-  #setClose {
-    flex: none; height: 40px; padding: 0 16px;
-    border: 1px solid var(--line); border-radius: 10px;
-    background: transparent; color: var(--muted); font-size: 14px; cursor: pointer;
-  }
-  #setClose:hover { color: var(--text); border-color: var(--muted); }
-  /* 窄屏：导航从左侧竖排换成顶部横排（Deck 竖握、手机） */
+  #saveCfg:active, #updApply:active { filter: brightness(.92); }
+  /* 窄屏下侧栏本身是抽屉：设置导航跟着会话列表一起住在抽屉里，不用另写一套 */
   @media (max-width: 720px) {
-    #settingsPanel { flex-direction: column; }
-    .set-nav {
-      flex: none; flex-direction: row; align-items: center;
-      gap: 4px; padding: 10px 12px;
-      padding-top: calc(10px + env(safe-area-inset-top));
-      border-right: 0; border-bottom: 1px solid var(--line);
-      overflow-x: auto;
-      /* 横向滑动的标签条不画滚动条，否则会压掉文字底部 */
-      scrollbar-width: none;
-    }
-    .set-nav::-webkit-scrollbar { display: none; }
-    .set-nav h2, .set-nav .spacer { display: none; }
-    .set-tab { width: auto; flex: none; margin: 0; white-space: nowrap; }
     .set-body { padding: 16px 14px 24px; }
     .card { padding: 14px; }
-    .set-foot { padding: 10px 14px; padding-bottom: calc(10px + env(safe-area-inset-bottom)); }
+    .set-foot { padding: 8px 10px; padding-bottom: calc(10px + env(safe-area-inset-bottom)); }
   }
   .sheet {
     background: var(--surface);
@@ -787,7 +860,7 @@
     box-sizing: border-box;
   }
   .field-row { display: flex; align-items: center; justify-content: space-between; }
-  .field-row > label:not(.switch) { display: inline-block; margin: 0; }
+  .field-row > label:not(.switch) { display: inline-block; margin: 0; align-self: center; }
   /* 开关外层的 label 同时也是 .field label，会把「块级 + 灰色小字」带进来，
      这里复位成与开关等大的容器 */
   .field label.switch { display: inline-block; margin: 0; font-size: 0; }
@@ -799,12 +872,14 @@
     padding: 0; border: 0; margin: 0; cursor: pointer; z-index: 2;
   }
   /* 令牌一行：输入框 + 随机生成按钮 */
-  .token-row { display: flex; gap: 8px; align-items: center; }
+  .token-row { display: flex; gap: 8px; align-items: stretch; }
   .token-row input { flex: 1; font-family: ui-monospace, monospace; letter-spacing: 1px; }
   .mini-btn {
     flex: none;
-    height: 44px;
+    /* 高度不再写死：跟随同一行的输入框（.token-row / .mem-add / .about-row 都靠 stretch 对齐），
+       否则 15px 的输入框配 44px 的按钮，一行里三种高度 */
     padding: 0 14px;
+    min-height: 42px;
     border: 1px solid var(--line);
     border-radius: 10px;
     background: var(--surface-2);
@@ -813,8 +888,6 @@
     cursor: pointer;
   }
   .mini-btn:hover { border-color: var(--brand); color: var(--brand); }
-  /* 预设按钮夹在提示文字里：矮一点、跟着基线走，别把提示撑成两个大按钮 */
-  .field-hint .mini-btn { height: 26px; padding: 0 8px; margin-left: 4px; font-size: 12px; }
   /* 「语气」这类多行输入：和单行输入框同一套外观，可拖高 */
   .field textarea {
     width: 100%;
@@ -865,14 +938,26 @@
   .switch input:checked + .slider::before { transform: translateX(20px); background: #fff; }
   #cfgHint { text-align: center; font-size: 13px; color: var(--muted); margin-top: 10px; min-height: 18px; }
 
-  /* 长期记忆：新增行 + 分组列表 */
-  .mem-add { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
-  .mem-add input { flex: 1; min-width: 0; }
-  .mem-kind {
-    flex: none; height: 44px; padding: 0 10px;
+  /* 长期记忆：新增行 = 下拉 + 输入框 + 按钮，三者同高同圆角，
+     输入框直接套 `field` 里的那套外观，别再单独写一份 */
+  .mem-add { display: flex; gap: 8px; align-items: stretch; margin-top: 10px; }
+  .mem-add input {
+    flex: 1; min-width: 0;
+    padding: 11px 14px;
     border: 1px solid var(--line); border-radius: 10px;
-    background: var(--surface-2); color: var(--text); font-size: 13px; outline: none;
+    background: var(--surface-2); color: var(--text);
+    font-size: 14px; font-family: inherit; outline: none;
   }
+  .mem-add input:focus { border-color: var(--brand); }
+  .mem-kind {
+    flex: none; padding: 0 10px;
+    border: 1px solid var(--line); border-radius: 10px;
+    background: var(--surface-2); color: var(--text); font-size: 13px;
+    font-family: inherit; outline: none;
+  }
+  .mem-kind:focus { border-color: var(--brand); }
+  /* 和输入框一样高：用 stretch 对齐，不再写死 44px */
+  .mem-add .mini-btn { height: auto; padding: 0 14px; }
   .mem-list { margin-top: 10px; }
   .mem-empty { font-size: 13px; color: var(--muted); padding: 10px 0; }
   .mem-group {
@@ -895,6 +980,8 @@
   .mem-del:hover { border-color: #e5534b; color: #e5534b; }
   .mem-foot { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
   .mem-foot .field-hint { margin: 0; flex: 1; }
+  /* 脚注行里的小按钮也跟着一行高，别再用 mini-btn 的 min-height 顶起来 */
+  .mem-foot .mini-btn { min-height: 32px; font-size: 13px; }
 
   /* 设置页底部：版本号 + 检查/安装更新 */
   .about-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -902,15 +989,14 @@
     font-size: 12px; font-weight: 600; color: var(--muted);
     padding: 3px 8px; border: 1px solid var(--line); border-radius: 999px;
   }
-  .about-row .mini-btn { margin-left: auto; }
+  .about-row .mini-btn { margin-left: auto; min-height: 32px; font-size: 13px; }
   .upd-note {
     margin-top: 8px; font-size: 13px; color: var(--muted);
     white-space: pre-wrap; word-break: break-word; line-height: 1.5;
   }
   .upd-note b { color: var(--text); }
-  #updApply { display: none; width: 100%; margin-top: 8px; padding: 11px;
-    border: none; border-radius: 10px; background: var(--brand); color: #fff;
-    font-size: 15px; font-weight: 600; }
+  /* 外观见上方 #saveCfg 那条共用规则，这里只管排版 */
+  #updApply { display: none; width: 100%; margin-top: 8px; }
 
   /* ===== 亮暗主题 + 分栏布局 ===== */
   :root {
@@ -958,6 +1044,9 @@
   ::-webkit-scrollbar-corner { background: transparent; }
   #app { display: flex; height: 100dvh; }
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; height: 100dvh; }
+  /* 对话视图是 #main 里的一层包装（进设置时整块藏起来）。它必须自己撑满并继续
+     纵向 flex，否则只是个普通块：消息区的 flex:1 失效塌成 0，输入框被顶到顶上 */
+  #chatView { flex: 1; display: flex; flex-direction: column; min-height: 0; }
   #sidebar {
     width: 240px; flex: 0 0 auto;
     background: var(--surface);
@@ -1008,6 +1097,8 @@
     border: 1px solid var(--line); background: var(--surface-2); color: var(--text);
     width: 24px; height: 24px; border-radius: 7px; cursor: pointer; font-size: 14px; line-height: 1;
   }
+  .sb-sess-block { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+  .sb-sess-block > .sb-sess-head { flex: none; }
   #sessList { flex: 1; overflow-y: auto; padding: 0 8px 8px; display: flex; flex-direction: column; gap: 2px; }
   .sess {
     display: flex; align-items: center; gap: 6px;
@@ -1032,6 +1123,12 @@
     }
     body.sb-open #sidebar { transform: none; }
     #btnMenu { display: block; }
+    /* 抽屉拉开时在设置页盖一层：点哪儿都会先收起导航，不会出现「导航挡住设置
+       却怎么也关不掉」——PC 端窄窗口尤其容易踩到 */
+    body.settings-mode.sb-open .set-main::after {
+      content: ''; position: fixed; z-index: 14;
+      inset: 0 0 0 240px; background: rgba(0,0,0,.35);
+    }
   }
   /* 手机竖屏（≈390px）：顶栏、时间线、输入栏都要单独收窄，否则会被挤出屏幕 */
   @media (max-width: 560px) {
@@ -1059,8 +1156,11 @@
     .tl-head { font-size: 12.5px; gap: 5px; }
     .tl-chip { max-width: 56vw; font-size: 11.5px; }
     .tl-body { font-size: 12px; }
-    /* 截图缩略图别顶满整行 */
-    .tl-body.pic .shot { width: 62vw; min-width: 0; }
+    /* 截图缩略图别顶满整行。这里不能再写固定 vw：气泡上限是 92%，
+       图一旦比「气泡宽度 − 内边距」宽，就会从右下角顶出去 */
+    .tl-body.pic .shot { width: auto; max-width: 56vw; min-width: 0; }
+    /* 提问气泡里的附图同理：跟着 92% 的气泡收窄，别顶出右下角 */
+    .msg .msg-shot { max-width: 60vw; max-height: 34vh; }
 
     #composer { padding: 8px 10px; padding-bottom: calc(8px + env(safe-area-inset-bottom)); gap: 6px; }
     #input { font-size: 15px; padding: 10px 12px; min-height: 40px; }
@@ -1164,8 +1264,15 @@
     <div class="sys-row" id="ctxRow" hidden><span class="sys-name">上下文</span><div class="bar"><div class="fill" id="ctxFill"></div></div><span class="sys-val" id="ctxVal">–</span></div>
     <div class="sys-sub" id="sysSub"></div>
   </div>
+  <div class="sb-sess-block">
   <div class="sb-sess-head"><span>会话</span><button id="btnNewSess" title="新会话">＋</button></div>
   <div id="sessList"></div>
+  </div>
+  <!-- 设置模式下的左栏：会话区整块换成设置分区导航，logo / 版本 / 底部按钮都保留 -->
+  <div class="sb-set-block">
+    <div class="sb-sess-head"><span>设置</span><button id="setClose" title="返回对话">返回</button></div>
+    <div id="setNav"></div>
+  </div>
   <div class="sb-brand">
     <img class="brand-mark" src="logo-mark.png" alt="DeckMeido">
     <span class="brand-name">
@@ -1180,6 +1287,9 @@
 </aside>
 <main id="main">
 
+<!-- 顶栏只有这一条：对话和设置共用。切到设置时 #chatView 整个藏起来，
+     它留在原处不动——状态点、会话名、上下文用量、连接数、模式徽章
+     在设置页里看到的和在对话里一模一样 -->
 <header>
   <button class="cb-btn" id="btnMenu" title="菜单">菜单</button>
   <span class="dot" id="dot"></span>
@@ -1188,11 +1298,14 @@
   <span class="spacer"></span>
   <div class="hdr-right">
     <span class="badge" id="ctxBadge" hidden></span>
-    <button class="badge" id="btnLive" title="实时画面（游戏模式）">画面</button>
+    <button class="badge" id="btnLive" title="实时画面（游戏模式）" hidden>画面</button>
     <span class="badge ctrl" id="ctrlBadge" hidden></span>
     <span class="badge" id="modeBadge" hidden></span>
   </div>
 </header>
+
+<!-- 对话视图：消息 + 输入栏。进设置时这块藏起来，#main 换成一页设置 -->
+<div id="chatView">
 
 <div id="shareOverlay">
   <div class="share-box">
@@ -1249,62 +1362,13 @@
     </div>
   </div>
 </div>
-
-</main>
 </div>
 
-<div id="liveView">
-  <div class="lv-bar">
-    <span class="lv-title" id="lvTitle">实时画面</span>
-    <button class="lv-btn" id="lvReload" title="重连画面">重连</button>
-    <button class="lv-btn" id="lvClose" title="关闭">关闭</button>
-  </div>
-  <div class="lv-stage">
-    <video id="lvVideo" muted autoplay playsinline hidden></video>
-    <div class="lv-msg" id="lvMsg">正在连接画面…</div>
-    <div class="lv-grip" id="lvGrip"></div>
-  </div>
-</div>
-
-<div id="codeView">
-  <div id="codeBox">
-    <div class="cv-bar">
-      <span style="flex:1; color:var(--muted); font-size:13px;">代码预览</span>
-      <button class="menu-btn" id="cvCopy">复制</button>
-      <button class="menu-btn" id="cvClose">关闭</button>
-    </div>
-    <pre id="codePre"></pre>
-  </div>
-</div>
-
-<input type="file" id="imgInput" accept="image/*,.txt,.md,.pdf,.docx,.csv,.log,.json,.py,.js,.ts,.sh,.yml,.yaml,.toml,.ini,.cfg,.xml,.html,.css" multiple hidden>
-<div id="dropHint">松手即可添加附件</div>
-
-<div id="authOverlay">
-  <div class="auth-card">
-    <img class="auth-logo" src="logo.png" alt="DeckMeido">
-    <h1>DeckMeido <small>控制台</small></h1>
-    <p>输入访问令牌即可连接这台 Steam Deck</p>
-    <input id="tokenInput" type="password" placeholder="访问令牌" autocomplete="off" spellcheck="false">
-    <div id="authErr" class="auth-err"></div>
-    <button id="tokenBtn">连接</button>
-    <div class="auth-tip">
-      令牌默认为 meido 可在客户端设置页修改<br>
-      当前版本 <span id="authVer">…</span>
-    </div>
-  </div>
-</div>
-
+<!-- 设置视图：占满 #main；左侧分区导航在侧栏里（替换掉会话列表）。
+     顶上不另做一条：对话页那条 <header> 就放在 #main 顶部、#chatView 外面，
+     两种模式下都是同一份 DOM，
+     不用抄一遍，也就不会出现「设置页的顶栏比对话页丑一截」 -->
 <div id="settingsPanel">
-  <nav class="set-nav">
-    <h2>设置</h2>
-    <button class="set-tab on" type="button" data-pane="model">模型接入</button>
-    <button class="set-tab" type="button" data-pane="persona">人设</button>
-    <button class="set-tab" type="button" data-pane="memory">长期记忆</button>
-    <button class="set-tab" type="button" data-pane="device">设备与连接</button>
-    <button class="set-tab" type="button" data-pane="about">关于与更新</button>
-    <div class="spacer"></div>
-  </nav>
   <div class="set-main">
     <div class="set-body">
       <div class="set-inner">
@@ -1317,11 +1381,6 @@
             <div class="field">
               <label>API 接口地址（base_url）</label>
               <input id="cfgBaseUrl" type="text" placeholder="https://api.deepseek.com" autocomplete="off">
-              <div class="field-hint">
-                默认按 DeepSeek 配置（填 https://api.deepseek.com 即可，不用加 /v1）。
-                其他 OpenAI 兼容服务照旧填它们的地址。
-                <button id="presetDeepseek" class="mini-btn" type="button">填入 DeepSeek 预设</button>
-              </div>
             </div>
             <div class="field">
               <label>API Key</label>
@@ -1335,14 +1394,22 @@
         </section>
 
         <section class="set-pane" data-pane="persona">
-          <h3>人设</h3>
-          <p class="pane-desc">决定她怎么称呼你、用什么语气说话。改完保存立即生效，新会话也保持一致。</p>
+          <h3>女仆人设</h3>
+          <p class="pane-desc">决定她是谁、怎么称呼你、用什么语气说话。改完保存立即生效，新会话也保持一致。</p>
           <div class="card">
-            <div class="card-title">称呼</div>
+            <div class="card-title">身份</div>
             <div class="field">
               <label>名字</label>
               <input id="cfgPersonaName" type="text" placeholder="DeckMeido" autocomplete="off">
             </div>
+            <div class="field">
+              <label>身份定位</label>
+              <textarea id="cfgPersonaTraits" rows="3" placeholder="日系女仆式助手：礼貌周到、称用户为主人，办事干练，偶尔带点俏皮的亲近感"></textarea>
+              <div class="field-hint">这句会接在「你是 {名字}，」后面，最先影响她怎么理解自己。</div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-title">称呼</div>
             <div class="field">
               <label>怎么称呼你</label>
               <input id="cfgPersonaAddress" type="text" placeholder="主人" autocomplete="off">
@@ -1367,10 +1434,17 @@
               <input id="cfgPersonaForbid" type="text" placeholder="喵，呢~，人家" autocomplete="off">
             </div>
           </div>
-        </section>
-
-        <section class="set-pane" data-pane="memory">
-          <h3>长期记忆</h3>
+          <div class="card">
+            <div class="card-title">补充设定</div>
+            <div class="field">
+              <label>额外规则（可留空）</label>
+              <textarea id="cfgPersonaExtra" rows="5" placeholder="例如：称呼我「主人」，汇报事情先给结论再给过程；不主动开玩笑；涉及设备操作时先说清要做什么。"></textarea>
+              <div class="field-hint">整段追加到系统提示词末尾，适合写上面表单装不下的规矩。</div>
+            </div>
+          </div>
+          <!-- 长期记忆并入这里：记的是「她记得你什么」，本来就是人设的一部分，
+               单独占一格导航反而让设置页多出一层分类 -->
+          <h4 class="set-sub">长期记忆</h4>
           <p class="pane-desc">
             记在这里的内容每次对话都会带上，重启也还在。对话里说「记住…」她也会自己记一条；
             纠正她的做法（「不对，应该…」）同样会记下来。只记你真想让她长期记住的，写多了会占掉上下文。
@@ -1410,7 +1484,7 @@
         </section>
 
         <section class="set-pane" data-pane="device">
-          <h3>设备与连接</h3>
+          <h3>设备连接</h3>
           <p class="pane-desc">她的权限范围、工作目录，以及其他设备连上这台 Deck 的方式。</p>
           <div class="card">
             <div class="card-title">权限</div>
@@ -1456,7 +1530,7 @@
         </section>
 
         <section class="set-pane" data-pane="about">
-          <h3>关于与更新</h3>
+          <h3>关于更新</h3>
           <p class="pane-desc">版本信息与升级渠道。升级会保留配置、会话与长期记忆。</p>
           <div class="card">
             <div class="card-title">版本</div>
@@ -1485,10 +1559,53 @@
     </div>
     <div class="set-foot">
       <div id="cfgHint"></div>
-      <button id="setClose" type="button">关闭</button>
       <button id="saveCfg" type="button">保存</button>
     </div>
   </div>
+</div>
+
+<div id="liveView">
+  <div class="lv-bar">
+    <span class="lv-title" id="lvTitle">实时画面</span>
+    <button class="lv-btn" id="lvReload" title="重连画面">重连</button>
+    <button class="lv-btn" id="lvClose" title="关闭">关闭</button>
+  </div>
+  <div class="lv-stage">
+    <video id="lvVideo" muted autoplay playsinline hidden></video>
+    <div class="lv-msg" id="lvMsg">正在连接画面…</div>
+    <div class="lv-grip" id="lvGrip"></div>
+  </div>
+</div>
+
+<div id="codeView">
+  <div id="codeBox">
+    <div class="cv-bar">
+      <span style="flex:1; color:var(--muted); font-size:13px;">代码预览</span>
+      <button class="menu-btn" id="cvCopy">复制</button>
+      <button class="menu-btn" id="cvClose">关闭</button>
+    </div>
+    <pre id="codePre"></pre>
+  </div>
+</div>
+
+<input type="file" id="imgInput" accept="image/*,.txt,.md,.pdf,.docx,.csv,.log,.json,.py,.js,.ts,.sh,.yml,.yaml,.toml,.ini,.cfg,.xml,.html,.css" multiple hidden>
+<div id="dropHint">松手即可添加附件</div>
+
+<div id="authOverlay">
+  <div class="auth-card">
+    <img class="auth-logo" src="logo.png" alt="DeckMeido">
+    <h1>DeckMeido <small>控制台</small></h1>
+    <p>输入访问令牌即可连接这台 Steam Deck</p>
+    <input id="tokenInput" type="password" placeholder="访问令牌" autocomplete="off" spellcheck="false">
+    <div id="authErr" class="auth-err"></div>
+    <button id="tokenBtn">连接</button>
+    <div class="auth-tip">
+      令牌默认为 meido 可在客户端设置页修改<br>
+      当前版本 <span id="authVer">…</span>
+    </div>
+  </div>
+</div>
+</main>
 </div>
 
 <div id="ctrlPanel">
@@ -1547,7 +1664,7 @@
   // 属于「某一轮对话」的消息类型：这些才需要按会话号过滤
   var TURN_SCOPED = ['user_message', 'stream_start', 'delta', 'thought_start',
                      'thought_delta', 'thought_end', 'tool_done', 'tool_activity',
-                     'assistant_message'];
+                     'ask', 'assistant_message'];
 
   function fmtTime(ts) {
     var d = ts ? new Date(ts * 1000) : new Date();
@@ -1735,54 +1852,121 @@
     // 旧版把事件块整体摆在正文上方，于是「思考→说话→执行」的顺序被打乱成
     // 「思考全在上、说话在中、命令在最下」；现在 order 里有序，按序摆放即可
     if (events && events.length) {
+      // 用户那条消息带的是「这一轮附带的画面」：它属于提问者，得画在提问气泡
+      // 自己身上（缩略图挂在气泡里），而不是另起一条助手侧的「截图」时间线。
+      // 以前所有 events 一视同仁地丢进 .events，回放时插件截的图就变成了
+      // 一条助手侧的时间线行，看着像「AI 自己截的图」
+      if (role === 'user') {
+        var bodyEvs = events.filter(function (ev) {
+          return !(ev && ev.type === 'screenshot' && ev.image);
+        });
+        var msgEl = makeUserBubble(text, ts, client, device, events);
+        messages.appendChild(msgEl);
+        if (bodyEvs.length) {
+          var ubox = document.createElement('div');
+          ubox.className = 'events';
+          bodyEvs.forEach(function (ev) { renderEvent(ev, ubox); });
+          messages.appendChild(ubox);
+        }
+        trimMessages();
+        fillFileSizes(msgEl);
+        scrollBottomSafe();
+        return;
+      }
       var box = document.createElement('div');
       box.className = 'events';
+      // 有 ask 的那一轮，问题本身就在 events 里、按「气泡在上、选项在下」画过了，
+      // 收尾的正文不要再补一条。若正文确实比问题多说了别的内容，才补上去
+      var asked = null;
+      events.forEach(function (ev) {
+        if (ev && ev.type === 'ask' && !asked) asked = ev;
+      });
       events.forEach(function (ev) { renderEvent(ev, box); });
-      // 一轮的尾巴：正文接在它真正说完的那个位置之后
-      box.appendChild(makeTextBubble(text, true, ts));
+      var tail = String(text || '').trim();
+      if (!asked || (tail && tail !== String(asked.question || '').trim())) {
+        box.appendChild(makeTextBubble(text, true, ts));
+      }
       messages.appendChild(box);
       trimMessages();
       fillFileSizes(box);
       scrollBottomSafe();
       return;
     }
-    var el = document.createElement('div');
-    el.className = 'msg ' + role;
-    if (ts) el.dataset.ts = String(ts);
-    if (role === 'user' && clientLabel(client, device)) {
-      // 来源角标：老数据没有 client 字段，就不显示。
-      // 「本端」只在设备 id 与本人一致时才标：两台电脑的 client 都是 web，
-      // 只比 client 会让别人的发言也显示成「本端」。老数据没有 device 字段，
-      // 那就退回比较 client 类型，至少还能区分手机和电脑
-      var own = device ? (device === DEVICE_ID) : (!device && client === myClient());
-      var src = document.createElement('span');
-      src.className = 'msg-src';
-      src.textContent = own ? '本端' : clientLabel(client, device);
-      // 把原始值和本端认定一起写进 title：角标认错时一眼能看出是哪一边算错了
-      src.title = '发起来源：' + clientLabel(client, device) + '（' + client
-                  + '）；本端认定为 ' + myClient() + (device ? '，设备 ' + device.slice(0, 8) : '');
-      el.appendChild(src);
-    }
-    if (role === 'assistant' || role === 'user') {
-      var body = document.createElement('div');
-      body.innerHTML = renderMd(text);
-      el.appendChild(body);
-    } else {
-      el.textContent = text;
-    }
-    if (role === 'assistant' || role === 'user') {
-      // 用户和助手都给一套底部操作行（默认悬停才显示）
-      addMsgFoot(el, ts, role);
-    } else {
-      var t = document.createElement('span');
-      t.className = 'time';
-      t.textContent = fmtTime(ts);
-      el.appendChild(t);
-    }
+    var el = makeUserBubble(text, ts, client, device, null);
     messages.appendChild(el);
     trimMessages();
     fillFileSizes(el);
     scrollBottomSafe();
+  }
+
+  // 用户气泡：来源角标 + 正文 + 随提问附带的画面缩略图 + 底部操作行。
+  // 实时接收（user_message）和历史回放（history）走同一份，
+  // 免得「刚发出去时有图、刷新后图又没了」这类两边不一致的怪现象
+  function makeUserBubble(text, ts, client, device, events) {
+    var el = document.createElement('div');
+    el.className = 'msg user';
+    if (ts) el.dataset.ts = String(ts);
+    // 来源角标：老数据没有 client 字段，就不显示。
+    // 自己这台设备发的话不标角标 —— 屏幕前的人刚打完那句话，不需要再被告知
+    // 「这是本端」。只有别的端（手机 / 客户端 / 另一台电脑 / QAM 插件）说的
+    // 才标出来。设备 id 与本人一致才算本端：两台电脑的 client 都是 web，
+    // 只比 client 会让别人的发言也当成自己说的。老数据没有 device 字段，
+    // 那就退回比较 client 类型，至少还能区分手机和电脑
+    var own = device ? (device === DEVICE_ID) : (!device && client === myClient());
+    if (!own && clientLabel(client, device)) {
+      var src = document.createElement('span');
+      src.className = 'msg-src';
+      src.textContent = clientLabel(client, device);
+      // 把原始值写进 title：角标认错时一眼能看出是哪一边算错了
+      src.title = '发起来源：' + clientLabel(client, device) + '（' + client
+                  + '）；本端认定为 ' + myClient() + (device ? '，设备 ' + device.slice(0, 8) : '');
+      el.appendChild(src);
+    }
+    var body = document.createElement('div');
+    body.innerHTML = renderMd(text);
+    el.appendChild(body);
+    // 随提问附带的画面（截屏询问）：缩略图直接嵌在气泡正文下面。
+    // 之前它被画成助手侧的一条「截图」时间线，看起来像是 AI 自己截的图
+    (events || []).forEach(function (ev) {
+      if (!(ev && ev.type === 'screenshot' && ev.image)) return;
+      var shot = document.createElement('img');
+      shot.className = 'msg-shot';
+      shot.src = withToken(ev.image);
+      shot.alt = ev.summary || '附带的画面';
+      shot.title = '点开看原图';
+      // 先按 16:9 占位，图解码完再交回自适应，避免气泡先瘦后胖
+      shot.width = 240; shot.height = 135;
+      shot.onload = function () {
+        shot.removeAttribute('width'); shot.removeAttribute('height');
+      };
+      // 图被清理或旧数据没落盘时别留破图标：换成一句说明
+      shot.onerror = function () {
+        shot.removeAttribute('width'); shot.removeAttribute('height');
+        var ph = document.createElement('div');
+        ph.className = 'msg-shot-gone';
+        ph.textContent = '（这张画面已不在服务器上，仅当时的模型看过）';
+        shot.parentNode.replaceChild(ph, shot);
+      };
+      shot.addEventListener('click', function () { openShotViewer(shot.src); });
+      el.appendChild(shot);
+    });
+    addMsgFoot(el, ts, 'user');
+    return el;
+  }
+
+  // 点缩略图看原图：直接开一个覆盖层，不跳转页面（跳走会丢掉当前对话状态）
+  function openShotViewer(url) {
+    var mask = document.createElement('div');
+    mask.className = 'shot-viewer';
+    var big = document.createElement('img');
+    big.src = url;
+    big.alt = '原图';
+    mask.appendChild(big);
+    mask.addEventListener('click', function () { mask.remove(); });
+    document.addEventListener('keydown', function esc(e) {
+      if (e.key === 'Escape') { mask.remove(); document.removeEventListener('keydown', esc); }
+    });
+    document.body.appendChild(mask);
   }
 
   // 气泡底部：操作按钮在左，时间在右（鼠标移上去才显示，见 .msg-foot 样式）
@@ -1881,6 +2065,20 @@
     img.className = 'shot thumb';
     img.src = withToken(ev.image);
     img.alt = '附带的画面';
+    // 解码前先按 16:9 占好位置，别让气泡先瘦后胖（同下方截图行的处理）
+    img.width = 280; img.height = 158;
+    img.onload = function () { img.removeAttribute('width'); img.removeAttribute('height'); };
+    // 图被清理掉（见后端 _save_incoming_shot 的保留数量）或旧数据没落盘时，
+    // 别留一个破图标：这里换成一句说明，用户知道「这一轮确实带了画面，只是文件没了」
+    img.onerror = function () {
+      img.removeAttribute('width'); img.removeAttribute('height');
+      var ph = document.createElement('div');
+      ph.textContent = '（这张画面已不在服务器上，仅当时的模型看过）';
+      ph.style.color = 'var(--muted)';
+      ph.style.fontSize = '12px';
+      body.innerHTML = '';
+      body.appendChild(ph);
+    };
     body.appendChild(img);
     r.tl.appendChild(body);
     r.tl.classList.add('open');
@@ -1930,6 +2128,12 @@
     if (ev.type === 'text') {
       var seg = (ev.text || '').trim();
       if (seg) box.appendChild(makeTextBubble(seg, false));
+      return;
+    }
+    // 她主动提问：问题一条气泡，紧接着候选答案。顺序固定在「气泡在上、选项在下」
+    if (ev.type === 'ask') {
+      if (String(ev.question || '').trim()) box.appendChild(makeTextBubble(ev.question, false));
+      box.appendChild(makeAskCard(ev.question, ev.options));
       return;
     }
     if (ev.type !== 'tool') return;
@@ -1988,6 +2192,11 @@
         img.className = 'shot';
         img.src = withToken(ev.image);
         img.alt = '屏幕截图';
+        // 图解码出来之前，按 16:9 的固有尺寸先占住位置。
+        // 不占的话气泡先按 0 宽画一遍，图片一落地再把气泡撑开——
+        // 那一瞬间就是「图比气泡大一圈」的观感
+        img.width = 400; img.height = 225;
+        img.onload = function () { img.removeAttribute('width'); img.removeAttribute('height'); };
         body.appendChild(img);
       } else if (ev.error) {
         // 失败原因单独显示：模型会据此告诉用户，界面上也要能直接看到
@@ -2025,6 +2234,78 @@
     scrollBottomSafe();
   }
 
+  // 提问的选项组：问题本身用上一格气泡说，这里只排候选答案 + 一个自己填的入口。
+  // 点选项 / 在输入行按回车，都当成用户把这句话发出去，走最普通的「再发一条消息」，
+  // 不需要任何额外的回传协议
+  function makeAskCard(question, options) {
+    var card = document.createElement('div');
+    card.className = 'ask-card';
+    var opts = (options || []).slice(0, 6);
+    // 已经答过就整组定住：一张卡片只认一次答案
+    function settle(picked) {
+      card.classList.add('answered');
+      if (picked) picked.classList.add('picked');
+      var all = card.querySelectorAll('button, input');
+      Array.prototype.forEach.call(all, function (el) { el.disabled = true; });
+    }
+    function answer(text) {
+      if (card.classList.contains('answered') || busy) return;
+      text = String(text || '').trim();
+      if (!text) return;
+      settle(null);
+      doSend(text);
+    }
+    var box = document.createElement('div');
+    box.className = 'ask-opts';
+    opts.forEach(function (o, i) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'ask-opt';
+      var n = document.createElement('span');
+      n.className = 'ask-n';
+      n.textContent = String(i + 1);
+      var t = document.createElement('span');
+      t.className = 'ask-t';
+      t.textContent = o;
+      b.appendChild(n);
+      b.appendChild(t);
+      b.addEventListener('click', function (e) {
+        e.stopPropagation();
+        if (card.classList.contains('answered') || busy) return;
+        settle(b);
+        doSend(o);
+      });
+      box.appendChild(b);
+    });
+    // 最后一格永远是空的：选项都对不上时，自己写一句
+    var row = document.createElement('div');
+    row.className = 'ask-opt ask-custom';
+    var free = document.createElement('input');
+    free.type = 'text';
+    free.className = 'ask-input';
+    free.placeholder = '或者，直接说说你想怎么办…';
+    free.autocomplete = 'off';
+    free.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' && !e.isComposing) {
+        e.preventDefault();
+        answer(free.value);
+      }
+    });
+    var go = document.createElement('button');
+    go.type = 'button';
+    go.className = 'ask-go';
+    go.textContent = '发送';
+    go.addEventListener('click', function (e) {
+      e.stopPropagation();
+      answer(free.value);
+    });
+    row.appendChild(free);
+    row.appendChild(go);
+    box.appendChild(row);
+    card.appendChild(box);
+    return card;
+  }
+
   function addSystem(text) {
     var el = document.createElement('div');
     el.className = 'msg system';
@@ -2054,6 +2335,8 @@
     typingEl.appendChild(dots);
     if (!label) l.remove();
     messages.appendChild(typingEl);
+    // 计时文字要写在 .typing-label 上，这个节点被删掉了就补一个回去
+    if (!label && waitTimer) waitTick();
     scrollBottomSafe();
   }
 
@@ -2079,6 +2362,7 @@
   var liveBox = null;      // 本轮对话的事件容器（实时渲染工具终端块）
   var liveToolCount = 0;   // 已实时渲染的工具数，避免 assistant_message 重复渲染
   var liveThoughtShown = 0; // 已实时渲染的思维链数
+  var askShown = 0;         // 已实时渲染的提问数（收尾时按这个跳过 events 里的 ask）
   var liveThought = null;  // 实时思维链卡片（.thought-body 元素）
   var streamEl = null;     // 流式输出气泡
   var streamBody = null;
@@ -2241,6 +2525,7 @@
           // 重连后重建现场：残留的流式气泡/事件容器都指向已经不存在的这一轮
           streamEl = null; streamBody = null;
           liveBox = null; liveToolCount = 0; liveThoughtShown = 0; liveThought = null;
+          askShown = 0;
           hideTyping();
           setBusy(false);
           // 等服务端紧跟着发的 status：它带着 running 字段，
@@ -2254,7 +2539,15 @@
           turnCacheReset();       // 新一轮开始，本地屏幕缓存清零
           if (msg.sid) turnCache.sid = msg.sid;
           // 带 brief 的一轮（截屏询问）界面上只显示短文案，长提示词不铺满屏幕
-          addMsg('user', msg.brief || msg.text, msg.ts, msg.events || null, msg.client, msg.device);
+          if (msg.events && msg.events.length) {
+            // 这一轮带了画面：和回放走同一条路径，缩略图挂在提问气泡里
+            addMsg('user', msg.brief || msg.text, msg.ts, msg.events,
+                   msg.client, msg.device);
+          } else {
+            messages.appendChild(makeUserBubble(msg.brief || msg.text, msg.ts,
+                                                msg.client, msg.device, null));
+            scrollBottomSafe();
+          }
           liveBox = document.createElement('div');
           liveBox.className = 'events';
           messages.appendChild(liveBox);
@@ -2372,6 +2665,11 @@
           // 最终正文就是时间线里的最后一段气泡：原地把它补成「正式回复」（带按钮/时间），
           // 而不是抽出来另起一条——否则这一段会掉到所有事件下面，顺序又乱回去
           var promoted = false;   // 最终正文是否已原地补进时间线
+          // 这一轮的正文就是那句问题、屏幕上已经以气泡形式出现过了（见 case 'ask'），
+          // 收尾时别再补一条一模一样的
+          var askOnly = askShown > 0 && !!(msg.events && msg.events.some(function (e) {
+            return e.type === 'ask';
+          }));
           if (streamEl && streamEl.parentNode) {
             if (msg.text) {
               var fb = streamEl.querySelector('.stream-body');
@@ -2405,9 +2703,10 @@
             if (liveBox) {
               // 补渲染未实时显示的事件：已实时展示过的工具块/思维链按数量跳过，
               // 过渡正文（text）在流式阶段已经显示过了，一并跳过，避免段落重复
-              var skip = liveToolCount, skipT = liveThoughtShown;
+              var skip = liveToolCount, skipT = liveThoughtShown, skipA = askShown;
               msg.events.forEach(function (e) {
                 if (e.type === 'text') return;
+                if (e.type === 'ask' && skipA > 0) { skipA--; return; }
                 if (e.type === 'tool' && skip > 0) { skip--; return; }
                 if (e.type === 'thought' && skipT > 0) { skipT--; return; }
                 renderEvent(e, liveBox);
@@ -2419,8 +2718,8 @@
           if (liveBox && !liveBox.childNodes.length && liveBox.parentNode) {
             liveBox.parentNode.removeChild(liveBox);
           }
-          liveBox = null; liveToolCount = 0; liveThoughtShown = 0;
-          if (!promoted) addMsg('assistant', msg.text, msg.ts);
+          liveBox = null; liveToolCount = 0; liveThoughtShown = 0; askShown = 0;
+          if (!promoted && !askOnly) addMsg('assistant', msg.text, msg.ts);
           refreshStatus();  // 更新上下文用量徽标
           } catch (e) {
             // 渲染出错不能拖住对话流程：记录一笔，继续往下走
@@ -2430,6 +2729,30 @@
             // 排队的消息就必须发出去，否则主人会一直等一条永远不动的队列
             flushQueue(!!msg.cancelled);
           }
+          break;
+        case 'ask':
+          // 这一轮说到这里就结束：问题先用一条普通气泡说，紧接着摆出候选答案。
+          // 顺序必须是「气泡在上、选项在下」，所以这里先补气泡再挂选项
+          hideTyping();
+          if (!liveBox) {
+            liveBox = document.createElement('div');
+            liveBox.className = 'events';
+            messages.appendChild(liveBox);
+          }
+          // 提问前她可能已经把这句话流式吐了出来（streamEl 里就是它），
+          // 那就把它撤掉，统一用下面这条正式气泡，免得屏幕上同一句话俩气泡
+          if (streamEl && streamEl.parentNode) {
+            var sBody = streamEl.querySelector('.stream-body');
+            var sText = sBody ? sBody.textContent.trim() : '';
+            if (!sText || sText === String(msg.question || '').trim()) {
+              streamEl.parentNode.removeChild(streamEl);
+            }
+          }
+          streamEl = null; streamBody = null;
+          if (msg.question) liveBox.appendChild(makeTextBubble(msg.question, false));
+          liveBox.appendChild(makeAskCard(msg.question, msg.options));
+          askShown++;   // 收尾时 events 里那条 ask 不再画第二遍
+          scrollBottomSafe();
           break;
         case 'tool_activity':
           showTyping(msg.text);
@@ -2654,37 +2977,32 @@
         showTyping('已重连，等待服务端处理完这一轮…');
       }
       if (!busy) setBusy(true);
+      // 连回来时把已经跑了多久接上（服务端给了开始时刻），而不是从 0 重新数
+      if (s.running_since) startWaitTimer(s.running_since);
     } else if (!s.running) {
-      // 只在对账（重连回来第一次 status）时用服务端状态复位本地忙碌态，
       // 平时不乱清 busy：doSend 刚发出、服务端还没建好 task 的瞬间收到
-      // 一条「未运行」的 status，会把刚点亮的终止态误掐掉
+      // 一条「未运行」的 status，会把刚点亮的终止态误掐掉。
+      // 但状态既然明确说「没在跑」，就不能让打字行一直挂在那里转圈 ——
+      // 那是「卡住」的观感来源；除非本地刚发出去（3 秒内，服务端可能还没建 task）
       if (awaitingResync) {
         awaitingResync = false;
         setBusy(false);
+        hideTyping();
         flushQueue(false);
-      } else if (msgQueue.length && !queueHeld
-                 && Date.now() - lastSendAt > 4000) {
-        // 队列自愈：服务端明确「没在跑」、队列却还压着东西，且距上次发送已经超过 4 秒
-        // （3000ms 的 status 间隔内足够走完一轮建 task），说明收尾事件根本没送到
-        // —— 比如被会话代次过滤掉，或者渲染中途抛了异常。
-        // 不处理的话这些消息会一直躺在输入框上方，主人以为「排队不生效」。
-        // queueHeld=true 表示主人是手动终止的，那是有意压住，不能替他发
-        setBusy(false);
-        showTyping('');
-        flushQueue(false);
+      } else if (Date.now() - lastSendAt > 3000) {
+        hideTyping();
+        stopWaitTimer();
       }
     }
     if (s.mode) {
       modeBadge.hidden = false;
       modeBadge.textContent = s.mode === 'gaming' ? '游戏模式' : '桌面模式';
-      // 画面入口一直显示：桌面模式下没有 gamescope 节点可抓，只置灰并提示原因，
-      // 直接藏掉会让人以为「实时画面」这个功能没了
-      btnLive.hidden = false;
-      btnLive.classList.toggle('off', s.mode !== 'gaming');
-      btnLive.title = s.mode === 'gaming'
-        ? '实时画面'
-        : '实时画面 · 仅游戏模式可用（当前是桌面模式）';
-      if (s.mode !== 'gaming' && liveOn) liveClose();
+      // 画面入口只在游戏模式出现：桌面模式下没有 gamescope 节点可抓，
+      // 摆一个点不动的按钮既占地方又和旁边的徽章不是同一个风格
+      var gaming = s.mode === 'gaming';
+      btnLive.hidden = !gaming;
+      btnLive.title = '实时画面';
+      if (!gaming && liveOn) liveClose();
     }
     if (s.context) {
       var c = s.context;
@@ -2692,24 +3010,41 @@
       // 窄屏顶栏把徽章藏了，同一份用量改在侧栏状态卡里显示（见 #ctxRow）
       var ctxRow = document.getElementById('ctxRow');
       ctxRow.hidden = false;
-      setCtxBar(pct, pct + '%' + (c.used ? ' · ' + fmtTokens(c.used) : ''));
+      setCtxBar(pct, pct + '%' + (c.used ? ' · ' + fmtTokens(c.used) : '')
+        + ((c.cache && c.cache.prompt) ? (' · 缓存 ' + Math.round(c.cache.percent) + '%') : ''));
       ctxRow.title = '模型窗口 ' + (c.window || 0).toLocaleString() + ' tokens'
         + (c.used ? ('\n当前约 ' + c.used.toLocaleString() + ' tokens') : '')
         + '\n达到 ' + c.compact_at + '% 时自动压缩';
       ctxBadge.hidden = false;
-      ctxBadge.textContent = '上下文 ' + pct + '%' + (c.used ? (' · ' + fmtTokens(c.used) + '/' + fmtTokens(c.window)) : '');
+      // 命中率直接摆在徽章上，省得为了看一个数去悬停
+      var cache = c.cache || null;
+      var cachePct = (cache && cache.prompt) ? cache.percent : 0;
+      ctxBadge.textContent = '上下文 ' + pct + '%'
+        + (cachePct > 0 ? (' · 缓存 ' + Math.round(cachePct) + '%') : '');
       // DeepSeek 的前缀缓存命中率：命中越高越便宜（命中部分按更低价计费）。
       // 数字突然掉下来通常意味着前缀被打断（换会话、改人设、升级后第一轮）
-      var cache = c.cache || null;
-      var cacheLine = '';
-      if (cache && cache.prompt) {
-        cacheLine = '\n前缀缓存命中 ' + cache.percent + '%（' + fmtTokens(cache.hit)
-                  + ' / ' + fmtTokens(cache.prompt) + ' 输入 token）'
-                  + '\n缓存按前缀保存，闲置几个小时到几天后会过期：'
-                  + (cache.idle ? ('距上次请求 ' + fmtIdle(cache.idle)) : '尚未请求过');
+      var tip = ctxRow.title;
+      if (c.messages != null) {
+        tip += '\n会话 ' + c.messages + ' 条消息'
+             + (c.chars ? ('、' + fmtTokens(c.chars) + ' 字符') : '');
       }
-      ctxBadge.title = ctxRow.title + cacheLine;
-      ctxRow.title = ctxBadge.title;
+      if (c.used && c.window && c.compact_at) {
+        tip += '\n剩余 ' + fmtTokens(Math.max(c.window - c.used, 0))
+             + ' tokens，离自动压缩还有 '
+             + fmtTokens(Math.max(Math.round(c.window * c.compact_at / 100) - c.used, 0));
+      }
+      if (cache && cache.prompt) {
+        tip += '\n前缀缓存命中 ' + cache.percent + '%（' + cache.hit.toLocaleString()
+             + ' / ' + cache.prompt.toLocaleString() + ' 输入 token）'
+             + '\n未命中 ' + (cache.prompt - cache.hit).toLocaleString() + ' token 按原价计费'
+             + '\n缓存按前缀保存，闲置几个小时到几天后会过期：'
+             + (cache.idle ? ('距上次请求 ' + fmtIdle(cache.idle)) : '尚未请求过');
+      } else {
+        tip += '\n前缀缓存：还没有数据（发起一次对话后才有，服务商不返回则为空）';
+      }
+      // 顶栏徽章和侧栏状态卡共用同一份说明
+      ctxBadge.title = tip;
+      ctxRow.title = tip;
       // 用量越接近上限越醒目：85% 起变黄，95% 变红
       ctxBadge.classList.toggle('warn', pct >= 85 && pct < 95);
       ctxBadge.classList.toggle('danger', pct >= 95);
@@ -2819,6 +3154,37 @@
     queueHeld = false;
     doSend(msgQueue.shift().text);
     renderQueue();
+    // 队列非空说明后面还有活要干：先把忙碌态立起来，
+    // 不然 doSend 往返期间服务端一报「没在跑」，等待提示会被复位抹掉
+    if (msgQueue.length) setBusy(true);
+  }
+
+  // 等这一轮的计时提示：服务端一轮最多能跑好几分钟，工具链中间经常几十秒
+  // 一句话都没有。以前屏幕上只剩三个点的打字动画，观感就是「卡住了」；
+  // 这里把「已经等了多久」显示出来，至少能看出后端还在跑
+  var waitTimer = null;
+  var waitBase = 0;        // 本轮已等秒数（status 给的 running_since 优先）
+  function waitTick() {
+    if (!typingEl) { stopWaitTimer(); return; }
+    waitBase += 1;
+    var lbl = typingEl.querySelector('.typing-label');
+    if (!lbl) {
+      lbl = document.createElement('span');
+      lbl.className = 'typing-label';
+      typingEl.insertBefore(lbl, typingEl.firstChild);
+    }
+    lbl.textContent = '正在处理… ' + waitBase + ' 秒'
+      + (waitBase >= 45 ? '（还在跑，可以按终止停下）' : '');
+  }
+  function startWaitTimer(since) {
+    stopWaitTimer();
+    waitBase = since ? Math.max(0, Math.round(Date.now() / 1000 - since)) : 0;
+    if (since) waitTick(); else waitBase = 0;
+    waitTimer = setInterval(waitTick, 1000);
+  }
+  function stopWaitTimer() {
+    if (waitTimer) { clearInterval(waitTimer); waitTimer = null; }
+    waitBase = 0;
   }
 
   function updateSendBtn() {
@@ -2844,7 +3210,7 @@
       .then(function (s) { if (s) renderStatus(s); })
       .catch(function () {});
   }
-  setInterval(refreshStatus, 30000);
+  setInterval(refreshStatus, 3000);
 
   // 删除：先点一下变成「确认删除」，再点一次才真删。
   // Steam Deck 上误触很常见，直接删掉一整轮回答没法撤销，多一步更稳。
@@ -2954,6 +3320,13 @@
 
   function setBusy(b) {
     busy = b;
+    // 忙碌态就是「有事件在等」：这时必须有计时提示，复位的所有路径都会走到这里
+    if (b) {
+      if (!typingEl) showTyping('');
+      if (!waitTimer) startWaitTimer(0);
+    } else {
+      stopWaitTimer();
+    }
     updateSendBtn();
   }
 
@@ -3004,6 +3377,7 @@
     // 已生成的部分交给服务端的 assistant_message(cancelled) 落成正式回复
     streamEl = null; streamBody = null;
     liveBox = null; liveToolCount = 0; liveThoughtShown = 0; liveThought = null;
+    askShown = 0;
   }
 
   // 按钮点击：运行中 = 终止；空闲 = 发送输入框内容
@@ -3063,6 +3437,8 @@
   var settingsBtn = document.getElementById('settingsBtn');
   var settingsPanel = document.getElementById('settingsPanel');
   var cfgBaseUrl = document.getElementById('cfgBaseUrl');
+  // 没配置过地址时的默认值：点开设置就能直接补 Key 开聊
+  var DEFAULT_BASE_URL = 'https://api.deepseek.com';
   var cfgApiKey = document.getElementById('cfgApiKey');
   var clearApiKey = document.getElementById('clearApiKey');
   var apiKeyHint = document.getElementById('apiKeyHint');
@@ -3187,7 +3563,16 @@
   });
 
   function openSettings() {
-    settingsPanel.classList.add('show');
+    // 设置顶替主界面：主区域换成设置页，侧栏会话列表换成分区导航。
+    // 窄屏不自动拉开抽屉——一拉开就盖住整块设置，还得再点一下才看得见内容；
+    // 要看分区导航，点顶栏那颗「菜单」
+    document.body.classList.add('settings-mode');
+    document.body.classList.remove('sb-open');
+    document.title = '设置 · DeckMeido';
+    // 顶栏是共用的一条，标题跟着换；关掉设置时 closeSettings 会还回去
+    setHdrTitle('设置');
+    settingsBtn.textContent = '返回';
+    settingsBtn.title = '返回对话';
     // 每次打开都从第一页开始；上次停在哪页容易让人以为设置不见了
     showSetPane('model');
     cfgHint.textContent = '';
@@ -3208,7 +3593,9 @@
         return r.json();
       })
       .then(function (c) {
-        cfgBaseUrl.value = c.base_url || '';
+        // 还没填过地址（首次打开）就先把默认的 DeepSeek 地址摆进去，
+        // 主人只要补个 Key 就能聊。注意带 /v1：网关那边两种写法都认
+        cfgBaseUrl.value = c.base_url || DEFAULT_BASE_URL;
         // 服务端不再下发明文 Key，只给「已配置」+ 打码值。
         // 输入框留空，占位符显示打码值 —— 让主人一眼看到「有 Key」，
         // 但即使拿到访问令牌也抄不走。不填就等于不改（见后端注释）。
@@ -3226,6 +3613,8 @@
         cfgPerm.value = c.permission_mode || 'auto';
         cfgWorkspace.value = c.workspace || '';
         document.getElementById('cfgPersonaName').value = c.persona_name || '';
+        document.getElementById('cfgPersonaTraits').value = c.persona_traits || '';
+        document.getElementById('cfgPersonaExtra').value = c.persona_extra || '';
         document.getElementById('cfgPersonaAddress').value = c.persona_address || '';
         document.getElementById('cfgPersonaTone').value = c.persona_tone || '';
         document.getElementById('cfgPersonaEnding').value = c.persona_ending || '';
@@ -3242,8 +3631,12 @@
         }
       })
       .catch(function (e) {
-        if (e && /401/.test(e.message)) { showAuth('旧令牌已失效，请重新输入'); }
-        else { cfgHint.textContent = (e && e.message) || '读取配置失败'; }
+        var msg = (e && e.message) || '';
+        if (/401/.test(msg)) { showAuth('旧令牌已失效，请重新输入'); }
+        // 同「保存」：fetch 层失败只给一句人话，别把 Failed to fetch 摆到界面上
+        else if (/Failed to fetch|NetworkError|Load failed/i.test(msg)) {
+          cfgHint.textContent = '连不上服务，请稍等几秒重试';
+        } else { cfgHint.textContent = msg || '读取配置失败'; }
       });
   }
 
@@ -3449,12 +3842,32 @@
     });
   });
 
-  // 设置页分区：左侧导航切换右侧内容。切页时内容区回到顶部，
-  // 否则从长页（人设）切到短页会停在半空
+  // 设置分区导航建在侧栏里（原来那套写在浮层里的 <nav> 已经搬过去了）。
+  // 名称与顺序固定，和内容区各 <section data-pane> 一一对应
+  var setNav = document.getElementById('setNav');
+  [['model', '模型接入'], ['persona', '女仆人设'],
+   ['device', '设备连接'], ['about', '关于更新']].forEach(function (it) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'set-tab';
+    b.dataset.pane = it[0];
+    b.textContent = it[1];
+    b.addEventListener('click', function () {
+      showSetPane(it[0]);
+      // 窄屏：导航是盖住设置的抽屉，选完这一页就该让开，不然什么都看不见
+      if (window.matchMedia('(max-width: 760px)').matches) {
+        document.body.classList.remove('sb-open');
+      }
+    });
+    setNav.appendChild(b);
+  });
+
+  // 切页时内容区回到顶部，否则从长页（人设）切到短页会停在半空
   var setBody = settingsPanel.querySelector('.set-body');
 
   function showSetPane(name) {
-    Array.prototype.forEach.call(settingsPanel.querySelectorAll('.set-tab'), function (b) {
+    // 导航在侧栏的 #setNav 里，不在设置内容区；从 settingsPanel 里找会一个都找不到
+    Array.prototype.forEach.call(setNav.querySelectorAll('.set-tab'), function (b) {
       b.classList.toggle('on', b.dataset.pane === name);
     });
     Array.prototype.forEach.call(settingsPanel.querySelectorAll('.set-pane'), function (p) {
@@ -3463,21 +3876,29 @@
     setBody.scrollTop = 0;
   }
 
-  Array.prototype.forEach.call(settingsPanel.querySelectorAll('.set-tab'), function (b) {
-    b.addEventListener('click', function () { showSetPane(b.dataset.pane); });
-  });
-  // 全屏页没有「点遮罩关闭」，要有一个明确的出口
-  document.getElementById('setClose').addEventListener('click', function () {
-    settingsPanel.classList.remove('show');
-  });
+  // 关掉设置 = 回到对话：主界面、侧栏会话列表、底部按钮文案都恢复原样
+  function closeSettings() {
+    document.body.classList.remove('settings-mode');
+    document.body.classList.remove('sb-open');
+    document.title = 'DeckMeido';
+    // 顶栏是共用的：「设置」只是临时借用，回到对话就把会话名还回来
+    setHdrTitle(curSessTitle);
+    settingsBtn.textContent = '设置';
+    settingsBtn.title = '设置';
+  }
+
+  document.getElementById('setClose').addEventListener('click', closeSettings);
   // Esc 关闭（输入框里按 Esc 只撤销编辑，不关页面）
   document.addEventListener('keydown', function (e) {
-    if (e.key !== 'Escape' || !settingsPanel.classList.contains('show')) return;
+    if (e.key !== 'Escape' || !document.body.classList.contains('settings-mode')) return;
     if (document.activeElement && /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) return;
-    settingsPanel.classList.remove('show');
+    closeSettings();
   });
 
-  settingsBtn.addEventListener('click', openSettings);
+  settingsBtn.addEventListener('click', function () {
+    if (document.body.classList.contains('settings-mode')) closeSettings();
+    else openSettings();
+  });
 
   // 扫码连接：展示局域网地址对应的二维码，手机一扫即带上令牌
   // 后端回的是 data:image/png;base64 的固定前缀 + 纯 base64，只认这个形状；
@@ -3523,15 +3944,6 @@
     }
   });
 
-  // 一键回到默认配置：地址填 DeepSeek 官方域名（不带 /v1），Key 不动。
-  // 模型也一起落到 deepseek-chat：只改地址的话，原来选的 gpt-* 会被服务端归一
-  // 替换掉，但输入框里还留着旧名字，看着像没生效
-  document.getElementById('presetDeepseek').addEventListener('click', function () {
-    cfgBaseUrl.value = 'https://api.deepseek.com';
-    fillModelSelect([], 'deepseek-chat');
-    cfgHint.textContent = '已填入 DeepSeek 地址与默认模型，点「保存」后生效';
-  });
-
   // 拉取当前配置（已保存的地址和 Key）的模型列表，同步到底部下拉框
   function reloadModels() {
     modelsPromise = null;
@@ -3561,6 +3973,8 @@
       workspace: cfgWorkspace.value,
       token: newToken,
       persona_name: document.getElementById('cfgPersonaName').value,
+      persona_traits: document.getElementById('cfgPersonaTraits').value,
+      persona_extra: document.getElementById('cfgPersonaExtra').value,
       persona_address: document.getElementById('cfgPersonaAddress').value,
       persona_tone: document.getElementById('cfgPersonaTone').value,
       persona_ending: document.getElementById('cfgPersonaEnding').value,
@@ -3604,7 +4018,13 @@
           loadToolbar();  // 刷新右上角当前模型显示
         });
       })
-      .catch(function (err) { cfgHint.textContent = (err && err.message) || '保存失败'; });
+      .catch(function (err) {
+        // fetch 本身失败（后端没起、正在重启、断网）只会抛 TypeError: Failed to fetch，
+        // 这不是给主人看的文案。服务端回的错（上面 throw 的）才有 message 可言
+        var msg = (err && err.message) || '';
+        var offline = /Failed to fetch|NetworkError|Load failed/i.test(msg);
+        cfgHint.textContent = offline ? '连不上服务，请稍等几秒重试' : (msg || '保存失败');
+      });
   });
 
   // ---------- 分享：把一条消息生成图片 ----------
@@ -4041,7 +4461,6 @@
     }
   });
 
-
   loadToolbar();
 
   // ---------- 亮暗主题 ----------
@@ -4055,11 +4474,18 @@
     applyTheme(document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light');
   });
 
-  // 窄屏（手机）侧栏抽屉
+  // 窄屏（手机）侧栏抽屉。设置页用的是同一条顶栏，所以这一颗按钮
+  // 在设置里自动就变成「拉出分区导航」的那颗，不用再绑一份
   document.getElementById('btnMenu').addEventListener('click', function () {
     document.body.classList.toggle('sb-open');
   });
+  // 点消息区 = 接着聊天，顺手收起抽屉
   messages.addEventListener('click', function () {
+    document.body.classList.remove('sb-open');
+  });
+  // 设置页内容区同理：窄屏抽屉盖住整块设置，点内容区就该退出，否则导航一直挡着
+  settingsPanel.addEventListener('click', function (e) {
+    if (e.target && e.target.closest && e.target.closest('input, textarea, select, button')) return;
     document.body.classList.remove('sb-open');
   });
 
@@ -4139,6 +4565,9 @@
     else { hdrTitle.title = name; }
     if (hdrTitle.textContent !== name) hdrTitle.textContent = name;
   }
+  // 最近一次拿到的会话名。设置页借用顶栏写「设置」，回来时要还回去，
+  // 所以得记着原来叫什么
+  var curSessTitle = '';
   function loadSessions() {
     if (!token) return;
     fetch('/api/sessions?token=' + encodeURIComponent(token))
@@ -4193,14 +4622,23 @@
           sessList.appendChild(row);
         });
         setHdrTitle(curTitle);
+        curSessTitle = curTitle || '';
+        // 设置在开着的时候后台刷新了会话列表，别把「设置」俩字顶掉
+        if (document.body.classList.contains('settings-mode')) setHdrTitle('设置');
       })
       .catch(function () {});
   }
   document.getElementById('btnNewSess').addEventListener('click', function () {
     // 新会话的创建结果要靠服务端的 session_changed 广播来刷新列表；
-    // 失败时这里补一句提示，别让按钮看起来彻底没反应
+    // 失败时这里补一句提示，别让按钮看起来彻底没反应。
+    // 后端在「当前会话本来就一句没说」时不会新建（防止刷出一排空会话），
+    // 这时也不会广播，得自己说一声，否则按钮看起来毫无反应
     fetch('/api/sessions/create?token=' + encodeURIComponent(token), { method: 'POST' })
-      .then(function (r) { if (!r.ok) addSystem('新建会话失败（HTTP ' + r.status + '）'); })
+      .then(function (r) {
+        if (!r.ok) { addSystem('新建会话失败（HTTP ' + r.status + '）'); return null; }
+        return r.json();
+      })
+      .then(function (d) { if (d && d.unchanged) addSystem('当前就是个空会话，直接聊吧'); })
       .catch(function () { addSystem('新建会话失败：连不上后端'); });
   });
   loadSessions();
@@ -4297,11 +4735,6 @@
   };
   btnLive.addEventListener('click', function () {
     if (liveOn) { liveClose(); return; }
-    // 桌面模式下后端拿不到 gamescope 节点，点开只会是个黑框，直接说清楚
-    if (btnLive.classList.contains('off')) {
-      addSystem('实时画面只在游戏模式下可用：回到游戏（gamescope 接管画面）后再点顶部的「画面」。');
-      return;
-    }
     liveOpen();
   });
   document.getElementById('lvClose').addEventListener('click', function () { liveClose(); });

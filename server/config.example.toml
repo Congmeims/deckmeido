@@ -10,7 +10,7 @@ port = 18765
 token = "meido"
 
 [llm]
-# OpenAI 兼容接口。默认填 DeepSeek：地址不用带 /v1，模型 deepseek-chat（非思考）
+# OpenAI 兼容接口。默认填 DeepSeek：地址不带 /v1 也认，模型 deepseek-chat（非思考）
 # 想换成 GPT / Claude(代理) / Qwen / LM Studio 时，把地址和模型一起改掉即可
 base_url = "https://api.deepseek.com"
 api_key = ""
