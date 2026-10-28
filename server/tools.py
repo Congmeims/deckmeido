@@ -1399,7 +1399,7 @@ def _gamescope_pw_node_sync() -> str | None:
         env["XDG_RUNTIME_DIR"] = f"/run/user/{sess[0]}"
     try:
         proc = subprocess.run(
-            ["pw-dump"], capture_output=True, text=True, env=env,
+            ["pw-dump"], capture_output=True, text=True, env=env, timeout=10,
         )
         nodes = json.loads(proc.stdout or "[]")
         for o in nodes:
