@@ -911,60 +911,47 @@ function Content() {
         }}
       />
 
-      {/* 输入框和发送并排：发送按钮单独占一行时，右边整条都是空的，
-          和上面的输入框、下面的「新会话/设置」三行宽度各不相同，看着散。
-          这里统一成同一行的两列：输入框吃满剩余宽度，发送固定窄一些 */}
+      {/* 输入框单独一行 */}
       <PanelSectionRow>
-        <div style={{ display: "flex", gap: 8, width: "100%", alignItems: "stretch" }}>
-          {/* 提示语做输入框里的占位符：外面再挂一行标签会白占一行高度 */}
-          <div style={{ flex: "1 1 0", minWidth: 0 }}>
-            <TextField
-              value={input}
-              placeholder="问问 Meido..."
-              onChange={(e) => setInput(e.target.value)}
-            />
-          </div>
-          <div
-            role="button"
-            onClick={busy ? cancel : ask}
-            style={{ flex: "0 0 auto", width: 74, ...FAKE_BTN }}
-          >
-            {busy ? "中断" : "发送"}
-          </div>
+        <TextField
+          value={input}
+          placeholder="问问 Meido..."
+          onChange={(e) => setInput(e.target.value)}
+        />
+      </PanelSectionRow>
+
+      {/* 发送单独一行 */}
+      <PanelSectionRow>
+        <div
+          role="button"
+          onClick={busy ? cancel : ask}
+          style={{ width: "100%", ...FAKE_BTN }}
+        >
+          {busy ? "中断" : "发送"}
         </div>
       </PanelSectionRow>
 
-      {/* 「新会话」和「设置」并排一行：两枚都是低频按钮，各占一行太浪费面板高度。
-          QAM 里不能把两个 ButtonItem 塞进一个 flex 行——Decky 的 ButtonItem 用
-          layout="below" 时外层是 100% 宽、自带 focus 边框，被 flex 压窄后文字居中
-          会溢出、两枚互相盖住（上一版就是这么坏的）。所以这里用一行的
-          Focusable + 普通 div 拼两枚「假按钮」，宽度由 flex 精确控制：
-          新会话占满剩余，设置按内容宽度，中间 8px 空隙 */}
-      <PanelSectionRow>
-        <div style={{ display: "flex", gap: 8, width: "100%" }}>
-          {status?.core_ok && !busy && (
-            <div
-              role="button"
-              onClick={newing ? undefined : newSession}
-              style={{
-                flex: "1 1 0",
-                minWidth: 0,
-                ...FAKE_BTN,
-                opacity: newing ? 0.5 : 1,
-              }}
-            >
-              {newing ? "正在新建…" : "新会话"}
-            </div>
-          )}
-          {/* 文案固定为「设置」：上下三角一进一出会把按钮宽度撑得跳来跳去，
-              展开与否看下面的设置项本身更直观 */}
+      {/* 新会话单独一行 */}
+      {status?.core_ok && !busy && (
+        <PanelSectionRow>
           <div
             role="button"
-            onClick={() => setShowSettings((v) => !v)}
-            style={{ flex: "0 0 auto", ...FAKE_BTN }}
+            onClick={newing ? undefined : newSession}
+            style={{ width: "100%", ...FAKE_BTN, opacity: newing ? 0.5 : 1 }}
           >
-            设置
+            {newing ? "正在新建…" : "新会话"}
           </div>
+        </PanelSectionRow>
+      )}
+
+      {/* 设置单独一行 */}
+      <PanelSectionRow>
+        <div
+          role="button"
+          onClick={() => setShowSettings((v) => !v)}
+          style={{ width: "100%", ...FAKE_BTN }}
+        >
+          设置
         </div>
       </PanelSectionRow>
 

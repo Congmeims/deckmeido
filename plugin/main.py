@@ -1711,19 +1711,27 @@ async def _drop_backend():
 def _lan_ip() -> str:
     """本机在局域网里的地址，给别的端填后端地址用
 
-    UDP connect 不发包，只是让内核挑一条默认出口并告诉我们源地址，
-    比解析 ip addr 稳（没有默认路由时退回 127.0.0.1）。
+    UDP connect 的源地址跟着默认路由走：开了 Clash/加速器后默认出口是
+    198.18.x 的 TUN fake-ip，别的设备连不上。所以这里枚举网卡只挑 RFC1918
+    私有段，和 server 的 _lan_ip 保持一致；没连局域网时退回 127.0.0.1。
     """
-    import socket
+    import re
+    import subprocess
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("8.8.8.8", 80))
-        return str(s.getsockname()[0])
+        out = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+        ips = re.findall(r"inet (\d+\.\d+\.\d+\.\d+)", out)
     except Exception:
+        ips = []
+    private = [a for a in ips if a.startswith("192.168.") or a.startswith("10.")
+               or re.match(r"172\.(1[6-9]|2\d|3[01])\.", a)]
+    if not private:
         return "127.0.0.1"
-    finally:
-        s.close()
+    private.sort(key=lambda a: (not a.startswith("192.168."), not a.startswith("10.")))
+    return private[0]
 
 
 async def _core_http(port: int, token: str, method: str, path: str,

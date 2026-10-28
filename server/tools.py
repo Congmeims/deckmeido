@@ -1570,7 +1570,7 @@ async def _screenshot_gamescope(path: Path) -> str:
             proc.kill()
             await proc.wait()
             return "抓帧超时（25 秒内 gamescope 没吐出画面，游戏可能正在切场景或已挂起）"
-        if not await _raw_ok(raw):
+        if not _raw_ok(raw):
             # gst 的具体报错比「失败了」有用得多，取最后一行
             line = err_text.splitlines()[-1] if err_text else ""
             return "抓帧没拿到有效图像" + (f"：{line}" if line else "（gst 没有输出错误信息）")
