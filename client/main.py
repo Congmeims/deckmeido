@@ -139,15 +139,22 @@ _STARTED_BACKEND = None
 
 def _start_backend():
     """真正执行 subprocess.Popen 的那一步，单独抽出来让 ensure_backend 能记句柄"""
+    python = DECKMEIDO_DIR / ".venv/bin/python"
+    if not python.exists():
+        print(f"[DeckMeido] 找不到解释器 {python}，请重跑 install.sh", file=sys.stderr)
+        return None
     try:
         return subprocess.Popen(
-            [str(DECKMEIDO_DIR / ".venv/bin/python"), "-m", "uvicorn",
+            [str(python), "-m", "uvicorn",
              "server.main:app", "--host", "0.0.0.0", "--port", PORT],
             cwd=DECKMEIDO_DIR,
             stdout=_backend_log_fd(), stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-    except Exception:
+    except Exception as exc:
+        # 以前直接 return None，用户只能看到「等了 15 秒还没起来」，
+        # 真正的原因（权限/缺文件）全丢了
+        print(f"[DeckMeido] 拉起后端失败：{exc}", file=sys.stderr)
         return None
 
 
@@ -191,10 +198,16 @@ def checkpoint_backend() -> str:
 
 
 def stop_backend() -> None:
-    """收掉本机后端（含它拉起的遮罩），别让服务在客户端退出后继续裸奔"""
-    pid = _listener_on_port(PORT)
-    if pid is None:
+    """收掉本机后端（含它拉起的遮罩），别让服务在客户端退出后继续裸奔
+
+    只收「自己拉起来的那个」：启动时后端已经在跑（用户手动起的、或上次
+    客户端被 kill 留下的），就不归本次退出管——按端口一律 SIGTERM 会把
+    别人正在用的后端连同那一轮回答一起干掉。
+    """
+    proc = _STARTED_BACKEND
+    if proc is None or proc.poll() is not None:
         return
+    pid = proc.pid
     # 先请它把正在生成的回答与内存历史落盘，再让它退出。
     # 以前直接 SIGTERM：那一轮回答还在流式生成中，进程一死就整段没了。
     print(f"[DeckMeido] 退出前 checkpoint：{checkpoint_backend()}", file=sys.stderr)
@@ -205,7 +218,7 @@ def stop_backend() -> None:
     except Exception:
         return
     for _ in range(80):  # 最多等 8 秒（shutdown 钩子里还要落一次盘，别太早 SIGKILL）
-        if _listener_on_port(PORT) is None:
+        if proc.poll() is not None or _listener_on_port(PORT) is None:
             return
         time.sleep(0.1)
     try:
@@ -362,7 +375,12 @@ def main() -> int:
     tray.setToolTip("DeckMeido")
 
     def restore() -> None:
-        view.showNormal()
+        if view.isFullScreen():
+            # 全屏时 showNormal() 会顺带把窗口还原成小窗，相当于「恢复」把用户的
+            # 全屏给取消了；全屏状态下只提窗，不动状态
+            view.showFullScreen()
+        else:
+            view.showNormal()
         view.raise_()
         view.activateWindow()
 
@@ -397,7 +415,10 @@ def main() -> int:
     backend = {"proc": _STARTED_BACKEND}
 
     def kick_backend() -> None:
+        global _STARTED_BACKEND
         backend["proc"] = _start_backend()
+        # watchdog 重拉的后端同样是我们 spawn 的，退出时要一并收走
+        _STARTED_BACKEND = backend["proc"]
 
     watch_state = {"last_kick": 0.0, "misses": 0}
 
@@ -432,7 +453,12 @@ def main() -> int:
         watch_state["last_kick"] = now
         watch_state["misses"] = 0
         kick_backend()
-        restore()
+        if backend["proc"] is None:
+            # 拉起失败别再 restore 打扰用户：托盘提示一下，下一轮再试
+            tray.showMessage("DeckMeido", "后端重启失败，详见 server/backend.log", icon, 3000)
+            return
+        # 不 restore()：用户可能正在别的窗口里干活，硬把本窗口提到前台很烦，
+        # 托盘给个提示就够，需要时点托盘图标回来
         tray.showMessage("DeckMeido", "后端已自动重启。", icon, 2500)
 
     timer = QTimer()
@@ -441,6 +467,9 @@ def main() -> int:
     timer.start()
 
     def on_minimized(state) -> None:
+        # 全屏 ↔ 普通切换也会走到这里，那不算「最小化」，别把窗口藏进托盘
+        if state & Qt.WindowFullScreen:
+            return
         # Steam Deck 桌面状态栏空间有限，最小化就直接收进托盘
         if state & Qt.WindowMinimized and not view.isMaximized():
             view.hide()

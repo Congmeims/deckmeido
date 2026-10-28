@@ -206,7 +206,9 @@ preflight() {
   #    （升级时后端就在跑），不能因此拦住安装
   if need_cmd ss; then
     local holder
-    holder=$(ss -ltnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p {print $6; exit}')
+    # 按冒号切开取最后一段精确比对，避免 :18765 顺带匹配到 187650 这类别的端口
+    holder=$(ss -ltnp 2>/dev/null | awk -v p="$PORT" '
+      { n = split($4, a, ":"); if (n > 1 && a[n] == p) { print $6; exit } }')
     if [ -n "$holder" ]; then
       if printf '%s' "$holder" | grep -qi "$APP\|python"; then
         dim "端口 $PORT 由 DeckMeido 自己在用（升级时正常）"
@@ -422,6 +424,12 @@ install_pacman_deps() {
       dim "手动执行：sudo steamos-readonly disable   然后再重跑本次命令"
       return 1
     fi
+    # 只读是「关掉才能装包」的临时状态：装完（无论成败）都恢复成 enabled，
+    # 否则用户的系统会一直停在可写状态，直到自己想起来手动开回去。
+    # 用 trap 兜住函数中途返回和 Ctrl-C 的情况。
+    trap 'sudo steamos-readonly enable >/dev/null 2>&1 || \
+          printf "\033[33m⚠ 恢复 SteamOS 只读保护失败，请手动执行：sudo steamos-readonly enable\033[0m\n" >&2; \
+          trap - EXIT INT TERM' EXIT INT TERM
   fi
   # 先装缺的（--needed）；再对「记录在、文件没了」的强制重装（不能带 --needed，
   # 否则 pacman 会认为已装而直接跳过）。-Sy 而不 -Syu，避免顺带滚系统
@@ -787,9 +795,11 @@ prune_stale() {
   # updater 升级前会打包一份 update-backup-*.tar.gz，成功后会自己删；
   # 进程半路被杀才会剩下，这里兜底清理，只留最新一份
   local old
-  for old in $(ls -1t "$INSTALL_DIR"/update-backup-*.tar.gz 2>/dev/null | tail -n +2); do
-    rm -f "$old"
-  done
+  # 文件名可能带空格（安装目录不是我们的名字规则），不能靠 $(ls) 分词
+  while IFS= read -r old; do
+    [ -n "$old" ] && rm -f -- "$old"
+  done < <(find "$INSTALL_DIR" -maxdepth 1 -name 'update-backup-*.tar.gz' -type f \
+             -printf '%T@ %p\n' 2>/dev/null | sort -rn | tail -n +2 | cut -d' ' -f2-)
   [ "$removed" -gt 0 ] && dim "清理了 $removed 个新版本中已不存在的旧文件"
   return 0
 }
@@ -955,9 +965,15 @@ stop_service() {
   systemctl --user stop "$UNIT" >/dev/null 2>&1 || true
 }
 
+# 把字符串转成可以安全塞进 sed 的 s|...| 替换段：
+# 替换段里的 & 会展开成「整个匹配」，\ 和分隔符 | 会破坏语法
+sed_repl() {
+  printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
+}
+
 # 手动安装 systemd 单元（默认不装：后端由客户端拉起，见 install_service 注释）
 render_service() {
-  sed "s|__INSTALL_DIR__|$INSTALL_DIR|g; s|__PORT__|$PORT|g" \
+  sed "s|__INSTALL_DIR__|$(sed_repl "$INSTALL_DIR")|g; s|__PORT__|$(sed_repl "$PORT")|g" \
     "$INSTALL_DIR/deploy/$UNIT" > "$UNIT_DIR/$UNIT"
 }
 
@@ -993,7 +1009,7 @@ install_plugin() {
 
 install_desktop() {
   mkdir -p "$DESKTOP_DIR"
-  sed "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
+  sed "s|__INSTALL_DIR__|$(sed_repl "$INSTALL_DIR")|g" \
     "$INSTALL_DIR/deploy/DeckMeido.desktop" > "$DESKTOP_DIR/DeckMeido.desktop"
   chmod +x "$DESKTOP_DIR/DeckMeido.desktop"
   need_cmd update-desktop-database && update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
@@ -1086,10 +1102,19 @@ read_token() {
 }
 
 wait_ready() {
+  # 客户端冷启动要依次：起 Qt、拉起后端、uvicorn 加载、第一次渲染页面。
+  # 以前只等 3×0.3 秒，新装/大版本升级（venv 冷启动、PySide6 首次解压缓存）
+  # 几乎必然超时，用户看到一条「未能自动启动」，其实界面几秒后就出来了。
+  # 这里给到 30 秒，进程已经退出（启动失败）就提前放弃，不白等。
   local url="http://127.0.0.1:$PORT/"
-  for _ in $(seq 1 3); do
+  local i
+  for i in $(seq 1 60); do
     if curl -fsS -o /dev/null "$url" 2>/dev/null; then return 0; fi
-    sleep 0.3
+    if [ "$i" -gt 6 ] && ! pgrep -f "$INSTALL_DIR/client/main.py" >/dev/null 2>&1 \
+       && ! pgrep -f "uvicorn server.main:app" >/dev/null 2>&1; then
+      return 1
+    fi
+    sleep 0.5
   done
   return 1
 }
@@ -1361,6 +1386,13 @@ do_uninstall() {
   # 桌面文件被删后，KDE 的图标缓存里还会留着入口，通知它刷新一次
   need_cmd kbuildsycoca6 && kbuildsycoca6 >/dev/null 2>&1 || true
   need_cmd kbuildsycoca5 && kbuildsycoca5 >/dev/null 2>&1 || true
+
+  # Decky 插件：装的时候链接到 ~/homebrew/plugins/DeckMeido，卸载不清的话
+  # QAM 里会一直留着一个连不上后端的面板
+  if [ -f "$INSTALL_DIR/plugin/deploy.sh" ]; then
+    dim "移除 Decky 插件"
+    DECKMEIDO_NONINTERACTIVE=1 bash "$INSTALL_DIR/plugin/deploy.sh" --remove >/dev/null 2>&1 || true
+  fi
 
   if [ "$purge" = 1 ]; then
     local ws; ws="$(workspace_dir)"

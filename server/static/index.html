@@ -1601,7 +1601,7 @@
          + '<span class="fc-icon">' + (FILE_ICONS[ext] || '📄') + '</span>'
          + '<span class="fc-meta"><span class="fc-name">' + escapeHtml(name) + '</span>'
          + '<span class="fc-size"></span></span>'
-         + '<a class="fc-dl" href="' + href + '" download="' + escapeHtml(name) + '">下载</a>'
+         + '<a class="fc-dl" href="' + escapeHtml(href) + '" download="' + escapeHtml(name) + '">下载</a>'
          + '</div>';
   }
 
@@ -2082,6 +2082,12 @@
   var liveThought = null;  // 实时思维链卡片（.thought-body 元素）
   var streamEl = null;     // 流式输出气泡
   var streamBody = null;
+  // 心跳：长时间没收到任何消息时发一次 ping。手机上切后台回来、或中途换了
+  // 网络（WiFi↔流量）时，ws 常常已经死了但 onclose 迟迟不触发 —— 界面看着
+  // 还是「已连接」，发出去的消息全部石沉大海
+  var pingTimer = null;
+  var lastMsgAt = 0;
+  var PING_MS = 20000;
 
   // 本轮「屏幕上已经出现过的内容」本地缓存。
   // 后端进程被杀时，服务端只能保住最后一次落盘的内容，而浏览器这边是完整的
@@ -2125,6 +2131,27 @@
     turnCache.cur = '';
   }
 
+  // 心跳：PING_MS 内一条消息都没收到就发 ping，再一个周期还没动静就判死重连。
+  // 只发 ping 不断连：真的还有流在走（工具跑得久）时服务端不会回，但也别误杀
+  function startHeartbeat() {
+    stopHeartbeat();
+    pingTimer = setInterval(function () {
+      if (!ws || ws.readyState !== 1) return;
+      var idle = Date.now() - lastMsgAt;
+      if (idle > PING_MS * 2) {
+        // 两个周期全无音讯：连接已经死了（onclose 不会来了），直接拆掉重连
+        stopHeartbeat();
+        try { ws.close(); } catch (e) {}
+        return;
+      }
+      try { ws.send(JSON.stringify({ type: 'ping' })); } catch (e) { /* 下一轮判死 */ }
+    }, PING_MS);
+  }
+
+  function stopHeartbeat() {
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+  }
+
   function connect() {
     if (!token) { showAuth(''); return; }
     // 防重入：已有连接正在建/已建立时不要再开一条，
@@ -2141,11 +2168,14 @@
       authErr.textContent = '';
       // 连接成功：接下来第一条 status 会带上 llm_configured，由它决定要不要弹设置页
       if (onboardState === '') onboardState = 'pending';
+      lastMsgAt = Date.now();
+      startHeartbeat();
     };
 
     ws.onmessage = function (ev) {
       var msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      lastMsgAt = Date.now();
       // 会话代次过滤：别的端切了会话后，正在跑的那一轮还会继续往外吐流式片段。
       // 这些片段不属于当前屏幕上的会话，丢弃，否则新会话里会冒出上一轮的回答。
       // 注意只过滤「本轮对话产物」，history / session_changed / status 必须放行，
@@ -2262,6 +2292,19 @@
               } catch (e) { /* 隐私模式/配额满：忽略，别影响界面 */ }
             }
             break;
+          }
+          if (!streamBody) {
+            // 兜底：stream_start 丢了（重连窗口、别的端已经开跑、事件乱序）时
+            // 以前这里静默丢弃，正文就整段不见了。现在就地补一个气泡，
+            // 后面 assistant_message 会按正常流程把它补成正式回复
+            if (!liveBox) {
+              liveBox = document.createElement('div');
+              liveBox.className = 'events';
+              messages.appendChild(liveBox);
+            }
+            streamEl = makeTextBubble('', false);
+            streamBody = streamEl.querySelector('.stream-body');
+            liveBox.appendChild(streamEl);
           }
           if (streamBody) {
             streamBody.textContent += msg.text;
@@ -2409,6 +2452,7 @@
     ws.onclose = function (ev) {
       setConnected(false);
       hideTyping();
+      stopHeartbeat();
       // 断联时把忙碌态复位：旧逻辑保留 busy=true，发送键一直停在终止态，
       // 点了只会发 cancel（完全不发消息），主人看到的就是「按钮卡死」
       setBusy(false);
@@ -2453,10 +2497,12 @@
   // 令牌变更后立即用新令牌重连（不等退避）
   function reconnectNow() {
     clearTimeout(reconnectTimer);
+    stopHeartbeat();
     suppressReconnect = true;
     if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} }
     suppressReconnect = false;
     backoff = 1000;
+    ws = null;
     connect();
   }
 
@@ -2668,7 +2714,10 @@
       ctxBadge.classList.toggle('warn', pct >= 85 && pct < 95);
       ctxBadge.classList.toggle('danger', pct >= 95);
     }
-    if (s.llm_configured === false) {
+    if (s.llm_configured === false && !noLlmNoticeShown) {
+      // 状态每几秒广播一次：以前这里不去重，没配模型时同一条提示会一直往
+      // 对话里刷（一次重连又是几十条）。只在第一次出现时提醒
+      noLlmNoticeShown = true;
       addSystem('提示：还没有配置模型。点顶部「设置」填 API 地址和 Key 就能开始对话');
     }
     // 首次引导：只在第一次拿到 status 时判断。没配模型就直接把设置页顶出来，
@@ -2688,6 +2737,7 @@
   var forceSendAfterCancel = null; // 「立即发送」：终止当前后要立刻发出去的文本
   var queuedNoticeShown = false;   // 断联暂存提示只弹一次，别刷屏
   var awaitingResync = false;      // 刚重连、等第一条 status 来对齐运行状态
+  var noLlmNoticeShown = false;    // 「还没配置模型」只提醒一次，别跟着 status 刷屏
 
   // ---------- 等待发送队列 ----------
   function renderQueue() {
@@ -2949,6 +2999,11 @@
       .catch(function () {});
     setBusy(false);
     hideTyping();
+    // 流式容器也要清：不清的话半截气泡会一直挂着「流式中」的样式，
+    // 而且下一轮的 delta 会往这个旧气泡里接着写，两轮正文混在一起。
+    // 已生成的部分交给服务端的 assistant_message(cancelled) 落成正式回复
+    streamEl = null; streamBody = null;
+    liveBox = null; liveToolCount = 0; liveThoughtShown = 0; liveThought = null;
   }
 
   // 按钮点击：运行中 = 终止；空闲 = 发送输入框内容
@@ -2987,7 +3042,9 @@
     if (!t) { authErr.textContent = '请先输入令牌'; return; }
     token = t;
     localStorage.setItem('deckmeido_token', t);
-    connect();
+    // 旧连接（用的是被拒的旧令牌）还挂在 ws 上，readyState 是 0/1，
+    // 直接 connect() 会被防重入挡掉，主人看到的就是「输对了令牌却一直转圈」
+    reconnectNow();
   });
   tokenInput.addEventListener('keydown', function (e) {
     if (e.key === 'Enter') { e.preventDefault(); tokenBtn.click(); }
@@ -3035,12 +3092,13 @@
     return src === 'github' ? 'GitHub' : (src === 'mirror' ? '国内镜像' : '');
   }
 
-  // 后台自动查到新版本时：设置按钮打红点，设置页里也把提示填好
+  // 后台自动查到新版本时：设置按钮打红点，设置页里也把提示填好。
+  // 版本号来自更新检查（远端仓库的 tag），照样要转义：它最终拼进 innerHTML
   function markUpdate(latest, current) {
     settingsBtn.classList.add('has-update');
     settingsBtn.title = '有新版本 v' + latest;
     verTag.textContent = '版本 v' + (current || '?');
-    updNote.innerHTML = '发现新版本 <b>v' + latest + '</b>，点下方按钮即可升级';
+    updNote.innerHTML = '发现新版本 <b>v' + escapeHtml(latest) + '</b>，点下方按钮即可升级';
     updApply.style.display = 'block';
   }
 
@@ -3100,8 +3158,8 @@
             : '还没有发布版本信息，已是最新') + tail;
           return;
         }
-        updNote.innerHTML = '发现新版本 <b>v' + d.tag + '</b>' +
-          (d.published_at ? '（' + d.published_at.slice(0, 10) + '）' : '') + '\n' +
+        updNote.innerHTML = '发现新版本 <b>v' + escapeHtml(d.tag) + '</b>' +
+          (d.published_at ? '（' + escapeHtml(String(d.published_at).slice(0, 10)) + '）' : '') + '\n' +
           '升级会自动拉取新代码并重启服务，配置与对话记录都会保留。' + tail;
         updApply.style.display = 'block';
       })
@@ -3201,7 +3259,16 @@
   function memFetch(path, opt) {
     return fetch(path + (path.indexOf('?') >= 0 ? '&' : '?')
                  + 'token=' + encodeURIComponent(token), opt)
-      .then(function (r) { return r.json(); });
+      .then(function (r) {
+        // 不查状态码的话，401/500 返回的 {"detail": ...} 会被当成成功结果
+        // 往下走，界面上表现为「点了没反应」或列表空白但没报错
+        if (!r.ok) {
+          return r.json().catch(function () { return {}; }).then(function (j) {
+            throw new Error((j && j.detail) || ('HTTP ' + r.status));
+          });
+        }
+        return r.json();
+      });
   }
 
   function loadMemory() {
@@ -3413,6 +3480,9 @@
   settingsBtn.addEventListener('click', openSettings);
 
   // 扫码连接：展示局域网地址对应的二维码，手机一扫即带上令牌
+  // 后端回的是 data:image/png;base64 的固定前缀 + 纯 base64，只认这个形状；
+  // 别的内容一律不往 innerHTML 里放（地址可被改，拼进去就是一段可控 HTML）
+  var PNG_RE = /^data:image\/png;base64,[A-Za-z0-9+/=]+$/;
   qrBtn.addEventListener('click', function () {
     if (qrBox.classList.contains('show')) { qrBox.classList.remove('show'); return; }
     qrBox.innerHTML = '<p>生成中…</p>';
@@ -3421,8 +3491,9 @@
       .then(function (r) { return r.json(); })
       .then(function (res) {
         cfgUrl.value = res.url || cfgUrl.value;
-        qrBox.innerHTML = res.qr
-          ? '<img src="' + res.qr + '" alt="扫码连接"><p>手机扫码即可连接（同一局域网）</p>'
+        var qr = String(res.qr || '');
+        qrBox.innerHTML = PNG_RE.test(qr)
+          ? '<img src="' + qr + '" alt="扫码连接"><p>手机扫码即可连接（同一局域网）</p>'
           : '<p>二维码生成失败，可直接复制上面的地址</p>';
       })
       .catch(function () { qrBox.innerHTML = '<p>二维码生成失败，可直接复制上面的地址</p>'; });
@@ -3504,7 +3575,16 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     })
-      .then(function (r) { return r.json(); })
+      .then(function (r) {
+        // 以前不查状态码：502/500 回的 {"detail": ...} 会被当成保存成功，
+        // 提示栏还写着「已保存」，实际什么都没落盘
+        if (!r.ok) {
+          return r.json().catch(function () { return {}; }).then(function (j) {
+            throw new Error((j && j.detail) || ('保存失败（HTTP ' + r.status + '）'));
+          });
+        }
+        return r.json();
+      })
       .then(function (res) {
         if (tokenChanged) {
           // 令牌已换：本地存的还是旧的，直接续上会 401，这里先换成新令牌再重连
@@ -3665,12 +3745,33 @@
   var permSelect = document.getElementById('permSelect');
   var modelSelect = document.getElementById('modelSelect');
 
+  // 配置写入的串行链：见 postConfig，放在函数前面免得被提前引用
+  var cfgChain = Promise.resolve();
+
   function postConfig(patch) {
-    return fetch('/api/config?token=' + encodeURIComponent(token), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch)
-    }).then(function (r) { return r.json(); }).catch(function () { return null; });
+    // 失败要浮出来：以前 catch 吞成 null，界面上看起来「切了」，实际后端还是旧值，
+    // 下一次刷新又跳回去。这里统一提示一句，并让调用方能判断成败。
+    // 串行化：快速连点（拖滑条、连切模型）会并发 POST，后发先至时后端的
+    // 最终值就成了先点的那一个，界面显示和实际配置对不上
+    var job = function () {
+      return fetch('/api/config?token=' + encodeURIComponent(token), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch)
+      }).then(function (r) {
+        if (!r.ok) {
+          return r.json().catch(function () { return {}; }).then(function (j) {
+            throw new Error((j && j.detail) || ('HTTP ' + r.status));
+          });
+        }
+        return r.json();
+      }).catch(function (e) {
+        addSystem('设置没能保存：' + (e && e.message ? e.message : e));
+        return null;
+      });
+    };
+    cfgChain = cfgChain.then(job, job);
+    return cfgChain;
   }
 
   function loadToolbar() {
@@ -4069,8 +4170,13 @@
               return;
             }
             fetch('/api/sessions/' + s.id + '?token=' + encodeURIComponent(token), { method: 'DELETE' })
-              .then(function () { loadSessions(); })
-              .catch(function () {});
+              .then(function (r) {
+                // 失败也要有反馈：以前不管成没成都刷新列表，删除被服务端拒绝时
+                // 界面上什么都没变，看起来像「点了没反应」
+                if (!r.ok) { addSystem('删除会话失败（HTTP ' + r.status + '）'); }
+                loadSessions();
+              })
+              .catch(function () { addSystem('删除会话失败：连不上后端'); });
           });
           row.appendChild(del);
           row.addEventListener('click', function () {
@@ -4079,6 +4185,8 @@
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ id: s.id })
+            }).then(function (r) {
+              if (!r.ok) addSystem('切换会话失败（HTTP ' + r.status + '）');
             }).catch(function () { addSystem('切换会话失败'); });
             document.body.classList.remove('sb-open');
           });
@@ -4089,8 +4197,11 @@
       .catch(function () {});
   }
   document.getElementById('btnNewSess').addEventListener('click', function () {
+    // 新会话的创建结果要靠服务端的 session_changed 广播来刷新列表；
+    // 失败时这里补一句提示，别让按钮看起来彻底没反应
     fetch('/api/sessions/create?token=' + encodeURIComponent(token), { method: 'POST' })
-      .catch(function () { addSystem('操作失败'); });
+      .then(function (r) { if (!r.ok) addSystem('新建会话失败（HTTP ' + r.status + '）'); })
+      .catch(function () { addSystem('新建会话失败：连不上后端'); });
   });
   loadSessions();
 

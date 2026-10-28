@@ -563,7 +563,9 @@ def _pointer_click(cmd: str) -> bool:
             return True
     return False
 
-# 智能审批（auto）模式下的危险命令特征：命中则需要用户确认
+# 智能审批（auto）模式下的危险命令特征：命中则需要用户确认。
+# 这些正则只是第一道网，真正能挡住 sh -c / base64 | sh / python -c 这类绕法的是
+# 下面的 _structural_danger()：先分词，再递归看每个子命令到底在调什么
 DANGER_PATTERNS = [
     r"\bsudo\b", r"\brm\b", r"\bmv\b", r"\bdd\b", r"\bmkfs", r"\bshred\b",
     r"\bpacman\b", r"\bflatpak\s+(install|uninstall|remove)",
@@ -574,9 +576,120 @@ DANGER_PATTERNS = [
     r">\s*/(etc|usr|boot|sys|proc)/", r"\bsteam\b[^|]*\binstall",
 ]
 
+# 本身就有破坏力的程序名（取 basename 后比较）
+_DANGER_PROGS = {
+    "sudo", "doas", "rm", "rmdir", "mv", "dd", "shred", "mkfs", "mkswap",
+    "fdisk", "parted", "gdisk", "wipefs", "btrfs", "pacman", "yay", "paru",
+    "reboot", "shutdown", "poweroff", "halt", "chmod", "chown", "chattr",
+    "kill", "killall", "pkill", "mount", "umount", "swapon", "swapoff",
+    "systemctl", "steamos-readonly", "flatpak", "steamos-update",
+}
+# 这些程序后面跟 -c / -e 时，参数本身就是一整条命令，必须递归检查
+_SHELL_PROGS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "su"}
+# 能把 stdin 变成可执行代码的解码器/解释器
+_DECODER_PROGS = {"base64", "xxd", "uudecode", "openssl"}
+# 解释器带 -c/-e 时，参数里可能是任意代码
+_CODE_PROGS = {"python", "python3", "perl", "ruby", "node", "php"}
+
+
+def _prog_name(tok: str) -> str:
+    """取程序名：去掉路径、引号、反斜杠转义（\\rm -> rm，s""udo 由分词处理）"""
+    tok = tok.strip("\"'")
+    tok = tok.replace("\\", "")
+    return os.path.basename(tok)
+
+
+def _structural_danger(cmd: str, depth: int = 0) -> bool:
+    """按命令结构判断危险性：分词后逐个看子命令与它们的参数
+
+    能挡住纯正则漏掉的写法：
+      sh -c 'rm -rf ~' / bash -c "$(echo cm0g)" / echo xxx | base64 -d | sh
+      python3 -c 'import os;os.system("rm -rf ~")' / \rm -rf ~ / s""udo ...
+    """
+    if depth > 3:
+        # 嵌套过深（比如多层 eval 拼接）无法可靠分析，按危险处理
+        return True
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        toks = list(lex)
+    except ValueError:
+        # 引号不闭合等解析失败：分析不了就当作危险，交给用户确认
+        return True
+
+    # 按 shell 运算符切分子命令：; && || | & 以及 $( ) 反引号包裹的部分
+    groups: list[list[str]] = [[]]
+    for tok in toks:
+        if tok and set(tok) <= set(";&|()`"):
+            if tok in ("(", ")") or tok.startswith("$"):
+                # 命令替换/子 shell：里面的部分同样要查
+                continue
+            groups.append([])
+            continue
+        groups[-1].append(tok)
+
+    for group in groups:
+        if not group:
+            continue
+        # 跳过前置环境变量赋值（FOO=1 cmd）
+        i = 0
+        while i < len(group) and re.fullmatch(r"[A-Za-z_]\w*=.*", group[i]):
+            i += 1
+        if i >= len(group):
+            continue
+        prog = _prog_name(group[i])
+        rest = group[i + 1:]
+        if prog in _DANGER_PROGS:
+            # flatpak 只有 install/uninstall/remove 才算改动系统
+            if prog == "flatpak":
+                if any(a in ("install", "uninstall", "remove", "update") for a in rest):
+                    return True
+            elif prog == "systemctl":
+                if any(a in ("stop", "disable", "mask", "restart", "kill") for a in rest):
+                    return True
+            elif prog in ("chmod", "chown") and not any(
+                    a.startswith(("-R", "--recursive")) for a in rest):
+                # 普通 chmod/chown 未必危险，但改系统目录的一律拦下
+                if any(a.startswith(("/etc", "/usr", "/boot", "/sys", "/proc"))
+                       for a in rest):
+                    return True
+            else:
+                return True
+        # 解释器/解码器：把参数交给下一层继续查
+        if prog in _SHELL_PROGS:
+            return True
+        if prog in _CODE_PROGS:
+            has_code = any(a == "-c" or a == "-e" or a.startswith("--eval") for a in rest)
+            if has_code:
+                return True
+        if prog in _DECODER_PROGS:
+            # base64 -d / openssl base64 -d：解码出来的东西一旦接管道执行就已经拆分了，
+            # 解码器本身不危险，但配合管道执行在下面 _pipe_to_shell 里单独判
+            continue
+    # 管道喂给 shell：xxx | sh / | bash / | source
+    if re.search(r"\|\s*(?:sudo\s+)?(?:ba|da|z|k)?sh\b", cmd) or \
+            re.search(r"\|\s*(?:sudo\s+)?(?:python3?|perl|ruby|node)\b", cmd):
+        return True
+    # 重定向覆盖系统目录
+    if re.search(r">\s*/(etc|usr|boot|sys|proc|bin|sbin|lib)/", cmd):
+        return True
+    # 命令替换里跑了危险程序：$(rm -rf ...)
+    for m in re.finditer(r"\$\(([^()]*)\)", cmd):
+        if _structural_danger(m.group(1), depth + 1):
+            return True
+    # 反引号同理
+    for m in re.finditer(r"`([^`]*)`", cmd):
+        if _structural_danger(m.group(1), depth + 1):
+            return True
+    return False
+
 
 def is_dangerous(cmd: str) -> bool:
-    return any(re.search(p, cmd) for p in DANGER_PATTERNS)
+    # 归一化：去掉零宽字符与多余空白，避免 "r m" 之外的花招干扰分词
+    norm = re.sub(r"[\u200b-\u200f\u2028\u2029]", "", cmd or "")
+    if any(re.search(p, norm) for p in DANGER_PATTERNS):
+        return True
+    return _structural_danger(norm)
 
 
 # 从命令中识别会写入/改动的文件路径（用于 UI 展示）
@@ -678,17 +791,21 @@ def _fix_display_env(env: dict):
 _LIVE_PROCS: set[asyncio.subprocess.Process] = set()
 # 命令超时转后台后，负责把它的输出抄进日志的任务；留着引用防止被 GC 回收
 _BG_DRAINERS: set[asyncio.Task] = set()
+# 已转后台的常驻进程：不在 _LIVE_PROCS 里（那轮 await 已经走了），
+# 但用户点「终止」时仍然应该能被收掉
+_BG_PROCS: set[asyncio.subprocess.Process] = set()
 
 
 async def abort_all_procs(grace: float = 2.0) -> int:
     """杀掉所有登记在案的子进程树，返回处理条数（终止按钮的第二道保险）"""
-    procs = list(_LIVE_PROCS)
+    procs = list(_LIVE_PROCS) + list(_BG_PROCS)
     for p in procs:
         try:
             await _kill_tree(p, grace)
         except Exception:
             pass
         _LIVE_PROCS.discard(p)
+        _BG_PROCS.discard(p)
     return len(procs)
 
 
@@ -734,7 +851,7 @@ async def _kill_tree(proc: asyncio.subprocess.Process, grace: float = 2.0) -> No
         pass
 
 
-async def _spawn_detached(command: str, env: dict) -> str:
+async def _spawn_detached(command: str, env: dict, cwd: str | None = None) -> str:
     """把命令整个甩到后台跑，立刻返回；用于「要挂遮罩」的启动类命令
 
     用 setsid 脱离当前会话：后端退出时不会把用户刚打开的程序一起带走。
@@ -751,7 +868,7 @@ async def _spawn_detached(command: str, env: dict) -> str:
     )
     proc = await asyncio.create_subprocess_shell(
         wrapped, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        cwd=str(Path.home()), env=env, executable="/bin/bash",
+        cwd=cwd or str(Path.home()), env=env, executable="/bin/bash",
         start_new_session=True,
     )
     out, _ = await proc.communicate()
@@ -764,11 +881,16 @@ async def _spawn_detached(command: str, env: dict) -> str:
         text = out_path.read_text(encoding="utf-8", errors="replace").strip()
     except Exception:
         pass
+    # 日志内容已经读进内存，临时文件不再需要：以前每个启动器都在 /tmp 漏一个
+    try:
+        out_path.unlink()
+    except OSError:
+        pass
     if pid and not Path(f"/proc/{pid}").exists():
         # 进程已经没了：把它的输出当成失败原因交回去
         return (f"启动后立即退出（pid {pid}）。\n{text}" if text
                 else f"启动后立即退出（pid {pid}），没有任何输出。")
-    msg = f"已在后台启动（pid {pid or '?'}），日志：{out_path}"
+    msg = f"已在后台启动（pid {pid or '?'}）"
     return f"{msg}\n{text}" if text else msg
 
 
@@ -777,6 +899,20 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
     timeout = max(1, min(int(timeout or 60), 300))
     env = dict(os.environ)
     _fix_display_env(env)
+    # 工作区边界对命令通道同样生效：manual / auto 下把 cwd 收进工作区，
+    # 写入路径越界则直接拒绝。以前这里固定 cwd=家目录，等于「文件工具受管、
+    # 一条 cat ~/.config/xxx 就能绕过」。
+    cwd = str(Path.home())
+    if path_bound:
+        cwd = str(WORKSPACE)
+        for raw in extract_writes(command):
+            # 目标可能是变量或通配符，解析不了就跳过（交给审批与危险判定兜底）
+            if any(ch in raw for ch in "$*?["):
+                continue
+            target = Path(raw).expanduser()
+            if not target.is_absolute():
+                target = Path(cwd) / target
+            resolve_in_workspace(str(target))
     # 命令里有鼠标点击时，遮罩必须暂时不接事件，否则这点会点在遮罩上变成「用户终止」；
     # 打开后要等遮罩真正让开，否则点击仍会打在还没隐藏的遮罩上
     await _set_overlay_passthrough(_pointer_click(command))
@@ -796,13 +932,13 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
         # 这次调用要挂遮罩让用户能随时点停，后端就不能堵在这里等程序退出
         # （QQ 这种会一直开着）。改成 setsid 放后台，输出重定向到文件，
         # 立刻把控制权还给 agent，遮罩只亮这一小会儿。
-        return await _spawn_detached(command, env)
+        return await _spawn_detached(command, env, cwd)
     proc = await asyncio.create_subprocess_shell(
         command,
         stdin=asyncio.subprocess.PIPE if feed else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        cwd=str(Path.home()),
+        cwd=cwd,
         env=env,
         executable="/bin/bash",
         start_new_session=True,
@@ -861,7 +997,10 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
             # 保住引用：asyncio 只持弱引用，不存一份会被 GC 连带取消
             _BG_DRAINERS.add(task)
             task.add_done_callback(_BG_DRAINERS.discard)
-            _LIVE_PROCS.discard(proc)
+            # 转后台后仍然登记进程：用户点「终止」时要把这些常驻程序一起收掉，
+            # 否则它们会一直活着，日志文件也只增不减
+            _BG_PROCS.add(proc)
+            task.add_done_callback(lambda _t, _p=proc: _BG_PROCS.discard(_p))
             return (f"命令运行超过 {timeout}s 仍未退出，判断是常驻程序，已转入后台继续运行"
                     f"（进程号 {proc.pid}）。\n"
                     f"如需确认它是否正常，用 pgrep / 看窗口 检查，不要重复启动。\n"
@@ -912,8 +1051,10 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
     return f"exit={proc.returncode}\n{text}" if text else f"exit={proc.returncode}（无输出）"
 
 # 确认危险操作时认的字。只保留意思明确的词：「好」「可以」「ok」这类在
-# 日常对话里太常见（「好的，顺便帮我查下天气」会被当成同意执行），去掉
-_CONFIRM_WORDS = {"确认", "确认执行", "执行", "同意", "yes", "y", "confirm"}
+# 日常对话里太常见（「好的，顺便帮我查下天气」会被当成同意执行），去掉。
+# 「执行」「y」「yes」同样太容易在别的话里出现（比如「请输入要执行的命令」），
+# 危险操作只认明确表态，宁可让用户多说一个字
+_CONFIRM_WORDS = {"确认", "确认执行", "确认一下", "同意执行"}
 
 # 去掉首尾空白与标点后再比，避免「确认。」「确认！」认不出
 _CONFIRM_STRIP = " \t\r\n。，,.!！?？~～"
@@ -1424,6 +1565,7 @@ class _VirtualPad:
         self._fd: int | None = None
         self._lock = asyncio.Lock()
         self._idle: asyncio.Task | None = None
+        self._gen = 0
 
     def _emit(self, typ: int, code: int, value: int):
         # input_event 的 timeval 两个字段都是 64 位 long，所以用 qq 不用 ll
@@ -1492,14 +1634,20 @@ class _VirtualPad:
     def _touch(self):
         if self._idle is not None:
             self._idle.cancel()
-        self._idle = asyncio.create_task(self._close_later())
+        # 代次自增：被取消的旧任务如果已经醒来并卡在等锁上，取消是打不断的
+        # （CancelledError 只在 sleep 阶段生效）。它拿到锁后会比对代次，
+        # 发现自己过期就直接退出，不会把刚建好的设备关掉。
+        self._gen += 1
+        self._idle = asyncio.create_task(self._close_later(self._gen))
 
-    async def _close_later(self):
+    async def _close_later(self, gen: int):
         try:
             await asyncio.sleep(self._IDLE)
         except asyncio.CancelledError:
             return
         async with self._lock:
+            if gen != self._gen:
+                return
             self._destroy()
 
     async def _ensure(self):
@@ -1624,17 +1772,18 @@ async def _screenshot() -> str:
     path = shots_dir / name
 
     # 每次截图先把上一次的状态清干净，否则「上一张成功、这一张失败」时
-    # LAST_VISION 还留着旧图，模型会拿着上一帧回答
-    global LAST_SHOT_ERROR, LAST_VISION
-    LAST_SHOT_ERROR = None
-    LAST_VISION = None
+    # 还留着旧图，模型会拿着上一帧回答。
+    # 状态放在 SHOT_STATE 里而不是模块全局：两轮并发时后用模块全局会出现
+    # B 截图清掉 A 的图、A 读不到画面却没有任何提示的情况
+    holder = SHOT_STATE
+    holder.clear()
 
     # 游戏模式：桌面会话已经结束，只能从 gamescope 抓
     if await _gamescope_pw_node():
         err = await _screenshot_gamescope(path)
         if not err:
             return await _finish_shot(path, name, shots_dir, time)
-        LAST_SHOT_ERROR = err
+        holder["error"] = err
         return (f"截图失败：{err}。现在没有当前画面可用，"
                 "请直接告诉用户这次没截到图、以及原因，不要凭空描述屏幕内容。")
 
@@ -1662,25 +1811,25 @@ async def _screenshot() -> str:
     finally:
         await _set_overlay_lift(False)
     if not path.exists() or path.stat().st_size < 10000:
-        LAST_SHOT_ERROR = "spectacle 与 mss 都不可用（或截到的是黑色画面）"
+        holder["error"] = "spectacle 与 mss 都不可用（或截到的是黑色画面）"
         # 黑屏也会留下几十字节的残片，不删掉下次会被当成「已有截图」
         path.unlink(missing_ok=True)
-        return (f"截图失败：{LAST_SHOT_ERROR}。现在没有当前画面可用，"
+        return (f"截图失败：{holder['error']}。现在没有当前画面可用，"
                 "请直接告诉用户这次没截到图，不要凭空描述屏幕内容。")
     return await _finish_shot(path, name, shots_dir, time)
 
 
 async def _finish_shot(path: Path, name: str, shots_dir: Path, time_mod) -> str:
     """压缩一份给多模态模型看（1280 宽 JPEG），并返回给模型的结果文本"""
-    global LAST_VISION
-    LAST_VISION = None
+    holder = SHOT_STATE
+    holder.pop("vision", None)
     try:
         from PIL import Image
         img = Image.open(path)
         img.thumbnail((1280, 1280))
         vpath = shots_dir / f"vision_{int(time_mod.time())}.jpg"
         img.convert("RGB").save(vpath, "JPEG", quality=70)
-        LAST_VISION = vpath
+        holder["vision"] = vpath
     except Exception:
         pass
     return f"截图完成：/shots/{name}。当前画面已附上，你可以直接根据画面内容回答用户的问题。"
@@ -1969,12 +2118,17 @@ async def _desktop(action: str, target: str = "", x: int = 0, y: int = 0, text: 
     return f"不支持的动作：{action}"
 
 
-# 最近一次截图的模型可读版本路径（供 run_agent 注入多模态消息）
-LAST_VISION: Path | None = None
+# 本轮截图的状态。run_agent 每轮进来时换成一个新的 dict（见 new_shot_state），
+# 于是两轮并发时各读各的，不会再互相清空。
+#   vision: 模型可读的 JPEG 路径；error: 这次截图失败的原因
+SHOT_STATE: dict = {}
 
-# 最近一次截图失败的原因（成功时为 None）；界面上要把它显示出来，
-# 否则用户只看到「已截屏」却等不来画面
-LAST_SHOT_ERROR: str | None = None
+
+def new_shot_state() -> dict:
+    """给一轮对话分配独占的截图状态容器，返回并设为当前"""
+    global SHOT_STATE
+    SHOT_STATE = {}
+    return SHOT_STATE
 
 # 最近一次文件写入/编辑的增删行数（供 UI 展示 diff 统计）
 LAST_DIFF: dict | None = None
@@ -2023,7 +2177,8 @@ def resolve_in_workspace(path: str) -> Path:
 
 async def _list_dir(path: str = "") -> str:
     d = resolve_in_workspace(path) if path else WORKSPACE
-    d.mkdir(parents=True, exist_ok=True) if not path else None
+    if not path:
+        d.mkdir(parents=True, exist_ok=True)
     if not d.is_dir():
         return f"不是目录：{d}"
     entries = []
@@ -2038,6 +2193,9 @@ async def _read_file(path: str, offset: int = 1, limit: int = 400) -> str:
     p = resolve_in_workspace(path)
     if not p.is_file():
         return f"文件不存在：{p}"
+    # 大文件整份读进内存会直接把后端撑爆（几百 MB 的日志很常见）
+    if p.stat().st_size > 8 * 1024 * 1024:
+        return f"文件太大（{p.stat().st_size / 1048576:.1f}MB），请改用 run_command 里 head/tail/grep 查看片段：{p}"
     lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
     offset = max(1, offset)
     chunk = lines[offset - 1: offset - 1 + min(limit, 2000)]
@@ -2046,13 +2204,27 @@ async def _read_file(path: str, offset: int = 1, limit: int = 400) -> str:
     return f"{p} {note}\n{body}"
 
 
+def _atomic_write(p: Path, text: str) -> None:
+    """先写同目录临时文件再 os.replace：写一半被杀不会留下半截文件"""
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, p)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 async def _write_file(path: str, content: str) -> str:
     global LAST_DIFF
     LAST_DIFF = None
     p = resolve_in_workspace(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     old_lines = len(p.read_text(encoding="utf-8", errors="replace").splitlines()) if p.is_file() else 0
-    p.write_text(content, encoding="utf-8")
+    _atomic_write(p, content)
     LAST_DIFF = {"add": len(content.splitlines()), "del": old_lines}
     return f"已写入 {p}（{len(content)} 字符）"
 
@@ -2069,7 +2241,7 @@ async def _edit_file(path: str, old: str, new: str) -> str:
         return "替换失败：old 文本在文件中不存在（先用 read_file 确认原文）"
     if count > 1:
         return f"替换失败：old 文本出现了 {count} 次，请扩大范围使其唯一"
-    p.write_text(text.replace(old, new, 1), encoding="utf-8")
+    _atomic_write(p, text.replace(old, new, 1))
     LAST_DIFF = {"add": len(new.splitlines()), "del": len(old.splitlines())}
     return f"已修改 {p}（替换 1 处）"
 

@@ -26,7 +26,6 @@ from pydantic import BaseModel
 
 from .llm import LLMClient
 from . import depcheck, memory, persona, power, singleton, stream, tools, updater
-from .session_store import merge_histories as _merge_histories
 from .session_store import set_title as _set_title
 from .session_store import store
 from .session_store import SESSIONS_DIR as _sessions_dir
@@ -749,9 +748,9 @@ def save_session_snapshot(sid: str, hist: list[dict]):
     return store.save_snapshot(sid, hist)
 
 
-def _write_session(sid: str, hist: list[dict], allow_merge: bool = True):
-    """原子写入一个会话文件（实现与合并策略见 session_store.write_session）"""
-    store.write_session(sid, hist, allow_merge)
+def _write_session(sid: str, hist: list[dict]):
+    """原子写入一个会话文件（落盘策略见 session_store.write_session）"""
+    store.write_session(sid, hist)
 
 
 # ---------- 流式正文的增量落盘 ----------
@@ -765,7 +764,19 @@ _STREAM_FLUSH_CHARS = 200      # 或自上次落盘以来又累积这么多字
 _RESTORE_MIN_CHARS = 0         # 恢复门槛已取消：一个字也救回来，见 init_sessions
 # events 槽：本轮到目前为止「屏幕上已经出现过」的有序内容块。
 # 只存最后那段正文的话，一轮里先说话、再调工具、再说一段的，中途被杀就只剩最后一段
-_stream_buf: dict = {"sid": "", "text": "", "last": 0.0, "written": 0, "parts": []}
+# 按 sid 各存一份：两轮并发（不同会话）时共用单槽会互相覆盖 —— A 的正文被 B 清掉，
+# 终止时 A 交给下一轮的交接正文就空了；收尾时还会把 B 的正文写进 A 的文件
+_stream_bufs: dict[str, dict] = {}
+
+
+def _stream_buf(sid: str = "") -> dict:
+    """取某个会话的流式缓冲（没有就建一个空的）"""
+    sid = sid or store.turn.get("sid") or store.current_sid
+    buf = _stream_bufs.get(sid)
+    if buf is None:
+        buf = {"sid": sid, "text": "", "last": 0.0, "written": 0, "parts": []}
+        _stream_bufs[sid] = buf
+    return buf
 
 
 def _write_streaming(sid: str, text: str, parts: list[dict] | None = None) -> None:
@@ -807,17 +818,16 @@ def _write_streaming(sid: str, text: str, parts: list[dict] | None = None) -> No
                 pass
 
 
-def persist_stream(text: str, force: bool = False, parts: list[dict] | None = None) -> None:
+def persist_stream(text: str, force: bool = False, parts: list[dict] | None = None,
+                   sid: str = "") -> None:
     """流式正文的节流落盘；force=True 立即写（终止 / checkpoint / 收尾时用）
 
+    sid 不传时按本轮归属推断；调用方最好显式传，避免跨会话串写。
     parts 传入时同时更新缓冲区里「屏幕上出现过的内容」有序块列表，
     这样即便只存了最后一段正文，恢复时也能按原顺序把所有段落和事件拼回来。
     """
-    sid = store.turn.get("sid") or store.current_sid
-    buf = _stream_buf
-    if buf["sid"] != sid:
-        # 换了会话或开了新一轮：重新开始累积
-        buf.update({"sid": sid, "text": "", "last": 0.0, "written": 0, "parts": []})
+    sid = sid or store.turn.get("sid") or store.current_sid
+    buf = _stream_buf(sid)
     buf["text"] = text
     if parts is not None:
         buf["parts"] = parts
@@ -851,7 +861,7 @@ def _snapshot_parts(events: list[dict], tail_text: str = "") -> list[dict]:
 def clear_stream(sid: str = "") -> None:
     """正文已正式落盘，把残留的 _streaming 字段清掉"""
     sid = sid or store.turn.get("sid") or store.current_sid
-    _stream_buf.update({"sid": "", "text": "", "last": 0.0, "written": 0, "parts": []})
+    _stream_bufs.pop(sid, None)
     with store.lock:
         if sid in store.deleted_sids:
             return
@@ -997,7 +1007,7 @@ def feed_push(type_: str, **kw):
     feed.append({"id": _feed_seq, "type": type_, "ts": time.time(), **kw})
     del feed[:-200]  # 最多保留 200 条
 
-# 待确认的危险操作 {name, args, description, sid, epoch, client, device}
+# 待确认的危险操作 {name, args, description, sid, epoch, turn_id, client, device}
 # sid/epoch/client/device 是「谁在什么会话里提的」：确认只认原会话原来源，
 # 否则任何连上的客户端随便一句「好」就能放行别人发起的危险命令
 pending_action: dict | None = None
@@ -1011,6 +1021,19 @@ def _pending_matches(p: dict, sid: str, epoch: int,
     # 来源也一起比：同一会话里换了个端发「好」不算确认（网页和插件能同时连）
     return (p.get("client") or "") == (client or "") \
         and (p.get("device") or "") == (device or "")
+
+
+def _pending_matches_turn(p: dict, sid: str, epoch: int, turn_id: str,
+                          client: str | None, device: str | None) -> bool:
+    """这个端的这一轮，能不能认领并确认这条挂起操作
+
+    与 _pending_matches 的区别是多比一道 turn_id：同一个端连发两轮时，
+    上一轮挂起的危险操作不能被这一轮的「确认」顺手放行（那一轮模型可能已经
+    换了话题，用户说的「确认」指的并不是这件事）。
+    """
+    if not _pending_matches(p, sid, epoch, client, device):
+        return False
+    return (p.get("turn_id") or "") == (turn_id or "")
 
 
 # ---------- WebSocket 连接管理 ----------
@@ -1167,6 +1190,10 @@ class ChatRequest(BaseModel):
     # 可选的附带图片（data URL 或纯 base64），供 Decky 插件把游戏画面直接塞进这一轮
     image: str | None = None
     image_prompt: str = "（这是当前游戏画面，结合画面回答用户的问题）"
+    # 发起端身份：危险操作挂起后，只有「同一个端」说的「确认」才算数。
+    # 不传的话挂起记录里是空值，插件端和网页端都会退化成同一个来源
+    client: str | None = None
+    device: str | None = None
 
 
 _CTX_RE = re.compile(r"@\{([^}]+)\}")
@@ -1370,7 +1397,10 @@ async def api_upload(file: UploadFile):
     其他文件 → 工作区 uploads/，返回相对工作区的路径，前端插成 @{uploads/xxx}，
     由 _expand_context 带上正文（文本类直接读，docx/pdf 现抽文字）。
     """
-    raw = await file.read()
+    try:
+        raw = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"读取上传内容失败：{e}") from e
     if len(raw) > _UPLOAD_MAX:
         raise HTTPException(status_code=413, detail="文件超过 20MB")
     fn = Path(file.filename or "file")
@@ -1546,7 +1576,7 @@ async def api_chat(req: ChatRequest, workspace: str | None = Query(default=None)
     if root is not None and not root.is_dir():
         root = None
     return await start_chat(text, image=req.image, image_prompt=req.image_prompt,
-                            workspace=root)
+                            workspace=root, client=req.client, device=req.device)
 
 
 # 当前正在处理的对话任务（用于终止按钮）
@@ -2017,6 +2047,22 @@ async def api_retry():
     return await start_chat(text, announce=False)
 
 
+def _safe_save(sid: str, hist: list[dict]) -> None:
+    """收尾落盘：磁盘满/权限出错时不能让「复位 turn.active」也跟着跳过"""
+    try:
+        save_session_snapshot(sid, hist)
+    except Exception as e:
+        print(f"[DeckMeido] 会话 {sid} 落盘失败：{e}", file=sys.stderr)
+
+
+def _safe_clear_stream(sid: str) -> None:
+    """清流式残留：失败只是下次启动多恢复一条「中断回答」，不该打断收尾"""
+    try:
+        clear_stream(sid)
+    except Exception as e:
+        print(f"[DeckMeido] 清理流式残留失败（{sid}）：{e}", file=sys.stderr)
+
+
 async def handle_chat(text: str, announce: bool = True,
                       image: str | None = None,
                       image_prompt: str = "（这是当前游戏画面，结合画面回答用户的问题）",
@@ -2103,14 +2149,18 @@ async def handle_chat(text: str, announce: bool = True,
     # run_agent 在终止时会往这里塞本轮执行过的工具，供落盘时做交接（见 _aborted_note）
     tool_log: list[dict] = []
     # 标题取自第一条用户消息，所以用户一发出就落盘并刷新侧栏，不必等整轮回答结束
-    save_session_snapshot(turn_sid, hist)
+    _safe_save(turn_sid, hist)
     await manager.broadcast({"type": "session_changed", "current": store.current_sid})
 
     # 上下文逼近模型窗口上限时自动压缩（摘要替换旧对话，不再直接丢弃）。
     # _ctx_used 在切换会话等路径上会归零，这时按当前历史重新估算一次，
-    # 否则会以为「才用了 0 token」而漏掉该压的情况
-    if _need_compact(_ctx_used or _estimate_tokens(_build_llm_msgs(hist, SYSTEM_PROMPT, turn_sid))):
-        await compact_history(auto=True, hist=hist)
+    # 否则会以为「才用了 0 token」而漏掉该压的情况；压缩失败也不能让这一轮起不来
+    try:
+        if _need_compact(_ctx_used or _estimate_tokens(
+                _build_llm_msgs(hist, SYSTEM_PROMPT, turn_sid))):
+            await compact_history(auto=True, hist=hist)
+    except Exception as e:
+        print(f"[DeckMeido] 自动压缩失败，按原上下文继续：{e}", file=sys.stderr)
 
     try:
         # 遮罩不再整轮常显：只有真的会动屏幕的工具（desktop 注入、xdotool/ydotool
@@ -2120,8 +2170,8 @@ async def handle_chat(text: str, announce: bool = True,
         # 遮罩的起落就在下面调用工具的前后（见 tools.touches_screen），这里不再常开。
         if not llm.configured:
             reply = "还没有配置模型。点右上角「设置」填好 API 地址和 Key 就能开始对话。"
-        elif pending_action and not _pending_matches(
-                pending_action, turn_sid, turn_epoch, client, device):
+        elif pending_action and not _pending_matches_turn(
+                pending_action, turn_sid, turn_epoch, turn_id, client, device):
             # 挂起的操作不是这个会话/这个端提的：既不能替别人确认，也不该
             # 因为别处的对话把这边的手头操作清掉，按普通消息继续
             reply = await _run_agent_guarded(events, hist=hist, image_part=image_part,
@@ -2151,8 +2201,8 @@ async def handle_chat(text: str, announce: bool = True,
         feed_push("assistant_message", text="已终止当前操作", events=events)
         # 终止时把已经生成的部分保住：屏幕上出现过的每一段正文都留下，
         # 不能只用最后那段（工具调用前的过渡话也在屏幕上显示过）
-        partial = "".join(_stream_buf.get("text") or "") if _stream_buf.get("sid") == turn_sid else ""
-        parts = _stream_buf.get("parts") or []
+        partial = _stream_buf(turn_sid).get("text") or ""
+        parts = _stream_buf(turn_sid).get("parts") or []
         killed_segs = [p.get("content") or "" for p in parts if p.get("type") == "text"]
         killed_text = "\n\n".join(s.strip() for s in killed_segs if s.strip()).strip()
         if partial.strip() and partial.strip() not in killed_text:
@@ -2165,10 +2215,19 @@ async def handle_chat(text: str, announce: bool = True,
                      "events": events, "interrupted": True, "aborted_turn": True,
                      "tool_log": list(tool_log), "ts": time.time(),
                      **src_tag})
-        save_session_snapshot(turn_sid, hist)
-        clear_stream(turn_sid)
-        store.turn["active"] = False
+        _safe_save(turn_sid, hist)
+        _safe_clear_stream(turn_sid)
         raise
+    except Exception as e:
+        # 非终止类异常（网络、磁盘、工具内部炸了）：以前这里直接往上抛，
+        # 把回复落盘、清 _streaming、复位 active 三步全跳过 —— 于是这一轮
+        # 只留下用户那句话，屏幕上出现过的工具链全丢，而且 turn["active"]
+        # 一直是 True，后面所有前端的「本轮归属」判定都跟着错。
+        # 统一在这里收成一条带错误说明的回复，走与成功路径相同的收尾
+        print(f"[DeckMeido] 本轮异常：{e}", file=sys.stderr)
+        reply = f"（出错了：{e}）"
+        if events:
+            reply += "\n\n（上面这些步骤已经执行，结果未完整汇总）"
     finally:
         set_overlay(False)
 
@@ -2181,9 +2240,9 @@ async def handle_chat(text: str, announce: bool = True,
                  "ts": asst_ts, **src_tag})
     # 关键：写回「本轮所属」的会话文件。中途被切走时 current_sid 已经指向别处，
     # 用 save_current_session 会把这一轮错写进新会话（串回复的根源）
-    save_session_snapshot(turn_sid, hist)
+    _safe_save(turn_sid, hist)
     # 正文已正式进 history，清掉流式残留（否则下次启动会多恢复出一条重复的「中断回答」）
-    clear_stream(turn_sid)
+    _safe_clear_stream(turn_sid)
     detached = _turn_detached(turn_epoch)
     store.turn["active"] = False
     turn_deleted = turn_sid in store.deleted_sids
@@ -2321,6 +2380,9 @@ async def compact_history(auto: bool = False, hist: list[dict] | None = None,
                 summary = again
     except Exception as e:
         return f"压缩失败，历史原样保留：{e}"
+    if sid in store.deleted_sids:
+        # 会话在压缩过程中被删了：游标与落盘一律作废，否则删掉的会话会被写回来
+        return summary
     _set_compact(sid, summary, end)
     _ctx_used = _estimate_tokens(_build_llm_msgs(hist, SYSTEM_PROMPT, sid))
     # 游标要和会话文件一起持久化，否则重启后模型会重新吃到全量历史
@@ -2328,9 +2390,6 @@ async def compact_history(auto: bool = False, hist: list[dict] | None = None,
         save_current_session()
     else:
         save_session_snapshot(sid, hist)
-    if sid in store.deleted_sids:
-        # 压缩摘要别往已删除的会话上写系统提示
-        return summary
     note = (f"{'已自动压缩上下文' if auto else '已压缩上下文'}"
             f"（{len(old)} 条旧消息 → 摘要，聊天记录完整保留）")
     await manager.broadcast({"type": "system", "text": note, "ts": time.time()})
@@ -2416,8 +2475,10 @@ class OpenFileReq(BaseModel):
 async def api_open_file(req: OpenFileReq):
     """原生客户端里点开图片/文件 → 用系统默认工具打开（仅限 static 目录内）"""
     rel = req.path.split("?")[0].lstrip("/")
-    p = (STATIC_DIR / rel).resolve()
-    if not str(p).startswith(str(STATIC_DIR.resolve())) or not p.is_file():
+    root = STATIC_DIR.resolve()
+    p = (root / rel).resolve()
+    # 按路径层级判断，不能拼字符串：/static-other/x 的 startswith("/static") 也成立
+    if not (p == root or root in p.parents) or not p.is_file():
         raise HTTPException(status_code=404, detail="file not found")
     subprocess.Popen(["xdg-open", str(p)],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -2472,7 +2533,15 @@ async def api_session_switch(req: SwitchReq):
     if not p.exists():
         raise HTTPException(status_code=404, detail="session not found")
     save_current_session()
-    data = json.loads(p.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        # 文件坏了就明确拒绝：以前这里直接抛 500，前端只能笼统提示「切换失败」，
+        # 而用户看到的是会话列表里明明有这一条
+        raise HTTPException(status_code=500,
+                            detail=f"会话文件读取失败：{e}") from e
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=500, detail="会话文件格式异常")
     store.current_sid = data.get("id", req.id)
     # 同样换对象：在跑的那一轮仍持有旧列表，不受切换影响
     store.history = data.get("history", [])
@@ -2627,9 +2696,10 @@ async def api_checkpoint():
     """
     flushed = False
     try:
-        text = _stream_buf.get("text") or ""
+        buf = _stream_buf()
+        text = buf.get("text") or ""
         if store.turn.get("active") and text.strip():
-            persist_stream(text, force=True, parts=_stream_buf.get("parts") or [])
+            persist_stream(text, force=True, parts=buf.get("parts") or [])
             flushed = True
     except Exception:
         pass
@@ -2641,17 +2711,21 @@ async def api_checkpoint():
 
 
 _lan_cache: tuple[float, str] = (0.0, "")
+_lan_lock = threading.Lock()
 
 
 def _lan_ip() -> str:
     """取真实局域网 IP：枚举网卡，优先 192.168.x，避开 VPN/加速器 TUN 虚拟段
 
     结果缓存 60 秒：这个函数每次都要 fork 一次 `ip`，而状态卡是 5 秒一刷的。
+    锁只护住缓存读写那几行，真正的 `ip` 调用仍在锁外跑：多端同时刷状态时
+    最多多 fork 几次，绝不因为一个网卡探测把整个事件循环堵住。
     """
     global _lan_cache
     now = time.monotonic()
-    if _lan_cache[1] and now - _lan_cache[0] < 60:
-        return _lan_cache[1]
+    with _lan_lock:
+        if _lan_cache[1] and now - _lan_cache[0] < 60:
+            return _lan_cache[1]
     try:
         out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
                              capture_output=True, text=True, timeout=3).stdout
@@ -2670,7 +2744,8 @@ def _lan_ip() -> str:
 
     ips.sort(key=rank)
     ip = ips[0] if ips else "127.0.0.1"
-    _lan_cache = (now, ip)
+    with _lan_lock:
+        _lan_cache = (now, ip)
     return ip
 
 
@@ -2840,20 +2915,25 @@ def stop_overlay() -> None:
     # 事件循环里没被 wait 过；若不 reap，主进程被 SIGTERM 后 uvicorn 的 shutdown
     # 会一直卡在「Waiting for background tasks to complete」，端口不释放，
     # 表现为一个既不服务也不退出的幽灵后端（还会被单实例守卫挡着不让重启）。
-    _reap_children()
+    # 只回收我们自己那个 pid：waitpid(-1) 会把 asyncio 管着的命令进程一起摘走
+    if proc is not None:
+        _reap_children(proc.pid)
 
 
-def _reap_children() -> None:
-    """回收所有已退出但还没 wait 的子进程（僵尸），一步到位的 waitpid(-1)。"""
-    for _ in range(64):
-        try:
-            pid, _status = os.waitpid(-1, os.WNOHANG)
-        except ChildProcessError:
-            return
-        except Exception:
-            return
-        if pid == 0:
-            return
+def _reap_children(only_pid: int | None = None) -> None:
+    """回收已退出但还没 wait 的子进程（僵尸）。
+
+    `waitpid(-1)` 会摘走**任意**一个子进程 —— 包括 asyncio 子进程管理器
+    正在管着的 run_command 进程。那些进程的退出码需要由事件循环回收，
+    被这里抢走后 asyncio 会一直等不到终止状态，命令永远「不结束」。
+    所以只回收我们自己拉起的那个 pid（遮罩），没有指定就什么都不做。
+    """
+    if only_pid is None:
+        return
+    try:
+        os.waitpid(only_pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        pass
 
 
 def _overlay_pids() -> list[int]:
@@ -3096,9 +3176,9 @@ async def _shutdown_overlay():
     # 客户端退出、systemctl restart、升级重启都走这条路径，
     # 少了这一步，被打断的那一轮回答就会整段消失（用户视角就是「记录丢了」）
     try:
-        text = _stream_buf.get("text") or ""
+        text = _stream_buf().get("text") or ""
         if store.turn.get("active") and text.strip():
-            persist_stream(text, force=True, parts=_stream_buf.get("parts") or [])
+            persist_stream(text, force=True, parts=_stream_buf().get("parts") or [])
             print(f"[DeckMeido] 退出前已保存未完成的回答（{len(text)} 字）", file=sys.stderr)
         # 这里刻意不写内存 history：正文在 handle_chat 收尾时已落盘，用户消息开头就落盘了，
         # 内存不比文件新。而「拿内存覆盖文件」在内存为空/偏旧时会直接把历史冲掉——
@@ -3161,6 +3241,9 @@ async def run_agent(events: list[dict], extra_system: str = "",
     """
     global pending_action, _ctx_used
     hist = store.history if hist is None else hist
+    # 本轮独占的截图状态：两轮并发时共用模块全局会互相清空（上一轮刚截的图
+    # 被这一轮的 clear 抹掉，注入的图片就丢了一半）
+    shot_state = tools.new_shot_state()
     # 本轮归属（中途切会话也不改这份 sid）
     turn_sid = store.turn.get("sid") or store.current_sid
     # 当前模式必须实测后告诉模型：游戏模式用 gamepad 注入、游戏模式下从 gamescope
@@ -3220,7 +3303,7 @@ async def run_agent(events: list[dict], extra_system: str = "",
         # 增量落盘（此函数是 async 的，前端不会感知到这点磁盘开销）
         try:
             persist_stream("".join(stream_text),
-                           parts=_stamp_parts("".join(stream_text)))
+                           parts=_stamp_parts("".join(stream_text)), sid=turn_sid)
         except Exception:
             pass
         # final=False：这段正文可能只是工具调用前的过渡话，前端不写进 crash 缓冲；
@@ -3271,17 +3354,22 @@ async def run_agent(events: list[dict], extra_system: str = "",
             # 压缩只推进游标、不删 history，所以这里重建 msgs 时要保留
             # 本轮新加的工具往返消息（hist_msgs 之后的部分），否则工具链断掉。
             if _need_compact(_estimate_tokens(msgs)):
-                await compact_history(auto=True, hist=hist, sid=turn_sid)
-                rebuilt = _build_llm_msgs(hist, sys_prompt, turn_sid)
-                extra = [m for m in msgs[hist_msgs:]
-                         if m.get("role") in ("tool", "assistant")]
-                msgs[:] = rebuilt + extra
-                hist_msgs = len(rebuilt)
-                streaming = False
-                # 压缩前已经显示的过渡正文：作为 text 事件留在 events 里继续保存
-                if "".join(stream_text).strip():
-                    events.append({"type": "text", "text": "".join(stream_text)})
-                stream_text.clear()
+                # 压缩失败（网络抖动、摘要模型报错）不该把整轮对话弄崩：
+                # 压缩只是省上下文，压不了就带着原上下文继续跑
+                try:
+                    await compact_history(auto=True, hist=hist, sid=turn_sid)
+                    rebuilt = _build_llm_msgs(hist, sys_prompt, turn_sid)
+                    extra = [m for m in msgs[hist_msgs:]
+                             if m.get("role") in ("tool", "assistant")]
+                    msgs[:] = rebuilt + extra
+                    hist_msgs = len(rebuilt)
+                    streaming = False
+                    # 压缩前已经显示的过渡正文：作为 text 事件留在 events 里继续保存
+                    if "".join(stream_text).strip():
+                        events.append({"type": "text", "text": "".join(stream_text)})
+                    stream_text.clear()
+                except Exception as e:
+                    print(f"[DeckMeido] 工具轮中压缩失败，继续：{e}", file=sys.stderr)
 
             msg = await llm.chat_with_tools_stream(msgs, round_tools, on_delta=on_delta,
                                                    on_thought=on_thought,
@@ -3400,6 +3488,7 @@ async def run_agent(events: list[dict], extra_system: str = "",
                                       "description": tools.describe(name, args),
                                       "sid": store.turn.get("sid") or store.current_sid,
                                       "epoch": store.turn.get("epoch") or store.epoch,
+                                      "turn_id": store.turn.get("turn_id") or "",
                                       "client": store.turn.get("client") or "",
                                       "device": store.turn.get("device") or ""}
                     return f"我需要执行一个会影响设备的操作：\n\n**{pending_action['description']}**\n\n回复「确认」我就执行，说别的就当作取消。"
@@ -3449,7 +3538,7 @@ async def run_agent(events: list[dict], extra_system: str = "",
                     else:
                         # 抓帧失败：接口层要把原因带到前端，不能让用户只看到
                         # 一行「已截屏」却一直没有画面
-                        event["error"] = tools.LAST_SHOT_ERROR or "未知原因"
+                        event["error"] = shot_state.get("error") or "未知原因"
                 events.append(event)
                 await manager.broadcast({"type": "tool_done", "event": event, "ts": time.time(), **_turn_tag()})
                 # 工具结果前面统一加「[工具名] 」，这类元信息在请求最前面：
@@ -3462,7 +3551,7 @@ async def run_agent(events: list[dict], extra_system: str = "",
                 # 同一轮里连着截第二张时复用上一张：模型反复截图通常不是画面变了，
                 # 而是它没「看到」上面那张。再截一张只会让上下文里堆图，
                 # 顺手还把模型推回同样的困惑里绕圈（曾经连截五次停不下来）。
-                if name == "screenshot" and tools.LAST_VISION:
+                if name == "screenshot" and shot_state.get("vision"):
                     if turn_shot_seen:
                         msgs.append({"role": "user", "content":
                                      "（本轮已经截过图，画面就在上面，直接看图回答，不要重复截图）"})
@@ -3471,7 +3560,7 @@ async def run_agent(events: list[dict], extra_system: str = "",
                         turn_shot_no += 1
                         try:
                             import base64
-                            b64 = base64.b64encode(Path(tools.LAST_VISION).read_bytes()).decode()
+                            b64 = base64.b64encode(Path(shot_state["vision"]).read_bytes()).decode()
                             msgs.append({"role": "user", "content": [
                                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                                 {"type": "text", "text": _shot_caption(max(turn_shot_no, 1))},
@@ -3488,7 +3577,10 @@ async def run_agent(events: list[dict], extra_system: str = "",
         # 收尾时模型经常什么都不写：这不是正常答复，要把「为什么停」说清楚
         return f"{answer}\n\n{limit_note}" if answer else limit_note
     except Exception as e:
-        return f"LLM 调用失败：{e}"
+        # 把失败当正常回复返回，下一轮模型会在自己的历史里读到一句「LLM 调用失败」，
+        # 于是把这句话当成它说过的话继续往下聊。明确标成中断，交给上层提示
+        print(f"[DeckMeido] LLM 调用失败：{e}", file=sys.stderr)
+        raise RuntimeError(f"LLM 调用失败：{e}") from e
 
 
 @app.websocket("/ws")
@@ -3516,6 +3608,16 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
                             "data": {**get_status(), "mode": ws_mode}})
         while True:
             data = await ws.receive_json()
+            if data.get("type") == "ping":
+                # 前端心跳：回一条 pong 让它知道链路还活着
+                await ws.send_json({"type": "pong"})
+                continue
+            if data.get("type") == "history":
+                # 客户端断线重连后主动要一份：握手时后端已经发过一次，
+                # 但断线期间别的端说的话它没收到，得重新对齐
+                await ws.send_json({"type": "history", "messages": store.history,
+                                    "sid": store.current_sid, "my_client": ua_client})
+                continue
             if data.get("type") == "chat":
                 # 开始发问就刷新：这条连接此刻在什么模式下，就是它自己的模式
                 ws_mode = (await asyncio.to_thread(get_status))["mode"]

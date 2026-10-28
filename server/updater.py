@@ -379,7 +379,10 @@ def _fix_owners(log_path: Path) -> None:
     `unable to unlink old 'plugin/main.py': Permission denied`。
     升级前先纠一次；自己不是 root 时无从修，静默跳过。
     """
-    if os.geteuid() != 0:
+    # Windows 上没有 geteuid / chown，整段跳过（开发机跑预览时不该因此报错）
+    geteuid = getattr(os, "geteuid", None)
+    chown = getattr(os, "chown", None)
+    if geteuid is None or chown is None or geteuid() != 0:
         return
     root = INSTALL_DIR / "plugin"
     if not root.exists():
@@ -388,7 +391,7 @@ def _fix_owners(log_path: Path) -> None:
         uid = INSTALL_DIR.stat().st_uid
         for child in [root, *root.rglob("*")]:
             if child.lstat().st_uid != uid:
-                os.chown(child, uid, -1, follow_symlinks=False)
+                chown(child, uid, -1, follow_symlinks=False)
         _append_log(log_path, "已把 plugin/ 的属主改回安装用户\n")
     except OSError as exc:
         _append_log(log_path, f"修正 plugin/ 属主失败：{exc}\n")
@@ -479,8 +482,12 @@ def apply(restart_service: bool = True, tag: str = "") -> dict:
                     base = update_cfg()["mirror"].rstrip("/")
                     info = {"tag": target, "sha256": "",
                             "tarball_url": f"{base}/deckmeido-{target}.tar.gz"}
-                # 覆盖式升级没有 git 兜底：先备份，覆盖过程中出错就整个盖回去
+                # 覆盖式升级没有 git 兜底：先备份。备份本身失败（返回 None）时
+                # 就不能再覆盖了——盖到一半出错没有任何东西可以盖回去
                 backup = backup or _backup(log_path)
+                if backup is None or not backup.exists():
+                    raise RuntimeError("升级前备份失败，为免目录被改坏已中止本次覆盖")
+                # 从这一步起文件才可能被改动，回滚判断从这里开始算
                 touched = True
                 _apply_mirror(info, log_path)
                 used = "mirror"
@@ -515,10 +522,17 @@ def apply(restart_service: bool = True, tag: str = "") -> dict:
         return {"ok": True, "restarted": False, "version": target,
                 "source": used, "message": f"代码已更新到 {target}，重启程序后生效"}
 
-    # 日志已在上面的 _append_log 里落过盘，这里只负责拉起升级流程
+    # 日志已在上面的 _append_log 里落过盘，这里只负责拉起升级流程。
+    # 用 /bin/sh 拉起会踩到 bash 专有语法（数组、进程替换），必须显式指定 bash；
+    # 系统里没有 bash 时退回 /bin/sh 只会得到一堆语法错误，所以找不到就不重启，
+    # 直接把「代码已更新，重启生效」告诉用户。
+    bash = shutil.which("bash")
+    if not bash:
+        return {"ok": True, "restarted": False, "version": target, "source": used,
+                "message": f"代码已更新到 {target}，但找不到 bash 来跑升级脚本，请手动重启程序"}
     with open(log_path, "ab") as log:
         subprocess.Popen(
-            ["bash", str(INSTALL_DIR / "install.sh"), "upgrade"],
+            [bash, str(INSTALL_DIR / "install.sh"), "upgrade"],
             cwd=str(INSTALL_DIR), stdout=log, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, start_new_session=True,
         )

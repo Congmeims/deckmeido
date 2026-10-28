@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import os
 import secrets
-import shutil
 import sys
 import threading
 import time
@@ -124,67 +123,54 @@ class SessionStore:
         self.write_session(sid or self.current_sid, hist)
         return True
 
-    def write_session(self, sid: str, hist: list[dict], allow_merge: bool = True) -> None:
+    def write_session(self, sid: str, hist: list[dict]) -> None:
         """原子写入一个会话文件。
 
-        allow_merge=True（默认）：磁盘历史明显比本次要写的多时，不是简单拒绝，
-        而是做「磁盘为底 + 追加内存里多出来的新消息」的单调合并。
-        单纯拒绝虽然保住了老数据，但活会话的新消息会永远存不进去——
-        每次重启都退回老历史，用户看到的是「回复错乱/内容反复」。
-        合并后两边都不丢：老历史保底，新消息按需追加。
+        磁盘历史比本次要写的多时怎么办？答案是照写。以前这里做「缩水写合并」：
+        用磁盘老历史做底、把内存里多出来的消息追加到末尾。它直接导致删不掉消息——
+        用户删掉会话里几条，落盘时历史条数减半，触发合并，磁盘上被删的那几条
+        又被拼了回来。合并还要求内存里至少有一条消息能在磁盘上找到锚点，
+        删得多一点（比如清空重开）就直接判成「无法合并」并保留磁盘内容，
+        于是界面上删干净了、重启后又全回来了。
+
+        内存里的 history 才是唯一真相：用户删除、编辑、重排都发生在它上面，
+        它写什么磁盘就存什么。真正需要防的只是「拿空历史覆盖掉有内容的文件」，
+        那是启动时序上的竞态，不是合并能解决的问题——留着那道空写保护即可。
         """
         with self.lock:
             if sid in self.deleted_sids:
                 # 会话已删除：迟到的落盘一律作废，否则等于把删掉的会话又变出来
                 return
-            write_hist = hist
             p = self.sess_path(sid)
             created = None
             old_n = 0
-            old_hist = None
+            old_hist: list[dict] = []
             if p.exists():
                 try:
                     old = json.loads(p.read_text(encoding="utf-8"))
                     created = old.get("created")
                     old_hist = old.get("history") or []
                     old_n = len(old_hist)
-                except Exception:
-                    pass
+                except Exception as e:
+                    # 解析失败不能当成「磁盘是空的」：下面的空写保护会因此失效，
+                    # 内存恰好为空时就把整份历史覆盖掉了。留档后照常写入新内容
+                    print(f"[DeckMeido] 会话 {sid} 读取失败（{e}），按新内容覆盖",
+                          file=sys.stderr)
+                    try:
+                        p.rename(p.with_name(f"{p.name}.broken-{int(time.time())}"))
+                    except OSError:
+                        pass
+                    created, old_n, old_hist = None, 0, []
 
-            new_n = len(hist)
-            # 内存为空 = 刚建的新会话，绝不能拿磁盘老历史来「补全」；
-            # 也绝不能让空内容覆盖磁盘。两种情况都是直接拒绝写入。
-            if allow_merge and new_n == 0 and old_n > 0:
+            # 内存为空 = 刚建的新会话 / 启动时序竞态，绝不能拿空内容覆盖磁盘
+            if not hist and old_n > 0:
                 print(f"[DeckMeido] 拒绝空写入：会话 {sid} 磁盘有 {old_n} 条，"
                       f"内存为空，保持磁盘内容不变", file=sys.stderr)
                 return
-            if allow_merge and old_n >= 6 and new_n < old_n / 2 and old_hist:
-                # 判为「缩水写」：留档 + 合并，而不是覆盖
-                stamp = time.strftime("%Y%m%d-%H%M%S")
-                bak = p.with_name(p.name + f".shrunk-{stamp}-{os.getpid()}")
-                try:
-                    shutil.copy2(p, bak)
-                except Exception:
-                    pass
-                merged, added = merge_histories(old_hist, hist)
-                if merged is not None:
-                    print(
-                        f"[DeckMeido] 缩水写已合并：会话 {sid} 磁盘 {old_n} 条 / 内存 {new_n} 条"
-                        f" → {len(merged)} 条（追加 {added} 条新消息），原文件留档 {bak.name}",
-                        file=sys.stderr,
-                    )
-                    write_hist = merged
-                else:
-                    print(
-                        f"[DeckMeido] 无法合并：会话 {sid} 磁盘 {old_n} 条 / 内存 {new_n} 条"
-                        f"，保留磁盘内容，原文件留档 {bak.name}",
-                        file=sys.stderr,
-                    )
-                    write_hist = old_hist
 
             data = {"id": sid, "created": created or time.time(), "updated": time.time(),
-                    "history": write_hist}
-            set_title(data, write_hist)
+                    "history": hist}
+            set_title(data, hist)
             # 压缩游标必须一起落盘：否则重启后模型重新吃到全量历史，
             # 白白撑爆上下文窗口，又要再压缩一遍
             comp = self.compact_for(sid)
@@ -214,7 +200,11 @@ class SessionStore:
             return {}
 
     def rewrite_session(self, sid: str, data: dict) -> None:
-        """把改过的会话 dict 原子写回（锁内调用方已持有锁也可以）"""
+        """把改过的会话 dict 原子写回（锁内调用方已持有锁也可以）
+
+        写失败不吞掉：调用方（清 _streaming、改标题）需要知道没写成功，
+        否则会以为已经落盘，下次启动又恢复出重复内容。
+        """
         p = self.sess_path(sid)
         tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
         try:
@@ -225,6 +215,7 @@ class SessionStore:
                 tmp.unlink()
             except OSError:
                 pass
+            raise
 
 
 store = SessionStore()
@@ -240,41 +231,3 @@ def set_title(data: dict, hist: list[dict]) -> None:
         data["title"] = str(first_user).strip().replace("\n", " ")[:24]
     else:
         data["title"] = "新会话 " + time.strftime("%H:%M", time.localtime(data.get("created") or time.time()))
-
-
-def merge_histories(old_hist: list[dict], new_hist: list[dict]):
-    """把「内存里的新消息」追加到「磁盘上的老历史」后面，返回 (合并结果, 新增条数)。
-
-    判定新旧的依据是消息指纹——(role, content 前 200 字)。内存里的消息如果
-    磁盘上已经有了就跳过；没有的则按顺序补在末尾。
-    无法判定（比如内存里的消息在磁盘上找不到任何锚点）时返回 (None, 0)，
-    让调用方保守地保留磁盘内容。
-    """
-    def fp(m):
-        return (m.get("role"), str(m.get("content") or "")[:200])
-
-    old_fps = [fp(m) for m in old_hist]
-    old_set = set(old_fps)
-    new_fps = [fp(m) for m in new_hist]
-
-    # 内存里的消息必须有一条能在磁盘上找到，否则说明这两份根本不是同一条时间线，
-    # 强行拼接只会把历史搅乱（用户看到的「回复错乱」就是这么来的）
-    anchor = None
-    for i, f in enumerate(new_fps):
-        if f in old_set:
-            anchor = i
-    if anchor is None:
-        return None, 0
-
-    # 锚点之后的消息视为「新增」，按指纹去重后追加
-    added = []
-    seen = set()
-    for m in new_hist[anchor + 1:]:
-        f = fp(m)
-        if f in old_set or f in seen:
-            continue
-        seen.add(f)
-        added.append(m)
-    if not added:
-        return old_hist, 0
-    return old_hist + added, len(added)

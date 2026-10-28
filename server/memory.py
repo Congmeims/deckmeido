@@ -40,6 +40,25 @@ def _used_of(it: dict) -> float:
     return max(it.get("used") or 0.0, _USED.get(it.get("id") or "", 0.0))
 
 
+def _persist_used(data: dict) -> bool:
+    """把内存里的「最近注入时间」合进要写盘的 data（调用方持有 _lock）
+
+    返回是否有变化。以前 mark_used 只写 _USED，而 _save 从不把它合进 data，
+    于是淘汰时「按最近使用保留」形同虚设：磁盘上的 used 永远是 0，
+    120 条一满就按创建时间砍，常用的老条目照样被丢掉。
+    """
+    changed = False
+    with _used_lock:
+        if not _USED:
+            return False
+        for it in data.get("items") or []:
+            u = _USED.get(it.get("id") or "")
+            if u and u > (it.get("used") or 0):
+                it["used"] = u
+                changed = True
+    return changed
+
+
 def _empty() -> dict:
     return {"items": [], "updated": 0.0}
 
@@ -71,7 +90,12 @@ def load() -> dict:
 
 
 def _save(data: dict) -> None:
-    """原子写：先写临时文件再替换，断电/杀进程不会留下半截 JSON"""
+    """原子写：先写临时文件再替换，断电/杀进程不会留下半截 JSON
+
+    写入前一律把内存里的 used 合进来：删除/编辑/清空这些路径也顺带把
+    「最近用过哪些」落到磁盘，不必为它单独多写一次文件。
+    """
+    _persist_used(data)
     data["updated"] = time.time()
     tmp = MEMORY_PATH.with_suffix(f".json.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -105,7 +129,10 @@ def add(kind: str, text: str) -> dict:
         item = {"id": _new_id(), "kind": kind, "text": text,
                 "created": time.time(), "used": 0.0}
         data["items"].append(item)
-        # 超上限时丢最早创建的那些（之前会话里注入过的优先保留）
+        # 先合入内存里记的「最近注入时间」，再按它淘汰 —— 否则排序键全是 0，
+        # 常用的老条目和从没被用过的条目排在一起，被砍掉的可能正是最该留的
+        _persist_used(data)
+        # 超上限时丢最久没用过的那些（之前会话里注入过的优先保留）
         if len(data["items"]) > MAX_ITEMS:
             data["items"].sort(key=lambda x: (_used_of(x), x["created"]), reverse=True)
             data["items"] = data["items"][:MAX_ITEMS]

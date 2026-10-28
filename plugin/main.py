@@ -66,6 +66,19 @@ def _find_install_dir() -> Path:
 INSTALL_DIR = _find_install_dir()
 CONFIG_PATH = INSTALL_DIR / "server" / "config.toml"
 
+
+def _workspace() -> str:
+    """这一轮的工作区：配置里的 [workspace].dir，和网页设置页那一项同源
+
+    以前写死 /home/deck，装到别处或别的用户下时后端会把工作区边界判到一个
+    不存在（或无权限）的目录上，工具全部报错。没配就不发，让后端用自己的默认值。
+    """
+    try:
+        cfg = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return str((cfg.get("workspace") or {}).get("dir") or "").strip()
+    except Exception:
+        return ""
+
 # 面板底部显示版本号：优先用后端 config 里报的版本（和网页设置页一致），
 # 后端连不上时退回插件自己的 package.json
 _PLUGIN_VERSION = "0.2.0"
@@ -1344,6 +1357,11 @@ _READER: asyncio.Task | None = None
 _ACC = ""            # 本轮已收到的增量正文
 _LAST_REPLY = ""     # 本轮确定下来的完整正文
 _FINAL_EVENT = asyncio.Event()
+# 本端这一轮是否正在跑
+_STREAM_RUNNING = False
+# 本端这一轮从发起到收尾的锁：连着点两次「发送」会各发一条 chat，
+# 两条流共用 _ACC 和 _FINAL_EVENT，正文会串成一团
+_TURN_LOCK = asyncio.Lock()
 # 面板展示的对话：所有端的提问和回复，{role, text, client, ts}
 _THREAD: list[dict] = []
 # 面板只显示最近这么多条：QAM 里挂着几百条会把滚动拖卡。
@@ -1486,10 +1504,17 @@ def _finalize(cancelled: bool = False):
     带完整正文的（没有正文的一轮后端压根不发）。status.running 不能当收尾依据：
     current_task 在回复广播之前就被置空，那一刻正文还没到。
     """
-    global _LAST_REPLY
+    global _LAST_REPLY, _STREAM_RUNNING
+    # 同一轮可能被两条路径冻结（正常收尾一条，连接断开兜底一条）：
+    # 已经冻结过就别重复发 final，也别再动锁
+    if _FINAL_EVENT.is_set():
+        return
     _LAST_REPLY = _ACC
+    _STREAM_RUNNING = False
     _emit({"kind": "final", "text": _ACC, "cancelled": cancelled})
     _FINAL_EVENT.set()
+    if _TURN_LOCK.locked():
+        _TURN_LOCK.release()
 
 
 async def _read_loop(bk: _Backend):
@@ -1497,8 +1522,14 @@ async def _read_loop(bk: _Backend):
 
     后端把用户提问和助手回复广播给每一条 ws 连接，所以这里能拿到别的端的对话。
     本端发出去的那一轮还要额外走 delta / final，把那几十秒的流式过程显示出来。
+
+    连接断了要自己接回来：以前这里直接 return，读任务结束但 _BACKEND 还挂着，
+    下次 _ensure_backend 看见「_READER 已结束」会重连，可在那之前面板上所有端
+    的消息都静默丢失。现在断线后原地退避重连，重连上立刻重新拉一次 history
+    对齐，并把本端没等到收尾的那一轮标成中断（它的 final 永远等不到了）。
     """
-    global _ACC
+    global _ACC, _BACKEND, _STREAM_RUNNING
+    delay = 1.0
     while True:
         try:
             raw = await bk.recv()
@@ -1506,7 +1537,23 @@ async def _read_loop(bk: _Backend):
             raise
         except Exception as exc:
             decky.logger.info(f"后端连接断开：{exc}")
-            return
+            # 本端这一轮还在等答复：收尾消息随连接一起丢了，_FINAL_EVENT 永远
+            # 不会 set。不在这里冻结的话，面板会一直显示「正在思考」
+            if bk.turn and not _FINAL_EVENT.is_set():
+                _finalize(cancelled=True)
+            await bk.close()
+            if bk is not _BACKEND:
+                # 已经被 _drop_backend 换掉了（取消、退出），不要接回来
+                return
+            _BACKEND = None
+            _STREAM_RUNNING = False
+            new = await _reconnect(delay)
+            if new is None:
+                delay = min(delay * 2, 30.0)
+                continue
+            delay = 1.0
+            bk = new
+            continue
         try:
             msg = json.loads(raw)
         except Exception:
@@ -1520,7 +1567,10 @@ async def _read_loop(bk: _Backend):
             continue
         if typ == "status":
             # 状态广播不带 sid（它在改配置时也会发），所以放在 sid 过滤之前
-            _emit({"kind": "status", "running": bool((msg.get("data") or {}).get("running"))})
+            run = bool((msg.get("data") or {}).get("running"))
+            # 记下来：重连/换到别的端开会话时，前端靠它决定要不要弹「正在思考」
+            _STREAM_RUNNING = run
+            _emit({"kind": "status", "running": run})
             continue
         if typ == "user_message":
             item = {
@@ -1545,9 +1595,10 @@ async def _read_loop(bk: _Backend):
         if typ == "assistant_message":
             # 助手消息现在也带来源（后端按同一轮的提问打标）；老数据没有这个字段，
             # 退回「最近一条 user 的 client」来归户
+            text = str(msg.get("text") or "")
             _push_thread({
                 "role": "assistant",
-                "text": str(msg.get("text") or ""),
+                "text": text,
                 "client": str(msg.get("client") or _nearby_client()),
                 "ts": float(msg.get("ts") or 0),
             })
@@ -1555,11 +1606,11 @@ async def _read_loop(bk: _Backend):
                 continue
             if msg.get("cancelled"):
                 # 用户点了终止：已生成的部分比「已终止当前操作」有用，保留它
-                _ACC = _ACC or str(msg.get("text") or "已终止当前操作")
+                _ACC = _ACC or text or "已终止当前操作"
                 _finalize(cancelled=True)
             else:
                 # 唯一带完整正文的收尾消息
-                _ACC = str(msg.get("text") or _ACC)
+                _ACC = text or _ACC
                 _finalize()
             continue
         if not mine:
@@ -1584,6 +1635,38 @@ def _nearby_client() -> str:
         if m.get("role") == "user":
             return str(m.get("client") or "")
     return ""
+
+
+async def _connect_backend() -> _Backend:
+    """按当前配置建一条新连接（不登记，调用方自己决定挂到哪）"""
+    cfg = _load_server_cfg()
+    port = int(cfg.get("port", 18765))
+    token = str(cfg.get("token", "") or "").strip().lower()
+    bk = _Backend(_backend_url(port, token))
+    await bk.open()
+    return bk
+
+
+async def _reconnect(delay: float) -> _Backend | None:
+    """重连一次：先退避再试，成功就重新拉一份 history 对齐面板
+
+    只在读循环里调用。失败返回 None，由调用方继续退避。
+    """
+    global _BACKEND
+    await asyncio.sleep(delay)
+    try:
+        bk = await _connect_backend()
+    except Exception as exc:
+        decky.logger.info(f"重连后端失败：{exc}")
+        return None
+    _BACKEND = bk
+    decky.logger.info(f"后端已重连：{bk.sockname()}")
+    # 断线期间别的端可能说过话，补一份完整历史
+    try:
+        await bk.send({"type": "history"})
+    except Exception as exc:
+        decky.logger.info(f"重连后拉 history 失败：{exc}")
+    return bk
 
 
 async def _ensure_backend() -> tuple[_Backend | None, str]:
@@ -1806,6 +1889,9 @@ class Plugin:
             _emit(_LAST_THREAD)
         elif _THREAD:
             _emit({"kind": "thread", "items": _THREAD})
+        # 面板重开时后端可能正在跑一轮（别端发起的）：状态得补一次，
+        # 否则界面上什么提示都没有，用户会以为卡住了
+        _emit({"kind": "status", "running": _STREAM_RUNNING})
         return {"ok": True}
 
     async def start_backend(self, ticket: str = "") -> dict:
@@ -1972,10 +2058,14 @@ class Plugin:
         """
         decky.logger.info(f"start_turn 被调用：{len(text or '')} 字，图 {shot or '(无)'}")
         _require(ticket, "start_turn")
-        global _ACC, _LAST_REPLY
+        global _ACC, _LAST_REPLY, _STREAM_RUNNING
         text = str(text or "").strip()
         if not text:
             return {"ok": False, "error": "问题是空的"}
+        if _TURN_LOCK.locked():
+            # 上一轮还在跑：面板上连点两下发送就会走到这里。不拦住的话两条流
+            # 共用 _ACC/_FINAL_EVENT，正文会混在一起
+            return {"ok": False, "error": "上一轮还没结束，先等它或者点终止"}
 
         image = ""
         if shot:
@@ -1993,9 +2083,11 @@ class Plugin:
         bk, why = await _ensure_backend()
         if not bk:
             return {"ok": False, "error": why}
+        await _TURN_LOCK.acquire()
         _ACC = ""
         _LAST_REPLY = ""
         _FINAL_EVENT.clear()
+        _STREAM_RUNNING = True
         # 本轮 turn_id：由本端生成，_read_loop 靠它把 δ 和 final 认出来。
         # 同一时刻只允许一轮，所以发之前先把它记在连接上
         bk.turn = f"qam-{os.urandom(6).hex()}"
@@ -2006,13 +2098,18 @@ class Plugin:
         if image:
             payload["image"] = image
             payload["image_prompt"] = "（这是当前游戏画面，结合画面回答用户的问题）"
-        payload["workspace"] = "/home/deck"
+        ws = _workspace()
+        if ws:
+            payload["workspace"] = ws
         sock = bk.sockname()
         decky.logger.info(f"start_turn：正文 {len(text)} 字，图 {len(image)} 字符，经 {sock} 发出")
         try:
             await bk.send(payload)
         except Exception as exc:
             decky.logger.error(f"start_turn 发送失败：{exc}")
+            # 没发出去就没有这一轮，锁要还回去，否则面板从此永远「上一轮没结束」
+            _TURN_LOCK.release()
+            _STREAM_RUNNING = False
             return {"ok": False, "error": f"发不出去：{exc}"}
         decky.logger.info("start_turn：已发出")
         # 提问不等后端回声，先在面板上落一条：后端广播回来时会按 ts 去重，
@@ -2029,18 +2126,24 @@ class Plugin:
         try:
             await asyncio.wait_for(_FINAL_EVENT.wait(), timeout=timeout)
         except asyncio.TimeoutError:
+            # 等了这么久还没收尾：把锁还回去，否则之后每一轮都报「上一轮没结束」
+            _finalize(cancelled=True)
             return {"ok": False, "error": f"等了 {timeout:.0f}s 还没有答复"}
         return {"ok": True, "text": _LAST_REPLY}
 
     async def cancel(self, ticket: str = "") -> dict:
-        """掐掉这一轮：断开的后端连接会让那边 CancelledError，
-        再补一次 /api/cancel，把子进程树一起收掉"""
+        """掐掉这一轮：直接调后端的 /api/cancel，连接保持不动
+
+        以前这里先 _drop_backend() 再发请求，等于每次终止都把 ws 拆掉：
+        拆掉的后果是全端广播断档、读循环退出、下一轮又要重连一次；而且面板还
+        要自己补一句「已中断」，和后端回的「已终止当前操作」叠成两句。
+        现在只发 HTTP 终止请求，收尾交给后端广播（它会带 cancelled=True 的
+        assistant_message），连接一直活着。
+        """
         _require(ticket, "cancel")
-        global _ACC
         cfg = _load_server_cfg()
         port = int(cfg.get("port", 18765))
         token = str(cfg.get("token", "") or "")
-        await _drop_backend()
         err = ""
         writer = None
         try:
@@ -2067,10 +2170,11 @@ class Plugin:
                     await writer.wait_closed()
                 except Exception:
                     pass
-        _ACC += "\n（已中断）" if _ACC else "已中断"
-        _finalize(cancelled=True)
         if err:
+            # 终止请求没送到（后端挂了）：连接上的收尾消息也等不到了，
+            # 就地冻结，别让面板一直转圈
             decky.logger.warning(f"/api/cancel 失败：{err}")
+            _finalize(cancelled=True)
         return {"ok": not err, "error": err}
 
     async def _main(self):
