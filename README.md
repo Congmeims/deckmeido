@@ -13,7 +13,9 @@
   <a href="#功能">功能</a> ·
   <a href="#实现逻辑">实现逻辑</a> ·
   <a href="#快速开始">快速开始</a> ·
-  <a href="#配置">配置</a>
+  <a href="#版本与升级">版本与升级</a> ·
+  <a href="#配置">配置</a> ·
+  <a href="#待办">待办</a>
 </p>
 
 ---
@@ -36,6 +38,7 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 - **上下文徽标**：顶栏实时显示 `已用 tokens / 窗口大小 / 百分比`，窗口大小按模型名自动推断（Gemini 1M、Claude 200k、DeepSeek 128k……），也可在配置里写死
 - **任意 OpenAI 兼容后端**：GPT、Claude（中转）、DeepSeek、Qwen、GLM、Kimi、LM Studio 本地模型都能接
 - **历史持久化**：助手回复连同工具事件时间线一起落盘，刷新网页不会丢失操作记录
+- **长期记忆（可教学）**：跨会话保留「关于主人」的条目，分用户画像 / 环境经验 / 知识条目三类。对话里说「记住…」她自己存；纠正她的做法（「不对，应该…」）也会存；设置页可以逐条查看、新增、改、删、清空
 
 ### 设备控制
 
@@ -58,8 +61,10 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 - **发起来源标注**：同一条对话里每条用户消息都带来源角标——`本端` / `网页` / `手机` / `客户端` / `QAM`。手机浏览器按 UA 自动识别，无需手动设置；没标来源的老消息不显示角标
 - **控件自检三态**：绿灯可用 / 红灯故障 / 灰灯「当前环境不适用」（如游戏模式下没有 KWin，`kdotool` 不再误报红灯）。灯色只统计真正需要工作的控件，游戏模式下显示为 `x/5` 而非 `x/6`
 - **权限三档**（作用于 `run_command`）：`manual` 每条命令都审批 / `auto` 只读自动、命中危险特征才确认 / `full` 完全放行。`write_file` / `edit_file` 不受此开关约束，任何模式下都直接落盘；`install_game` 与 `self_update upgrade` 无论模式如何都强制确认
-- **语音播报**：调用 Deck 内置 TTS，在掌机扬声器上念出回复
+- **语音播报**：调用 Deck 内置 TTS，在掌机扬声器上念出回复；网页设置页与 QAM 面板的开关同步（`POST /api/tts` 热更新，不用重启）
+- **实时画面**：游戏模式下网页端可边下边播当前画面（gamescope 抓帧 → H.264 硬编 → 分片 MP4），面板可拖动缩放
 - **图片上传**：拖拽或点击上传，服务端按类型分类存储
+- **文件下载卡片**：回复里的工作区文件路径渲染成带大小与下载按钮的卡片（`/files/<相对路径>`，带令牌校验，只能下载工作区内的文件）
 - **分享为图片**：多选任意回合，勾选后生成长图，自动剔除思维链
 - **深浅双主题**：所有组件（含代码块、滚动条、遮罩）都跟着主题切换，浅色模式下不会出现"黑块"
 - **原生客户端**：1.2 倍缩放适配 800p 屏幕，最小化到托盘，单击托盘图标恢复
@@ -104,9 +109,15 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 
 **启动常驻程序不阻塞。** `flatpak run com.google.Chrome` 这类命令的进程不会退出，早期实现会一直等到 60s 超时。现在识别启动器类命令（flatpak / snap / steam / chrome / firefox / mpv / xdg-open 等，且无管道、分号、重定向），最多等 3 秒：命令自行退出就返回真实输出，仍在运行就判定为常驻程序，放它继续跑并立刻返回"已在后台启动"。
 
-**思维链可见。** 多数服务商只有在请求里带 `reasoning_effort` 时才返回 `reasoning_content`。配置默认 `high`，前端在 `thought_end` 之后不自动折叠，思考内容可以一直回看。
+**思维链可见。** 多数服务商只有在请求里带 `reasoning_effort` 时才返回 `reasoning_content`。配置默认 `high`，前端在 `thought_end` 之后不自动折叠，思考内容可以一直回看。DeepSeek 的思考默认就开着，同一个 `reasoning_effort` 它只认 `high` / `max`（`low`、`medium` 会被它映射成 `high`）。
 
 **上下文压缩而非丢弃。** 到阈值时不是简单砍掉老消息，而是让模型写一份摘要（保留目标、偏好、已完成操作、待办、关键路径），用一条 system 消息顶替前面的对话，再拼上最近几轮原文。长任务不会因为跨度大而"失忆"。
+
+**DeepSeek 前缀缓存友好。** 默认后端就是 DeepSeek，几处细节专门为它的"硬盘缓存"（命中部分按更低的单价计费）让步：历史只追加、压缩只推进游标（发出去的前缀每轮都一样）、工具结果统一以 `[工具名]` 开头、历史里的旧画面换成一段固定文案不再重发 base64、请求带固定 `user_id` 让这台 Deck 的历史始终落在同一个 KVCache 分桶里。命中情况会打在日志里，鼠标悬停顶栏的上下文徽标也能看到命中率和距上次请求的闲置时长——命中率掉下来通常就是前缀被打断了（换了人设、切了会话、放太久缓存过期）。
+
+**长期记忆是显式教学，不是后台自学。** 只有两种来源：模型主动调 `remember` 工具（对话里明确说「记住」或纠正做法时），以及设置页里手动写。没有后台定时总结、没有把整段对话自动抽成记忆——那样长任务跑几轮就会把上下文塞满噪声。条目存在 `server/memory.json`，去重按「忽略空白与标点」比较，超过 120 条时按「最近被用到 + 最近创建」淘汰。
+
+**记忆段拼在 system prompt 最末尾。** 这是为 DeepSeek 前缀缓存让路：如果记忆插在规则中间，增删一条就会让后面的全部前缀失效，下一轮整段重算。放在最后，改动只影响尾部。每轮对话都重新读一次，所以刚说完「记住」这一轮之后就能生效。
 
 **Web 与客户端同源。** 客户端不复制界面，直接用 QWebEngineView 加载 `http://127.0.0.1:18765/?native=1`。改一处 HTML，两端同步更新；`native=1` 只用来把"点开图片"这类行为切到系统默认程序。
 
@@ -132,11 +143,29 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 git clone https://github.com/Congmeims/deckmeido.git && cd deckmeido && bash install.sh
 ```
 
-脚本会：建虚拟环境 → 装依赖（含 PySide6）→ 生成配置 → 清理旧的 `deckmeido.service` 与占用端口的残留后端 → 装好应用菜单与桌面快捷方式 → 自动启动客户端（后端由客户端拉起），最后打印带令牌的访问地址。
+GitHub 连不上（或太慢）时走国内镜像站，装的是同一份代码：
+
+```bash
+# 有 install.sh 时（比如已经从别处拿到脚本）
+bash install.sh from-mirror
+
+# 什么都没有时：先取一份脚本，再让它去镜像站拉最新版
+curl -fsSL -o /tmp/dm.sh https://meido.meagames.cn/deckmeido/install.sh
+bash /tmp/dm.sh from-mirror
+```
+
+镜像站也可以直接下包手动安装（地址里带版本号，换版本要改文件名）：
+
+```bash
+curl -fLO https://meido.meagames.cn/deckmeido/deckmeido-0.2.0.tar.gz
+tar -xzf deckmeido-0.2.0.tar.gz && cd deckmeido-0.2.0 && bash install.sh
+```
+
+脚本会：建虚拟环境 → 装依赖（含 PySide6，pip 自动挑最快的国内源，装失败自动换源）→ 生成配置 → 清理旧的 `deckmeido.service` 与占用端口的残留后端 → 装好应用菜单与桌面快捷方式 → 自动启动客户端（后端由客户端拉起），最后打印带令牌的访问地址。
 
 **不要用 `sudo` / root 执行。** 程序装到当前用户家目录（默认 `~/deckmeido`），用 root 装会落到 `/root` 下，桌面会话里起不来。脚本检测到 root 会直接退出。
 
-不想用 git 的话，直接下载 Release 里的包。资产文件名带版本号，所以链接里必须写具体版本号，换版本就要改文件名（`releases/latest/download/...` 里同样得写带版本的文件名，写错会 404）：
+GitHub Release 里也有同样的包，文件名带版本号，所以链接里必须写具体版本号：
 
 ```bash
 curl -fLO https://github.com/Congmeims/deckmeido/releases/download/v0.2.0/deckmeido-0.2.0.tar.gz
@@ -151,10 +180,17 @@ sha256sum -c SHA256SUMS --ignore-missing
 
 包里的 `RELEASE-NOTES.md` 是这一版相对上一版改了什么。
 
+Release 包里还带 `deploy/deps/` 离线依赖包（`pacman -U` 本地装，装不上再回退联网），同目录的 `install.sh` 会优先用它。离线包不进仓库，发版前在 Deck 上跑一次 `tools/fetch_offline_deps.sh` 刷新。
+
+### 常用命令
+
 ```bash
-bash install.sh upgrade      # 升级：同步代码 + 依赖，保留配置与会话
-bash install.sh check        # 自检：逐个实测控制类控件是否真的能用
-bash ~/deckmeido/uninstall.sh        # 卸载：先取消正在跑的任务，停服务、删快捷方式，保留配置与工作区
+bash install.sh upgrade             # 升级：同步代码 + 依赖，保留配置与会话
+bash install.sh upgrade --deps      # 升级后顺带检查并安装控制类插件
+bash install.sh from-mirror         # 从镜像站拉最新版覆盖安装
+bash install.sh check               # 自检：逐个实测控制类控件是否真的能用
+bash install.sh install --deps      # 安装时直接装控制类插件，不再询问
+bash ~/deckmeido/uninstall.sh           # 卸载：先取消正在跑的任务，停服务、删快捷方式，保留配置与工作区
 bash ~/deckmeido/uninstall.sh --purge   # 连配置与工作区一起删
 ```
 
@@ -164,18 +200,57 @@ bash ~/deckmeido/uninstall.sh --purge   # 连配置与工作区一起删
 
 设置页底部显示当前版本号（安装时由 `install.sh` 写入安装目录的 `VERSION`），旁边有「检查更新」：
 
-- **检查更新**：向 GitHub 查询最新 release，比当前版本新就提示，并出现「立即升级」
-- **立即升级**：先把本地改动 `git stash`，再 `git fetch --tags` + `git checkout <tag>` 切到新版，然后后台执行 `install.sh upgrade`（同步代码、装依赖、重启后端）。任何一步失败都会自动回滚到升级前的 commit，并把回滚命令写进 `update.log`。配置、会话、工作区都会保留
+- **更新源**：默认「国内镜像优先，镜像不通时用 GitHub」，也可以选只用其中一个。镜像站是纯静态目录，升级时下载 `deckmeido-<版本>.tar.gz` 覆盖文件并核对 sha256，**不需要 git**
+- **检查更新**：向当前源查询最新版本，比当前版本新就提示，并出现「立即升级」
+- **立即升级**：镜像源先打包一份 `update-backup-*.tar.gz`，再下载新版覆盖并核对 sha256，中途出错整个盖回去，成功后删掉备份；GitHub 源则先把本地改动 `git stash`，再 `git fetch --tags` + `git checkout <tag>`，失败回滚到升级前的 commit。之后后台执行 `install.sh upgrade`（同步代码、装依赖、重启后端）。当前源失败会自动切到另一个源，两个都失败才报错。全过程写进 `update.log`，配置、会话、工作区都会保留
 
 升级前会先关掉客户端再停后端，避免旧客户端在升级过程中把旧后端拉回来；升级后新进程的 `/api/version` 报出新版本号才算成功。
 
-通过 release tar 包安装的目录没有 `.git`，上面的自动升级用不了，升级按钮会提示不适用：重新下载新包覆盖安装即可（`bash install.sh` 会清理新版本里已不存在的旧文件，配置、会话、工作区不受影响）。也可以在终端里手动升级：
+不管装的时候用 git 还是 tar 包，上面两条升级都能用。也可以在终端里手动升级：
 
 ```bash
+bash ~/deckmeido/install.sh from-mirror     # 从镜像站拉最新版覆盖
+# 或者 git 安装时切到指定版本
 cd ~/deckmeido && git fetch --tags && git checkout v0.2.0 && bash install.sh upgrade
 ```
 
+### 发布到镜像站
+
+`bash tools/make_release.sh v0.2.0` 会产出 `dist/` 下的 tarball、`.sha256`、`SHA256SUMS`、`latest.json` 和 `install.sh`，按原样 rsync 到镜像目录即可（客户端读 `latest.json` 判断有没有新版）：
+
+```bash
+bash tools/make_release.sh v0.2.0
+rsync -av dist/latest.json dist/SHA256SUMS dist/install.sh dist/deckmeido-0.2.0.tar.gz* \
+      user@meido.meagames.cn:/var/www/deckmeido/
+```
+
+GitHub Release 照旧单独发一份，两边版本号保持一致，用户无论走哪个源都能升到同一版。
+
+镜像目录就是一个普通静态目录，nginx 最简配置（纯 GET，不需要任何后端）：
+
+```nginx
+location /deckmeido/ {
+    alias /var/www/deckmeido/;
+    autoindex off;
+    sendfile on;
+    tcp_nopush on;
+    limit_conn addr 2;          # 单 IP 最多 2 条并发，避免一个人占满带宽
+    add_header Cache-Control "no-cache";   # latest.json 必须能立刻看到新版
+}
+
+# latest.json / .sha256 都是几 KB，但会被反复拉，短缓存减少请求
+location ~* /deckmeido/.*\.(json|sha256)$ {
+    alias /var/www/deckmeido/;   # 实际按需改成 alias + try_files
+    add_header Cache-Control "max-age=60";
+}
+```
+
+`latest.json` 不能被 CDN 长时间缓存（`max-age` 超过几分钟），否则客户端会一直以为没有新版。
+
+带宽只影响下载时长，不影响正确性：代码包只有几 MB，500KB/s 下单个客户端约十几秒；PySide6 等 pip 依赖走的是国内 pip 源，不经过镜像站。**不要把 `deploy/deps/` 的 pacman 离线包传到镜像站**——那是几十上百 MB，会把这台小带宽机器直接压满，留在 GitHub Release 里就好。
+
 自定义位置与端口：`DECKMEIDO_DIR=~/apps/deckmeido DECKMEIDO_PORT=18765 bash install.sh`
+换镜像地址：`DECKMEIDO_MIRROR=https://example.com/deckmeido bash install.sh`（会写进配置，之后升级也走它）
 
 默认不安装 systemd 开机自启：后端由客户端（桌面快捷方式）拉起，退出时一并收走，避免两份后端抢同一端口导致历史不一致。需要后端常驻时再手动生成单元：
 
@@ -196,25 +271,28 @@ systemctl --user daemon-reload && systemctl --user enable --now deckmeido.servic
 
 ```bash
 .venv/bin/python -m uvicorn server.main:app --host 0.0.0.0 --port 18765
-.venv/bin/python client/main.py     # 原生客户端
+client/launch.sh                    # 原生客户端（带守护，崩溃后自动重启）
 ```
+
+`launch.sh` 会反复拉起 `client/main.py`，并把 C 层崩溃栈写进 `server/client-crash.log`（`faulthandler`）。排查问题时用 `CLIENT_CRASH_RELAUNCH=0 client/launch.sh` 关掉自动重启。
 
 ## 配置
 
 | 段落 | 键 | 说明 |
 | --- | --- | --- |
 | `[server]` | `port` / `token` | 监听端口；访问令牌，默认 `meido`，留空则自动生成 |
-| `[llm]` | `base_url` / `api_key` / `model` | OpenAI 兼容接口 |
-| | `reasoning_effort` | `low` / `medium` / `high`，留空则不发送 |
+| `[llm]` | `base_url` / `api_key` / `model` | OpenAI 兼容接口；默认 DeepSeek（`https://api.deepseek.com` + `deepseek-chat`，地址不用带 `/v1`） |
+| | `reasoning_effort` | `high` / `max`，留空则走后端默认（DeepSeek 默认开思考）。OpenAI 系同样发送 `reasoning_effort` |
 | | `timeout` / `max_output_tokens` | 请求超时秒数；单次输出上限，`0` 表示用满上下文剩余空间 |
 | | `max_continuations` | 撞到输出上限时自动续写轮数，默认 3 |
 | `[agent]` | `max_tool_rounds` | 单轮最多连续调用工具次数，默认 `0` = 不限 |
 | | `context_window` | 窗口大小，`0` 表示按模型名推断 |
 | | `compact_ratio` | 触发压缩的占用比例，默认 0.95 |
+| | `compact_target_left` | 压缩后保留最近原文的比例，默认 0.3 |
+| | `ask_template` | 「截屏询问」的提示词模板，可在网页「设置」里改 |
 | `[power]` | `keep_awake` | 执行命令或显示遮罩时阻止息屏与休眠，默认 `true`（游戏模式不干预） |
-| `[persona]` | `name` / `traits` / `extra` | 人格名称与性格描述。日常改人设请用网页「设置 → 女仆的人设」，这几项是由那里写入的 |
-| `[persona.style]` | `address` / `tone` | 怎么称呼用户；语气描述。同样是设置页在写 |
-| | `ending` / `suffix` / `forbid` | 句尾习惯；落款；禁用词句列表（逗号分隔） |
+| `[update]` | `source` | 更新源：`mirror` / `github` / `mirror-only` / `github-only`，设置页「关于」可改 |
+| | `mirror` / `github_repo` | 镜像站目录（默认 `https://meido.meagames.cn/deckmeido`）；GitHub 仓库 |
 | `[tts]` | `enable` / `engine` / `voice` | 语音播报开关（默认 `false`）与引擎、语言 |
 | | `speed` / `max_chars` | 语速（词/分钟，默认 170）；单次播报最长字符数（默认 300） |
 | `[security]` | `permission_mode` | `manual` / `auto` / `full` |
@@ -222,11 +300,22 @@ systemctl --user daemon-reload && systemctl --user enable --now deckmeido.servic
 
 上表这些项都能在网页「设置」里改，保存即时生效，一般不需要手改文件。配置文件位置：安装目录下的 `server/config.toml`（首次启动自动生成）。
 
+人设与长期记忆不在 `config.toml` 里，各自单独成文件，放在同一目录（`server/`）下：
+
+| 文件 | 内容 | 说明 |
+|---|---|---|
+| `meidosoul.json` | 人设（女仆的灵魂） | 名字、性格、称呼、语气、禁用词。网页「设置 → 人设」写入，改完即时生效 |
+| `memory.json` | 长期记忆 | 用户画像 / 环境经验 / 知识条目三类，网页「设置 → 记忆」或对话里教学写入 |
+
+网页「设置 → 记忆 → 备份」可以把这两个文件的内容导出成一个 `meidosoul.json`，换机器或重装后再导入即可。旧版本的 `config.toml` 里如果有 `[persona]` 段，首次启动会自动搬到 `meidosoul.json`。
+
+`~/.config/deckmeido/` 是另一回事，只放安装脚本自己的状态（`.deps-build-id`、`.deps-offline`），不含配置。
+
 ## 目录结构
 
 ```
 deckmeido/
-├── install.sh                 一键安装 / 升级 / 卸载
+├── install.sh                 一键安装 / 升级 / 卸载 / 镜像安装 / 自检
 ├── VERSION                    安装时写入的版本号（设置页与升级检查读它）
 ├── uninstall.sh               安装时生成的卸载入口
 ├── requirements.txt           Python 依赖
@@ -234,19 +323,29 @@ deckmeido/
 │   ├── logo.png               应用图标（桌面快捷方式、托盘、遮罩、网页 favicon）
 │   └── icon-src/              图标 SVG 源文件
 ├── client/main.py             PySide6 原生客户端（含托盘、单实例）
+├── client/launch.sh           客户端守护脚本（崩溃/切模式后自动重启）
+├── plugin/                    Decky 插件（QAM 面板：对话、截屏询问、虚拟手柄）
+│   ├── deploy.sh              检测 Decky 与控制用户插件目录
+│   ├── main.py                插件后端（鉴权、抓帧、手柄、攻略流程）
+│   └── src/index.tsx          QAM 面板前端
 ├── deploy/
 │   ├── deckmeido.service      旧版 systemd 单元（现在默认不安装，仅供手动启用）
-│   └── DeckMeido.desktop      桌面快捷方式模板
+│   ├── DeckMeido.desktop      桌面快捷方式模板
+│   └── deps/                  离线 pacman 包（不进仓库，发版前用工具脚本刷新）
 ├── server/
-│   ├── main.py                FastAPI 服务、会话、approval、遮罩调度
+│   ├── main.py                FastAPI 服务、agent 循环、approval、遮罩调度
+│   ├── session_store.py       会话状态与落盘（store 单例、原子写、压缩游标）
 │   ├── llm.py                 OpenAI 兼容流式客户端
+│   ├── memory.py              长期记忆存储（memory.json：三类条目、去重、淘汰）
+│   ├── persona.py             人设存储（meidosoul.json：名字、称呼、语气、禁用词）
 │   ├── tools.py               工具定义与执行实现
 │   ├── overlay.py             半透明操作遮罩（PySide6）
+│   ├── stream.py              实时画面（gst 管线 + 分片 MP4）
 │   ├── tts.py                 espeak-ng 语音播报
 │   ├── power.py               任务期间抑制息屏与休眠
 │   ├── depcheck.py            系统控件自检（ydotool / kdotool / espeak-ng 等）
 │   ├── singleton.py           单实例锁
-│   ├── updater.py             查最新 release、git pull 与后台升级
+│   ├── updater.py             查最新版本（镜像 / GitHub 双源）、覆盖或 git 升级
 │   ├── config.example.toml    配置模板
 │   └── static/
 │       ├── index.html         单文件 Web 控制台
@@ -256,10 +355,12 @@ deckmeido/
 └── tools/
     ├── make_icon.py           由 SVG 渲染 PNG 图标
     ├── make_icon_png.py       由成品 PNG 生成各尺寸图标
-    └── make_release.sh        打 Release 用的 tar.gz
+    ├── fetch_offline_deps.sh  把 pacman 依赖树下到 deploy/deps/（发版前在 Deck 上跑）
+    ├── make_release.sh        打 Release 包，同时产出 latest.json 供镜像站用
+    └── ui-preview.html        QAM 面板的浏览器预览
 ```
 
-`VERSION` 与 `uninstall.sh` 由 `install.sh` 在安装时生成，不在仓库里。
+`VERSION` 与 `uninstall.sh` 由 `install.sh` 在安装时生成，不在仓库里；`deploy/deps/` 已被 `.gitignore` 忽略。
 
 ## 已知限制
 
@@ -271,101 +372,43 @@ deckmeido/
 
 ## 待办
 
-以下为已确认要改、尚未动手的事项，按方向分组，顺序不代表优先级。
+只列**尚未完成**的事项。已完成的能力已经写进上面的功能与实现说明，不再在这里留记录。顺序不代表优先级。
 
-### 安装与首次使用
+### 待真机验证
 
-- ~~**初始配置向导**~~ — 已做：Web 面板首次拿到 status 时若 `llm_configured` 为 false 就直接弹出设置页（原先用 `fetch('/api/config')` 并发判断，经常抢在 status 之前拿不到结果而错过引导，已改成等 status 决定）。后端未配置时的回复也改成引导文案
-- ~~**`install.sh` 界面重做**~~ — 已做：figlet `Big` 字体的大字标题 + 框线分区 + 依赖表格 + 完成卡片
-- ~~**`install.sh` 的 `?` 符号**~~ — 已做：改为 `[?]`
-- ~~**Release 内置离线依赖包**~~ — 已做：`tools/fetch_offline_deps.sh` 把依赖树下载到 `deploy/deps/`，`make_release.sh` 打进发布包，`install.sh` 优先 `pacman -U` 本地包、装不上或实测仍缺再回退联网
-  - SteamOS 的 A/B 镜像切换会让 pacman 缓存失效，所以离线包独立存放在 `deploy/deps/`，不复用 `/var/cache/pacman/pkg`
-  - 离线包不进仓库（`.gitignore`），发版前在 Deck 上重跑一次 `fetch_offline_deps.sh`，否则包会比 holo 仓库旧
+以下代码已写完，但只在开发机上做过语法与逻辑校验，需要上 Deck 实测：
 
-### 工具能力
+- **镜像覆盖升级** — 从 `latest.json` 下载 → sha256 → 解压覆盖 → 后台 `install.sh upgrade` 的整条链路，以及中途失败时 `update-backup-*.tar.gz` 的还原能力
+- **pip 测速选源** — `pick_pip_index()` 在 Deck 网络下的排序是否合理，某个源超时后能否顺利换到下一个
+- **实时画面编码器探测** — `_probe_encoder` 走 `vah264enc` 还是回落 `x264enc`，需要实际跑一次确认（`stream.py`）
+- **QAM 面板对话同步** — `ready()` 补发能否覆盖 Decky 重挂监听的时机；助手回复的来源在新旧会话混排时是否标对
+- **非 Steam 游戏名** — `compatdata` 目录名在 SteamOS 上是无符号还是带符号写法（已双向兜底）；网页游戏、原生 Linux 程序不走 Proton、没有 `STEAM_COMPAT_DATA_PATH` 时会拿不到名字
 
-- ~~**`desktop` 补齐手势**~~ — 已做：`action` 新增 `scroll`（`dx` / `dy`，按截图像素给，内部按 `WHEEL_PX_PER_STEP` 换成 ydotool 的格数，省掉 `x`/`y` 时沿用当前光标）与 `drag`（`x,y` → `x2,y2`，按下后按距离插值 2~80 步再松开，滑块/拖选这类按位移判断的逻辑才认得出是「拖」）
-- ~~**模拟 Steam Deck 触摸板**~~ — 已做：新增 `action=swipe`（`dx` / `dy` 为屏幕像素），按 20ms 间隔拆成连续小格滚轮，目标程序会当成一次连续手势。`ydotool` 造不出真正的触摸板事件，这里是「手感接近」的近似实现，双指滚动直接用 `scroll` 即可
-  - 顺带修了这类动作被遮罩吃掉的问题：新增 `tools.pointer_action()` 与后端状态 `_overlay_state["pointer"]`，`run_agent` 在 `set_overlay(True)` **之前**置上，遮罩进程看到就以 25ms 快轮询、显示后立刻 `hide()` 并回报，agent 的点击才落得到下面的窗口
+### 功能
 
-### 界面与交互
-
-- ~~**遮罩改按工具判定**~~ — 已做：`tools.touches_screen()` 判断这一步会不会真的动屏幕（`desktop` 注入、`xdotool` / `ydotool` / `kdotool` / `wtype` 一类命令、拉起可见窗口），只在执行这类工具的前后 `set_overlay(True/False)`；`handle_chat` 里整轮常显的遮罩已去掉，跑后台命令、翻文件不再挡视线
-- ~~**手机端上下文用量徽章**~~ — 已做：顶栏徽章在 ≤560px 隐藏，同一份用量由侧栏状态卡的 `#ctxRow` 显示（85% 起变黄、95% 变红，与徽章同阈值）
-- ~~**文件下载改气泡卡片**~~ — 已做：模型输出的 `[名字](/files/<相对工作区路径>)` 在 `renderMd` 里渲染成附件卡片（图标 + 文件名 + 大小），右侧独立下载按钮；新增 `/files/{path}`（限工作区内，带 token 校验）与 `POST /api/file_stat`（补大小）
-
-### 实时画面
-
-- ~~**网页端实时画面（H.264 硬编 / fragmented MP4）**~~ — 已做：`server/stream.py` 起一条常驻 `gst-launch-1.0` 管线（`pipewiresrc ! videoconvert ! videorate ! vaapih264enc ! h264parse ! mp4mux ! fdsink`），从 stdout 的 MP4 字节流里按 ISO BMFF box 边界切开后广播；`GET /api/stream`（必带 `check_token`）返回 `video/mp4` 分片流，前端 `<video muted autoplay playsinline>` 边下边播
-  - 为什么换掉 MJPEG：60fps 下 MJPEG 每帧整图编码，jpegenc 单帧 7~8ms、要吃半个核并明显发热；H.264 只编帧间差异，`vaapih264enc` 走 AMD VCN 固定单元，CPU 基本不参与
-  - 编码器探测：按「最终运行身份」（root 时先 `runuser` 降权到 deck）实跑 `videotestsrc ! vah264enc ! fakesink`，能返回 0 才用 vaapi；否则回落 `x264enc speed-preset=ultrafast tune=zerolatency`，两者都不行才报错——避免前端挂一个永远黑着的框
-  - 实现要点：多浏览器共用同一条 gst 管线（只编码一次）；`ftyp+moov`（含 SPS/PPS）缓存下来，后接入的客户端先收到它才不会解码失败；每客户端队列 maxsize=3（约 300ms，太深延迟累积、太浅丢 fragment 会卡到下一个关键帧，`keyframe-period=60` 即 1s 一个 IDR）；最后一条流断开自动停管线
-  - 前端：「画面」按钮仅游戏模式显示，面板可拖动 / 拖右下角缩放（几何存 localStorage）；用 `loadedmetadata` 判定出画（分片 MP4 不会触发 `load`），8s 无画面自动重连 3 次；`stalled` 提示卡住、`error` 提示断流；播放器解出的 `videoWidth/videoHeight` 回传 `POST /api/stream/report` 供角标显示
-  - 遮罩：推流期间后台每 0.5s 重申一次 `ON_OVERLAY_LIFT(True)`，工具收尾复位也追不上，保证遮罩不进画面
-  - 已知取舍：默认 60fps、vaapi CBR 4000kbps（约 0.5MB/s，1280×800 下肉眼无损；软编回落时按 `DEFAULT_QUALITY` 折算），未做 WebRTC；桌面模式仍需走 portal ScreenCast，暂未实现
-  - 已验证：MP4 box 切分在 1B / 7B / 64B / 4KB 分块边界下都能完整还原（header 与 6 个 fragment 字节一致），错位数据不会炸掉；`_probe_encoder` 需要 Deck 上实测
-  - 复用依据：`pipewiresrc` / `vaapih264enc` / `h264parse` / `mp4mux` 插件在 SteamOS 上齐备，AMD VCN 支持 H.264 high profile；`mss` 抓 gamescope 表面全黑、`spectacle` 仅约 1.2fps，均排除
-
-### 游戏模式
-
-- ~~**Decky 插件载体**~~ — 已做：`plugin/` 是独立 Decky 插件，`plugin/deploy.sh` 装到 `~/homebrew/plugins`（目录属 `root:root`，需要 sudo，或建软链接指向 `~/deckmeido/plugin`）。QAM 面板里能对话、看各端流式回答，「截屏询问」一键带图问（手柄键位区已删，改由模型调 `gamepad` 工具）
-- ~~**安装时检测 Decky 框架**~~ — 已做：`install.sh` / `upgrade` 会先跑 `plugin/deploy.sh --detect`，没装 Decky 就整段跳过（不构建、不报错），装了才构建并部署
-  - 判定信号：`~/homebrew/plugins` 存在（Decky 自己创建，最可靠）> `~/.local/share/decky` 等 bundle 目录 > systemd 里有 decky 单元。目录空着也算装了（刚装完还没装别的插件）
-  - 退出码约定：`0` 框架在 / `2` 没装或构建环境不具备（install.sh 不当错误）/ `1` 失败
-  - `plugin/` 之前没被 `sync_files` 带进安装目录，这次补上（`CODE_DIRS` 与同步清单、`make_release.sh` 的打包清单均已加入，发布包**不含** `plugin/node_modules`）
-- ~~**游戏内截帧**~~ — 已做：`pw-dump` 找到 `node.name=gamescope` 且 `media.class=Video/Source` 的节点，`gst-launch-1.0` 抓帧。踩过两个坑：① root 跑时要 `runuser -u deck` 降权，`XDG_RUNTIME_DIR` 必须指向 `/run/user/1000`；② `pipewiresrc path=N num-buffers=6` 必须拆成独立 argv token，整段塞一个 token 会让 gst 报 `syntax error` 并静默降级成纯文本
-- ~~**虚拟手柄**~~ — 已做：`plugin` 侧 `_Gamepad` 走 `/dev/uinput`，ABXY / 十字键 / 摇杆可用；`deck` 用户对 `/dev/uinput` 有 ACL（`user:deck:rw-`）
-- ~~**手柄补全 Xbox 布局**~~ — 已做：在 `guide` 之外补齐 `lt`/`rt`（`ABS_Z`/`ABS_RZ`，`trigger` 动作给 0..1 力度，`press`/`hold` 等于一踩到底）、`l3`/`r3`（`BTN_THUMBL`/`BTN_THUMBR`）、右摇杆（`ABS_RX`/`ABS_RY`，`stick` 加 `side=right`）、`share`（`KEY_RECORD` 0xA7，Series X|S 才有，部分驱动/游戏不认）。`release` 除摇杆回中外还会松开仍踩着的扳机，避免「松开后车还在开」
-- ~~**系统提示词针对 SteamOS 优化**~~ — 已做：`build_system_prompt` 明确「SteamOS 3.x holo、只读根、KDE Plasma」身份，并分出两种运行模式的操作要点：游戏模式（gamescope，只能用手柄注入，十字键移动焦点 / A 确认 / B 返回 / LB·RB 切页签 / start 暂停菜单 / select 地图 / guide 为 Xbox 键 / LT·RT 扳机 / L3·R3 摇杆按下 / 右摇杆转视角 / share 分享键）与桌面模式（KDE Plasma，用 desktop 工具点按、装软件走 Discovery 的 Flatpak、`/usr` 只读）
-  - 明确告知模型：QAM 与 Steam 主菜单靠系统层拦物理 Steam 键，虚拟手柄发不出来，需要时请用户自己按；模式互切同理
-- ~~**手柄补 Xbox/Guide 键**~~ — 已做：`_PAD_KEYS` / `_GAMEPAD_KEYS` 新增 `guide` → `BTN_MODE`(0x13C)，工具 `gamepad` 的 `button` 枚举与 QAM 面板同步加上（面板标签「Xbox」）。SteamOS 里它只会被游戏当成 Xbox Guide 键，呼不出 Steam 菜单 —— 这条限制已写进提示词
-- ~~**Decky 插件本机鉴权**~~ — 已做：插件后端以 root 加载，`screenshot` / `gamepad_*` / `start_turn` / `wait_final` / `cancel` / `lock` 全部要过 `_require(ticket, 方法名)`，未解锁直接抛 `PermissionError`。`get_status` 故意不设门（前端要先知道解锁态才决定显示哪个界面，且它只报端口与抓帧能力）
-  - 令牌优先级：环境变量 `DECKMEIDO_QAM_TOKEN` > 插件设置目录 `plugin.toml` 的 `[plugin] qam_token` > **默认 `meido`**（与后端 `config.example.toml` 默认值一致，用户只需记一个）
-  - 解锁后发 32 字节随机票据，落盘到 `decky.DECKY_PLUGIN_SETTINGS_DIR/qam_session.json`（目录 `0700`、文件 `0600`），12 小时有效，Decky 重启不用重输；`lock` 与插件卸载都会删掉它
-  - 令牌比较走 `hmac.compare_digest`（先各自 sha256 成定长再比），连续错 5 次冷却 30 秒，避免 4 位级令牌被脚本穷举
-  - 前端：未解锁时 QAM 只渲染解锁框（输入令牌 → 解锁），解锁后才显示提问区。面板上不再有「锁定」按钮：票据自然过期（12h）或被插件重启作废；需要立刻撤销时删掉 `qam_session.json` 或卸载插件
-- ~~**QAM 面板改成以对话为主**~~ — 已做：面板从上到下依次是「状态双行 →『截屏询问』→ 全部端的对话 → 打字输入框 →『发送』→『设置 ▾』（默认收起）→ 居中的版本号」。原来那四排测试用的手柄按键区已删掉（虚拟手柄仍由模型通过 `gamepad` 工具调用）
-  - 状态第一行：`自动截图可用` / `自动截图不可用（原因）` + `女仆核心 正常` / `女仆核心 异常`（异常标红）；第二行 `192.168.x.x:18765`，别的设备照这个地址连。IP 用 UDP `connect(8.8.8.8)` 取默认出口地址，核心状态直接问 `/api/status`
-  - 「截屏询问」：收起 QAM → 抓帧 → 带图自动问「看我卡在哪一步」，游戏名由后端从 Steam 取进提问里
-  - 对话区显示**所有端**的提问与回复（客户端 / PC网页端 / 插件端 / 手机网页端 各有角标），数据来自后端已有的 `user_message` / `assistant_message` 广播和连上时的 `history` 快照；随图那条多模态消息不进面板
-  - 来源标记现在问答两侧都带（`handle_chat` 把 `client` 同时写进 user 与 assistant 的历史和广播），老数据没有该字段时退回「最近一条提问的来源」
-  - 插件侧 `_THREAD` 聚合 + `_LAST_THREAD` 快照：Decky 是先渲染面板后挂监听，`history` 那条 thread 可能早于首帧，所以前端挂好监听后调 `ready()` 补发一次；本端提问不等回声先落一条（ts=0），后端回声按「角色+正文」把它替换成带真实 ts 的那条
-  - 待真机确认：`ready()` 补发能否覆盖 Decky 重挂监听的时机；助手回复的来源在新旧会话混排时是否标对
-  - 设置区（面板末尾，默认收起，点「设置 ▾」展开）：`带画面询问`（本地开关，决定发送时抓不抓帧；`截屏询问` 永远带图）、`语音播报回复`（读写后端 `[tts] enable`，网页设置页同一项），另有一行「后端 已连接/未连接 · 工作区 …」。语音开关走新增的 `POST /api/tts?enabled=true|false`，复用 `update_config` 热更新，不用重启；`get_status` 顺带读 `/api/config` 拿到当前值与版本号
-  - 最底部单独一行居中的版本号：优先取后端 `/api/config` 的 `version`（和网页设置页一致），后端连不上时退回插件 `package.json` 的版本。logo 不放了 —— QAM 的 CEF 不给 `file://`，插件目录里的 png 加载不出来，手画的 SVG 又和网页里的图案对不上
-  - 已验证：13 项（默认令牌、8 个受保护方法在未解锁时全部拒绝、大小写无关、票据落盘、错票据拒绝、盘上恢复、过期失效、lock 清除、连续失败冷却、环境变量覆盖）
-- **远程控制** — 让局域网设备通过 HTTP 注入按键与触摸，实现「远程下一句指令，agent 代为操作」。路线已确认：`ydotool`（键鼠，`ydotoold` 已在跑）+ `/dev/uinput`（手柄，`deck` 已在 `input` 组且设备可写）；decky-flow 的 EIS 桥是本机 Unix socket 而非网桥，这一层可以省掉
-  - 前置：**先做网络鉴权**。`:18765` 目前无 token 监听 `0.0.0.0`，等于把「可执行命令」的入口开放给整个局域网
+- **远程控制** — 让局域网设备通过 HTTP 注入按键与触摸，实现「远程下一句指令，agent 代为操作」。路线已确认：`ydotool`（键鼠）+ `/dev/uinput`（手柄）；decky-flow 的 EIS 桥是本机 Unix socket 而非网桥，这一层可以省掉
+  - 前置：**先做网络鉴权**。`:18765` 若不设令牌就监听 `0.0.0.0`，等于把「可执行命令」的入口开放给整个局域网
   - 已实测：切到 gamescope 后后端存活、`:18765` 正常监听、`ydotoold` 未断、QAM 的 WebSocket 连通
   - 定位：LLM 推理一来一回 1~3 秒，不适合动作游戏，适合「帮我跑日常 / 挂机刷素材」
-- ~~**抓帧失败要有提示**~~ — 已做：`_screenshot_gamescope` 从 `bool` 改成返回「成功即空串 / 失败即原因」，逐层给出具体原因（找不到 gamescope 节点 / 没装 gst-launch-1.0 / 找不到用户会话 / 25s 超时并 kill 掉进程 / gst stderr 最后一行）。失败文本会明确要求模型「告诉用户没截到图，不要凭空描述屏幕内容」，并新增 `tools.LAST_SHOT_ERROR` 经 `tool_done` 事件的 `error` 字段送到前端：时间线那一行变红、显示「截屏失败」并默认展开原因
-  - 顺带修掉两个真 bug：① 未装 `mss` 时 `import mss` 抛 `ModuleNotFoundError` 直接把工具调用炸掉，那句「spectacle 与 mss 都不可用」的提示永远走不到；② 桌面模式失败分支没有清 `LAST_VISION`，模型会拿上一张成功截图回答（现在每次截图开始就把它置空）
-  - 黑屏残片（<10KB）现在会被删掉并计入失败，不再被当成「已有截图」沿用
-  - 已验证：游戏模式三种前置失败、桌面模式双后端不可用共四条路径的原因文本与状态清理均符合预期
+- **桌面模式实时画面** — 目前只支持游戏模式（gamescope PipeWire 节点），桌面模式还需走 portal ScreenCast
+- **QAM 的全局热键 / 独立截图按钮** — 全局热键会和 Steam 输入争抢，暂缓
+
+### 待真机验证（补充）
+
+上述已知问题的修复改动，同样只在开发机上校验过：
+
+- **客户端守护** — `client/launch.sh` 的 `WAYLAND_DISPLAY` 等待与退避重启节奏，在 Deck 上切游戏模式时是否真的能把窗口拉回来
+- **崩溃栈** — `server/client-crash.log` 能否记录到 gamescope 掐连接时的 C 层栈
+- **plugin 属主自愈** — Decky 以 root 加载后，`plugin/` 是否已恢复为 deck 所有，`git pull` 是否不再报 `Permission denied`
 
 ### 已知问题
 
-- **切游戏模式时 PySide6 客户端崩溃** — `The Wayland connection broke`。客户端是 Wayland 原生窗口，gamescope 会话重建时连接被断
-- **journal 每分钟一条 sudo 噪声** — `a password is required ... USER=root ; COMMAND=/usr/bin/true`，来源是 `depcheck.sudo_nopasswd()` 的免密探测
-- **`plugin/` 目录所有权会漂移** — Decky 以 root 写入插件目录，一次之后 `plugin/` 就变成 `root:root`，deck 用户再 `git pull` 会报 `unable to unlink old 'plugin/main.py': Permission denied`，需要 `sudo chown -R deck:deck` 修回
+暂无。曾经列在这里的四项已处理：
 
-### 游戏模式（续）
-
-- ~~**Decky 插件联动查攻略**~~ — 已做：QAM 面板加「查攻略（看当前画面）」一键按钮，不用打字。点下去 → `Navigation.CloseSideMenus()` 收起 QAM → 450ms 后抓帧 → 抓完立刻 `Navigation.OpenQuickAccessMenu()` 弹回面板 → 画面连同固定提示词发给后端。后端据画面认游戏与场景，`web_search` 现搜（中文没结果就换英文关键词）再总结成可照做的步骤，回答在 QAM 流式显示，同一条 `ws` 广播也会同步到网页/手机
-  - 收起菜单用的是 Steam 的 `MenuStore`（`@decky/ui` 的 `Navigation` 直接调窗口实例），不是模拟按键：QAM 里按 B 是「回上一级标签页」，按几次都不保证关面板
-  - 抓帧参数 `screenshot(ticket, hide=True)`：`pipewiresrc` 抓的是 gamescope 合成后的画面，QAM 本身也在里面，不收起来只能拍到半屏游戏
-  - 游戏名不靠模型认：插件扫 `/proc/*/environ` 里的 `SteamAppId`（Steam 启动游戏时注入）拿到运行中 appid，再去 Steam 配置里取名字。Steam 游戏走 `userdata/*/config/localconfig.vdf` 的 `apps` 段 `name`（库里改过的备注就是它），非 Steam 游戏走 `shortcuts.vdf` 的 `AppName`——**按 Steam 键弹出的主页左上角那个游戏名，读的就是这两个字段**，所以拿到的必然和菜单上一致，没必要去截菜单画面做 OCR（还得先收 QAM、等动画，慢且易错）。拿到后拼成「当前游戏：《xxx》」放在问题开头，模型直接拿它搜；取不到才退回看画面判断
-  - `userdata` 位置不只猜 `~/.steam/steam`：还会试 `~/.local/share/Steam`、Flatpak 路径，以及 XDG `user-dirs.dirs` 里 `XDG_DOCUMENTS_DIR` 下的 `steam/nav`（`install.sh` 建桌面快捷方式就说明这台机器用户目录被挪过）
-  - `localconfig.vdf` 用括号配对解析（app 块里夹着 `cloud` 等子块，按第一个 `}` 切会漏）
-  - 非 Steam 游戏（库里那个十位编号的容器）不在 `localconfig.vdf` 里，名字得读 `userdata/*/config/shortcuts.vdf`：这是**二进制** VDF（类型字节 + `\0` 结尾键名），`AppName` 就是库里显示的名字（手动改过的备注也是它）；改过名后 appid 不重算，只能按 appid 查名字，反推没用
-  - 非 Steam 游戏运行时 `SteamAppId=0`，退回 `STEAM_COMPAT_DATA_PATH` 的目录名（`compatdata/<编号>`）当编号；界面上按无符号十位显示，目录名却可能写成有符号负数，所以两种写法都拿去匹配
-  - 待真机确认：`compatdata` 目录名在 SteamOS 上到底是哪种写法（已双向兜底），以及部分非 Steam 游戏（如网页游戏、原生 Linux 程序）不走 Proton、没有 `STEAM_COMPAT_DATA_PATH` 时会拿不到名字
-  - 系统提示词补了「带画面问攻略」的规范：先认场景 → 先搜再总结 → 中文不行换英文 → 只给步骤不编打法；并声明「当前游戏：《xxx》」是准确名字，别自己重新猜
-  - 未做：全局热键（会与 Steam 输入争抢）、独立截图按钮、输入框开关
-
-### 依赖
-
-- **`ddgs`** — 已在 `requirements.txt` 解注释并列为默认安装（`1c598a0`），但本机 `.venv` 尚未安装，`web_search` 仍返回 `No module named 'ddgs'`
+- **切游戏模式时 PySide6 客户端崩溃**（`The Wayland connection broke`）—— Qt 在 C 层直接 abort，Python 层捕获不到。现在由 `client/launch.sh` 守护：异常退出后等 Wayland 回来再拉起，连续崩溃时退避（最长 30 秒）；同时用 `faulthandler` 把崩溃栈落到 `server/client-crash.log`。桌面快捷方式、`install.sh` 的启动与各停止路径均已改为围绕 `launch.sh`
+- **journal 每分钟一条 sudo 噪声** —— 根因是自检定期执行 `sudo -n true` 探免密，失败一次就在 journal 留一条。现在**完全不做免密探测**：网页自检只跑不需要 root 的实测，装系统包一律引导到终端执行 `bash install.sh check --fix`，由 `sudo` 自己提示输入密码；`install.sh` 的预热也直接 `sudo -v`，不再预读策略
+- **`plugin/` 目录所有权漂移** —— 插件侧新增 `_restore_owner()`，加载时与写票据、开日志前把属主改回 deck；`updater.py` 的 `_fix_owners()` 在 `git` 升级前再兜一次
+- **上下文压缩的摘要质量** —— 摘要短于历史长度 1/20（且至少 120 字）时，用更明确的分段要求重试一次，取更长者；两版都不合格就保留原文
 
 ---
 

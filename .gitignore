@@ -1,5 +1,8 @@
 # 密钥与本地配置
 server/config.toml
+# 长期记忆与人设（教学/调校出来的内容属于用户数据）
+server/memory.json
+server/meidosoul.json
 
 # Python
 __pycache__/

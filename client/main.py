@@ -40,6 +40,26 @@ BACKEND_LOG = DECKMEIDO_DIR / "server" / "backend.log"
 _BACKEND_LOG_MAX = 5 * 1024 * 1024   # 5 MB，只留一代 backend.log.1
 _log_handle = None
 
+# 客户端崩溃日志：切游戏模式时 gamescope 会话重建会掐断 Wayland 连接，
+# Qt 在那种情况下是 abort()，Python 层 try/except 拦不住，只有 faulthandler
+# 能在进程死前把栈写下来。没有它就只能看到一句 "Wayland connection broke"。
+CRASH_LOG = DECKMEIDO_DIR / "server" / "client-crash.log"
+
+
+def _enable_crash_log() -> None:
+    """把 C 层致命信号（SIGSEGV / SIGABRT 等）的栈写到文件里"""
+    try:
+        import faulthandler
+
+        f = open(CRASH_LOG, "a", encoding="utf-8")
+        faulthandler.enable(file=f, all_threads=True)
+        f.write(f"\n===== client start {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+        f.flush()
+        globals()["_crash_handle"] = f  # 保持引用，别让 GC 把文件关掉
+    except Exception:
+        pass
+
+
 
 def load_token() -> str:
     try:
@@ -271,6 +291,7 @@ def install_translators(app: QApplication) -> None:
 
 
 def main() -> int:
+    _enable_crash_log()
     QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setApplicationName("DeckMeido")
@@ -425,7 +446,12 @@ def main() -> int:
             view.hide()
             tray.showMessage("DeckMeido", "已最小化到托盘，点击托盘图标可恢复。", icon, 2000)
 
-    view.installEventFilter(_MinimizeWatcher(on_minimized))
+    # 事件过滤器对象必须留引用：installEventFilter 不持有所有权（Qt 只存裸指针），
+    # 这里如果写成 installEventFilter(_MinimizeWatcher(...))，Watcher 会被 GC，
+    # 窗口状态一变就访问已释放对象
+    watcher = _MinimizeWatcher(on_minimized)
+    watcher.setParent(app)
+    view.installEventFilter(watcher)
 
     def on_quit() -> None:
         tray.hide()
@@ -435,16 +461,8 @@ def main() -> int:
 
     app.aboutToQuit.connect(on_quit)
 
-    # SIGTERM / SIGINT 直接杀掉进程时 aboutToQuit 不触发，后端和遮罩就成了
-    # 没人管的孤儿（下次启动会看到「旧后端还在跑」）。这里转成正常退出。
-    def on_signal(signum, frame) -> None:
-        app.quit()
-
-    for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        try:
-            signal.signal(_sig, on_signal)
-        except Exception:
-            pass
+    # 信号处理（转 queued 调用再 app.quit）已在 main() 开头统一注册，这里不要再注册一遍：
+    # 在事件循环里直接调 app.quit() 有重入风险，且会覆盖掉前面那份正确的处理函数。
 
     return app.exec()
 

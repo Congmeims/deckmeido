@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import glob
+import io
 import json
 import os
 import re
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 from pathlib import Path
 
 import tomllib
@@ -23,7 +25,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .llm import LLMClient
-from . import depcheck, power, singleton, stream, tools, updater
+from . import depcheck, memory, persona, power, singleton, stream, tools, updater
+from .session_store import merge_histories as _merge_histories
+from .session_store import set_title as _set_title
+from .session_store import store
+from .session_store import SESSIONS_DIR as _sessions_dir
 from .tts import TTS
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -142,8 +148,15 @@ llm = LLMClient(
     # 留空则完全不传，交由服务商默认行为
     reasoning_effort=str(CFG["llm"].get("reasoning_effort", "high")),
 )
+# 地址填成 DeepSeek（含手抄的 /v1）时把模型名归一，免得带着 gpt-* 去请求
+llm.normalize()
 
-PERSONA = CFG.get("persona", {})
+PERSONA = persona.load()
+# 老版本的人设写在 config.toml 的 [persona] 段，第一次启动时搬进 meidosoul.json，
+# 之后再改设置页，人设也只落 meidosoul.json，不再写 config.toml。
+# 迁移必须在 load_config 之后、拼 SYSTEM_PROMPT 之前。
+if persona.migrate_from_config(CFG.get("persona")):
+    PERSONA = persona.load()
 # 「截屏询问」的提示词模板。插件点按钮时会把这段连同当前画面发过来，
 # 所以模板本身放在配置里，用户可以在设置页随时改（例如换个问法、加一条自己的要求）。
 DEFAULT_ASK_TEMPLATE = (
@@ -207,22 +220,34 @@ def context_window() -> int:
 # 于是用户屏幕上已有的几十轮对话被一起抹掉——表现就是「内容不见了」。
 # 现在改成游标模型：
 #   history        永远只追加，完整记录 = 界面显示 + 磁盘存档
-#   _compact_map   每个会话一份 {"summary": 旧对话摘要, "upto": 摘要覆盖到第几条}
+#   store.compact_map  每个会话一份 {"summary": 旧对话摘要, "upto": 摘要覆盖到第几条}
 # 发给模型时 = 摘要(system) + history[upto:]，History 本身一条都不动。
-_compact_map: dict[str, dict] = {}
+# 游标放在 session_store 里，落盘时能一起写进会话文件（见 session_store.write_session）
 
 
 def _compact_for(sid: str) -> dict:
-    """取某个会话的压缩游标（没有就返回空游标）"""
-    cur = _compact_map.get(sid or "")
-    if not isinstance(cur, dict):
-        return {"summary": "", "upto": 0}
-    return {"summary": cur.get("summary") or "", "upto": max(0, int(cur.get("upto") or 0))}
+    return store.compact_for(sid)
 
 
 def _set_compact(sid: str, summary: str, upto: int) -> None:
-    _compact_map[sid or current_sid] = {"summary": summary or "",
-                                        "upto": max(0, int(upto or 0))}
+    store.set_compact(sid, summary, upto)
+
+
+# 历史图片的占位文案：固定不变，既省掉每轮重发的几 MB 输入，也保证前缀稳定
+_STALE_IMAGE_NOTE = "（这里原本是一张画面，属于更早的对话，已不再发送）"
+
+
+def _digest_text(m: dict) -> str:
+    """把一条历史消息拍平成摘要用的纯文本
+
+    多模态消息的 content 是 list，直接 str() 会把 base64 也塞进摘要请求，
+    一次压缩就能发出几十万字符（还全是噪音）。
+    """
+    content = m.get("content")
+    if isinstance(content, list):
+        content = " ".join(str(p.get("text") or "[图片]") for p in content
+                           if isinstance(p, dict))
+    return str(content or "")
 
 
 def _build_llm_msgs(hist: list[dict], sys_prompt: str, sid: str = "") -> list[dict]:
@@ -231,7 +256,7 @@ def _build_llm_msgs(hist: list[dict], sys_prompt: str, sid: str = "") -> list[di
     返回的列表长度就是「来自历史的条数」，调用方据此区分本轮新增的临时消息
     （assistant tool_calls / tool 结果），压缩后重建时可以接回去。
     """
-    sid = sid or _turn.get("sid") or current_sid
+    sid = sid or store.turn.get("sid") or store.current_sid
     comp = _compact_for(sid)
     upto = min(comp["upto"], len(hist))
     msgs: list[dict] = [{"role": "system", "content": sys_prompt}]
@@ -246,11 +271,60 @@ def _build_llm_msgs(hist: list[dict], sys_prompt: str, sid: str = "") -> list[di
         # 网关对请求体有上限，超了会被上游截断并返回 503，整轮提问跟着失败；
         # 这些图只是当时那一轮的参考，用一句说明代替即可
         content = _shrink_oversized_images(content)
+        # DeepSeek 没有视觉接口，历史里那几张旧画面本来也看不见：
+        # 换成固定文案，省输入费的同时让前缀每轮都一模一样
+        if llm.is_deepseek and isinstance(content, list):
+            content = [_restale_image_part(p) for p in content]
         # 历史里还存了 ts / events 供界面回放，发给模型时只保留 role 和 content
         msgs.append({"role": m["role"], "content": content,
                      "tool_calls": m.get("tool_calls"),
                      "tool_call_id": m.get("tool_call_id")})
     return _drop_orphan_tools(msgs)
+
+
+# 上一轮终止时，交接说明里最多列几条工具，再多模型也读不出重点
+_ABORT_NOTE_MAX = 12
+
+
+def _aborted_note(hist: list[dict]) -> str:
+    """上一轮是被用户终止的话，给模型一条交接说明
+
+    终止时 history 里只留下「已经说出口的正文 + 工具块」，没有 tool 调用与结果，
+    模型看到自己的话断在半路，下一句就会接着往下做（用户看到的就是「我终止了
+    它还在跑」）。这里把做过什么、没做什么补给它，并明确要求不许续做。
+
+    只在「最后一条是终止的 assistant」时生效：中间那些早已翻篇的终止轮次
+    不该在之后每一轮都再念一遍。
+    """
+    if not hist:
+        return ""
+    last = hist[-1]
+    if last.get("role") != "assistant" or not last.get("aborted_turn"):
+        return ""
+    done = [t for t in (last.get("tool_log") or []) if isinstance(t, dict)]
+    lines = ["用户在上一轮中途点了「终止」，那一轮已经作废。"]
+    finished = [t for t in done if not t.get("interrupted")]
+    cut = [t for t in done if t.get("interrupted")]
+    if finished:
+        lines.append("终止前确实已经执行完这几步，不要重做：")
+        for t in finished[:_ABORT_NOTE_MAX]:
+            name = t.get("name") or ""
+            summary = str(t.get("summary") or "").strip()
+            lines.append(f"- {name}：{summary}" if summary else f"- {name}")
+        if len(finished) > _ABORT_NOTE_MAX:
+            lines.append(f"- 还有 {len(finished) - _ABORT_NOTE_MAX} 步，略")
+    if cut:
+        lines.append("这些是终止时刚开始、没有执行完的：")
+        for t in cut[:_ABORT_NOTE_MAX]:
+            name = t.get("name") or ""
+            summary = str(t.get("summary") or "").strip()
+            lines.append(f"- {name}：{summary}" if summary else f"- {name}")
+    lines.append(
+        "除非用户在最新这句话里明确要求继续（「继续」「接着做」这类），否则一律不要"
+        "自行续做上一轮的任何步骤：不要重新执行、不要补做剩下的步骤、也不要再调用"
+        "工具。按用户这次说的话正常回答；如果这句话和上一轮无关，就当上一轮没有发生过。"
+    )
+    return "\n".join(lines)
 
 
 # 单张图 base64 的上限。网关实测 1600 万字符必挂；给到 200 万字符（约 1.5MB 原图）
@@ -280,6 +354,21 @@ def _shrink_oversized_images(content):
     return out if changed else content
 
 
+def _restale_image_part(part: dict) -> dict:
+    """把历史里的图片换成固定的一句话（DeepSeek 用）
+
+    历史消息里内联的 base64 是最容易让前缀缓存失效的东西：只要某张图在中间
+    被压缩、替换或重新编码，它后面的整段历史都跟着失配。更实际的问题是——
+    上下文里躺着几张几 MB 的旧画面，每一轮都在为它们重新付输入费，
+    而模型真正需要看的只是「当时有过一张画面」。
+    这里换成一段不带编号、不带时间的定长文案：同一张图每轮展开的结果都一样，
+    前缀才稳；本轮新截的那张（不在历史里）仍然是原图。
+    """
+    if isinstance(part, dict) and part.get("type") == "image_url":
+        return {"type": "text", "text": _STALE_IMAGE_NOTE}
+    return part
+
+
 def _drop_orphan_tools(msgs: list[dict]) -> list[dict]:
     """去掉没有配对的 tool 消息与 tool_calls，保证发出去的消息能通过接口校验
 
@@ -290,6 +379,10 @@ def _drop_orphan_tools(msgs: list[dict]) -> list[dict]:
     宁可丢掉这几条（摘要里还留着结论），也不能让整轮对话失败。
     """
     ids_with_result = {m.get("tool_call_id") for m in msgs if m["role"] == "tool"}
+    # DeepSeek 思考模式下，带过工具调用的 assistant 必须把 reasoning_content
+    # 原样回传，少一个字段就 400（见官方「思考模式 → 工具调用」）。这里统一补上：
+    # 没存过的（切换过服务商、旧会话）就补空字符串
+    keep_reasoning = llm.is_deepseek
     out: list[dict] = []
     for m in msgs:
         if m["role"] == "tool":
@@ -298,7 +391,10 @@ def _drop_orphan_tools(msgs: list[dict]) -> list[dict]:
             called = {tc.get("id") for tc in (prev or {}).get("tool_calls") or []}
             if m.get("tool_call_id") not in called:
                 continue
-            m = {"role": "tool", "tool_call_id": m["tool_call_id"], "content": m["content"]}
+            content = m.get("content")
+            if keep_reasoning and isinstance(content, list):
+                content = [_restale_image_part(p) for p in content]
+            m = {"role": "tool", "tool_call_id": m["tool_call_id"], "content": content}
             out.append(m)
             continue
         calls = m.get("tool_calls")
@@ -312,6 +408,8 @@ def _drop_orphan_tools(msgs: list[dict]) -> list[dict]:
                 m = {"role": m["role"], "content": m["content"]}
             else:
                 m = {**m, "tool_calls": kept}
+                if keep_reasoning:
+                    m.setdefault("reasoning_content", "")
         else:
             m = {"role": m["role"], "content": m["content"]}
         out.append(m)
@@ -463,13 +561,66 @@ def build_system_prompt(workspace: Path | None = None) -> str:
         "- 安装脚本优先 curl 下载成文件再执行（便于排查）；但用户明确要求原样执行时，直接执行\n"
         "- 命令需要交互输入时（密码/确认提示），用 stdin 参数喂入；长任务放后台并输出日志路径\n"
         "- 回答简洁，中文优先\n"
-        "- 需要 appid 时先用 find_game 查询，不要编造"
+        "- 需要 appid 时先用 find_game 查询，不要编造\n"
+        "- 长期记忆：用户说「记住」「以后都这样」时，用 remember 工具存一条；"
+        "用户纠正你的做法（「不对，应该…」「以后别…」）且这个纠正以后也用得上时，"
+        "同样存一条再照做。只顾当前这句话的临时要求不要存。"
+        "记忆里已有的内容不要重复存，用户要求忘掉某件事时告诉他去设置页的记忆面板里删"
     )
     if extra:
         p += f"\n补充人设：{extra}"
     # 语气约束放最后：这里的规则最贴近用户即将说的话，权重最高
     p += "\n\n" + _persona_style_block()
     return p
+
+
+def _mode_block(gaming: bool) -> str:
+    """当前运行模式段，接在 system prompt 的主体之后
+
+    主体里两套模式是并列描述的，模型得自己猜现在在哪种；猜错的代价是直接调错
+    工具（桌面模式拿 gamepad、游戏模式拿 desktop），用户看到的就是「点了没反应」。
+    这里只写「当前生效的是哪一套」，不重复主体里已有的键位说明。
+
+    只在这里追加、不改主体：当前模式切换时，受影响的前缀只到这一段为止，
+    前面的长前缀照样命中缓存（同 _memory_block 的考虑）。
+    """
+    if gaming:
+        return (
+            "\n\n当前实际运行模式：游戏模式（gamescope 合成器，Steam 大屏界面）。\n"
+            "- 操作设备一律用 gamepad 工具（手柄注入）。desktop 的鼠标键盘注入在游戏模式"
+            "下对游戏无效，不要用。\n"
+            "- 截图由 screenshot 工具从 gamescope 的 PipeWire 节点抓帧，抓的是游戏画面；"
+            "它拿不到 KDE 桌面上的窗口。\n"
+            "- 遮罩/提示这类画面反馈由系统挂在 gamescope 的覆盖层上，你正常调用工具即可，"
+            "不要自己去画。\n"
+            "- QAM 和 Steam 主菜单是系统层拦物理 Steam 键实现的，虚拟手柄做不到，"
+            "需要时请用户自己按 Steam 键。\n"
+            "- 不要试图用 xdotool / kdotool 操作游戏窗口，也不要建议用户切到桌面去点。"
+        )
+    return (
+        "\n\n当前实际运行模式：桌面模式（KDE Plasma + Wayland，非 gamescope）。\n"
+        "- 操作设备一律用 desktop 工具（focus 切前台 → 截图 → click/type）。"
+        "gamepad 在桌面模式下没有意义，不要用。\n"
+        "- 截图由 screenshot 工具走 spectacle/mss，抓的是当前桌面；不存在 gamescope "
+        "画面可抓，也别建议用户切到游戏模式去截图。\n"
+        "- 遮罩/提示走的是桌面通知/窗口这一套，不要按游戏模式的覆盖层去理解。\n"
+        "- Wayland 原生窗口只认合成输入；xdotool 仅对 X11(Xwayland) 程序有效。"
+    )
+
+
+def _memory_block() -> str:
+    """长期记忆段，接在 system prompt 最末尾
+
+    必须放在最末尾而不是开头：记忆会随使用增删，放在前面的话，只要加一条，
+    后面整段几十行前缀就被打掉，DeepSeek 的缓存命中率会直接掉到 0。
+    放在末尾时，一次记忆变动影响的只是这一小段之后的缓存（本来就没什么内容）。
+    单条记忆每轮都按「类别 + 创建时间」稳定排序，同样的记忆展开结果一字不差。
+    """
+    text, ids = memory.block()
+    if ids:
+        # 只记「谁被注入过」，供记忆条数到上限时优先保留常用的那些
+        memory.mark_used(ids)
+    return text
 
 
 SYSTEM_PROMPT = build_system_prompt()
@@ -488,7 +639,8 @@ def apply_config(cfg: dict):
     """热更新运行配置（LLM / TTS / 权限模式 / 访问令牌），无需重启"""
     global CFG, TOKEN, PERMISSION_MODE, PERSONA, SYSTEM_PROMPT, MAX_TOOL_ROUNDS, ASK_TEMPLATE
     CFG = cfg
-    PERSONA = cfg.get("persona", {})
+    # 人设不在这里取：它存在 meidosoul.json，改完由 update_config 的调用方
+    # 直接 reload_persona()，config.toml 里即使还留着旧的 [persona] 段也不再生效
     TOKEN = (cfg["server"].get("token") or TOKEN).strip().lower()
     MAX_TOOL_ROUNDS = (int(cfg.get("agent", {}).get("max_tool_rounds", 0))
                        or DEFAULT_MAX_TOOL_ROUNDS)
@@ -499,15 +651,23 @@ def apply_config(cfg: dict):
     llm.api_key = c["api_key"]
     llm.model = c["model"]
     llm.reasoning_effort = str(c.get("reasoning_effort", "high"))
+    llm.normalize()
     t = cfg.get("tts", {})
     was_enabled = tts.enable
     tts.enable = bool(t.get("enable", False))
-    # 关掉播报时立刻掐断正在念的那句，不能等它自己读完
+    # 关掉播报时立刻掐断正在念的那句，不能等它自己读完。
+    # apply_config 也可能在启动阶段（没跑事件循环）被调用，那时没有 loop 可建任务
     if was_enabled and not tts.enable:
-        asyncio.create_task(tts.stop())
+        try:
+            asyncio.get_running_loop().create_task(tts.stop())
+        except RuntimeError:
+            pass
     tts.voice = t.get("voice", "cmn")
     tts.speed = int(t.get("speed", 170))
     PERMISSION_MODE = cfg.get("security", {}).get("permission_mode", "auto")
+    # 文件工具的边界跟着权限模式走：full 不设限（与 run_command 一致），
+    # 其余模式只能碰工作区。这里同步一份，热更新后立刻生效
+    tools.path_bound = PERMISSION_MODE != "full"
     # 桌面模式下执行命令/亮遮罩时阻止息屏（热更新即生效，不必重启）
     wake_on = cfg.get("power", {}).get("keep_awake", True)
     power.keeper.enabled = bool(wake_on)
@@ -522,8 +682,21 @@ def apply_config(cfg: dict):
     SYSTEM_PROMPT = build_system_prompt()
 
 
+def reload_persona() -> dict:
+    """重新读 meidosoul.json 并重拼系统提示词，保存后立即生效
+
+    人设存在独立文件里，不走 update_config / apply_config 那条热更新路径，
+    由设置页和导入接口直接调用这里。
+    """
+    global PERSONA, SYSTEM_PROMPT
+    PERSONA = persona.load()
+    SYSTEM_PROMPT = build_system_prompt()
+    return PERSONA
+
+
 # 权限模式：manual=所有命令手动审批 / auto=危险命令才审批 / full=完全访问
 PERMISSION_MODE = CFG.get("security", {}).get("permission_mode", "auto")
+tools.path_bound = PERMISSION_MODE != "full"
 
 # 工作区（默认 ~/deckmeido_workspace，可在设置里改）
 DEFAULT_WORKSPACE = Path.home() / "deckmeido_workspace"
@@ -532,204 +705,53 @@ try:
 except Exception:
     pass
 
-# 内存中的对话历史（当前会话；多会话 JSON 落盘在 server/sessions/）
-history: list[dict] = []
-
 # ---------- 会话持久化 ----------
+# 状态与落盘都在 session_store 里（store.current_sid / store.history / store.turn ...）。
+# 这里保留原来的名字，调用点不用改；但这些都是「读 store」的视图，不是第二份状态。
 
-SESSIONS_DIR = BASE_DIR / "sessions"
-SESSIONS_DIR.mkdir(exist_ok=True)
-current_sid = "default"
+SESSIONS_DIR = _sessions_dir
 
-# 会话代次：新建 / 切换 / 删除会话时 +1。
-# 一轮对话开始时快照 epoch，中途被别的端切走会话也能认出来，
-# 从而把结果写回原会话、不污染新会话（否则会出现「新会话回了上一个问题」）
-_sess_epoch = 0
 
-# 当前这一轮对话的归属：开始时间戳 + 当时的 sid/epoch，供 save / compact 判断是否已被切走
-_turn: dict = {"sid": "", "epoch": 0, "active": False}
+# 会话文件的写入锁，见 session_store.SessionStore.lock
+_SESS_WRITE_LOCK = store.lock
 
 
 def _turn_detached(epoch: int) -> bool:
     """这轮开始时快照的 epoch 是否已过期（会话被切走或重建）"""
-    return epoch != _sess_epoch
+    return store.turn_detached(epoch)
 
 
 def _turn_tag() -> dict:
-    """给广播消息挂上本轮所属会话号；前端据此丢弃不属于当前会话的流式片段"""
-    if _turn.get("active") and _turn.get("sid"):
-        return {"sid": _turn["sid"]}
-    return {}
+    """给广播消息挂上本轮所属会话号；前端据此丢弃不属于当前会话的流式片段。
+
+    发起端自带的 turn_id 也一并带上：插件要认出「哪些 δ 是我这一轮的」，
+    只看 sid 不行——同一会话里别的端提问也是这个 sid。
+    """
+    return store.turn_tag()
 
 
 def _sess_path(sid: str) -> Path:
-    return SESSIONS_DIR / f"{sid}.json"
-
-
-# 已被用户删除的会话号。删除动作只删文件，而「正在跑的那一轮」手里还捏着这个
-# sid：收尾时 save_session_snapshot(turn_sid) / 流式节流的 _write_streaming
-# 都会把文件原样写回来 —— 用户看到的就是「删了一个，冒出两个会话」。
-# 这里记一笔，所有落盘入口先查名单，删掉的会话绝不允许复活。
-# 只在启动时为空（重启后文件确实不存在了，也没人在跑老那一轮）。
-_deleted_sids: set[str] = set()
-
-
-def _set_title(data: dict, hist: list[dict]) -> None:
-    """给没有标题的空会话补一个带时间的标题，避免侧栏出现两个一模一样的「新会话」"""
-    if data.get("title") and data["title"] != "新会话":
-        return
-    first_user = next((m.get("content") for m in hist
-                       if m.get("role") == "user" and str(m.get("content") or "").strip()), None)
-    if first_user:
-        data["title"] = str(first_user).strip().replace("\n", " ")[:24]
-    else:
-        data["title"] = "新会话 " + time.strftime("%H:%M", time.localtime(data.get("created") or time.time()))
+    return store.sess_path(sid)
 
 
 def save_current_session():
     """把当前会话历史写盘，标题取第一条用户消息"""
-    _write_session(current_sid, history)
-
-
-def _merge_histories(old_hist: list[dict], new_hist: list[dict]):
-    """把「内存里的新消息」追加到「磁盘上的老历史」后面，返回 (合并结果, 新增条数)。
-
-    判定新旧的依据是消息指纹——(role, content 前 200 字)。内存里的消息如果
-    磁盘上已经有了就跳过；没有的则按顺序补在末尾。
-    无法判定（比如内存里的消息在磁盘上找不到任何锚点）时返回 (None, 0)，
-    让调用方保守地保留磁盘内容。
-    """
-    def fp(m):
-        return (m.get("role"), str(m.get("content") or "")[:200])
-
-    old_fps = [fp(m) for m in old_hist]
-    old_set = set(old_fps)
-    new_fps = [fp(m) for m in new_hist]
-
-    # 内存里的消息必须有一条能在磁盘上找到，否则说明这两份根本不是同一条时间线，
-    # 强行拼接只会把历史搅乱（用户看到的「回复错乱」就是这么来的）
-    anchor = None
-    for i, f in enumerate(new_fps):
-        if f in old_set:
-            anchor = i
-    if anchor is None:
-        return None, 0
-
-    # 锚点之后的消息视为「新增」，按指纹去重后追加
-    added = []
-    seen = set()
-    for m in new_hist[anchor + 1:]:
-        f = fp(m)
-        if f in old_set or f in seen:
-            continue
-        seen.add(f)
-        added.append(m)
-    if not added:
-        return old_hist, 0
-    return old_hist + added, len(added)
+    store.save_current()
 
 
 def _fresh_sid() -> str:
-    """生成一个目录里绝对不存在的会话号。
-
-    直接 token_hex(4) 理论上够随机，但启动路径里出现过「老文件改名 .broken 后
-    又用同一 sid 重建」的情况，新会话写回去正好覆盖掉还没救回来的历史。
-    这里显式重试，撞号就换一个。
-    """
-    for _ in range(20):
-        sid = secrets.token_hex(4)
-        if not _sess_path(sid).exists() and sid not in _deleted_sids:
-            return sid
-    return secrets.token_hex(8)
+    """生成一个目录里绝对不存在的会话号（实现见 session_store）"""
+    return store.fresh_sid()
 
 
 def save_session_snapshot(sid: str, hist: list[dict]):
     """把指定快照写回指定会话文件（会话中途被切走时，用这招把结果送回原会话）"""
-    if sid and sid != current_sid:
-        _write_session(sid, hist)
-        return True
-    _write_session(sid or current_sid, hist)
-    return True
+    return store.save_snapshot(sid, hist)
 
 
 def _write_session(sid: str, hist: list[dict], allow_merge: bool = True):
-    """原子写入一个会话文件。
-
-    allow_merge=True（默认）：磁盘历史明显比本次要写的多时，不是简单拒绝，
-    而是做「磁盘为底 + 追加内存里多出来的新消息」的单调合并。
-    单纯拒绝虽然保住了老数据，但活会话的新消息会永远存不进去——
-    每次重启都退回老历史，用户看到的是「回复错乱/内容反复」。
-    合并后两边都不丢：老历史保底，新消息按需追加。
-    """
-    with _SESS_WRITE_LOCK:
-        if sid in _deleted_sids:
-            # 会话已删除：迟到的落盘一律作废，否则等于把删掉的会话又变出来
-            return
-        write_hist = hist
-        p = _sess_path(sid)
-        created = None
-        old_n = 0
-        old_hist = None
-        if p.exists():
-            try:
-                old = json.loads(p.read_text(encoding="utf-8"))
-                created = old.get("created")
-                old_hist = old.get("history") or []
-                old_n = len(old_hist)
-            except Exception:
-                pass
-
-        new_n = len(hist)
-        # 内存为空 = 刚建的新会话，绝不能拿磁盘老历史来「补全」；
-        # 也绝不能让空内容覆盖磁盘。两种情况都是直接拒绝写入。
-        if allow_merge and new_n == 0 and old_n > 0:
-            print(f"[DeckMeido] 拒绝空写入：会话 {sid} 磁盘有 {old_n} 条，"
-                  f"内存为空，保持磁盘内容不变", file=sys.stderr)
-            return
-        if allow_merge and old_n >= 6 and new_n < old_n / 2 and old_hist:
-            # 判为「缩水写」：留档 + 合并，而不是覆盖
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            bak = p.with_name(p.name + f".shrunk-{stamp}-{os.getpid()}")
-            try:
-                shutil.copy2(p, bak)
-            except Exception:
-                pass
-            merged, added = _merge_histories(old_hist, hist)
-            if merged is not None:
-                print(
-                    f"[DeckMeido] 缩水写已合并：会话 {sid} 磁盘 {old_n} 条 / 内存 {new_n} 条"
-                    f" → {len(merged)} 条（追加 {added} 条新消息），原文件留档 {bak.name}",
-                    file=sys.stderr,
-                )
-                write_hist = merged
-            else:
-                print(
-                    f"[DeckMeido] 无法合并：会话 {sid} 磁盘 {old_n} 条 / 内存 {new_n} 条"
-                    f"，保留磁盘内容，原文件留档 {bak.name}",
-                    file=sys.stderr,
-                )
-                write_hist = old_hist
-
-        data = {"id": sid, "created": created or time.time(), "updated": time.time(),
-                "history": write_hist}
-        _set_title(data, write_hist)
-        # 压缩游标必须一起落盘：否则重启后模型重新吃到全量历史，
-        # 白白撑爆上下文窗口，又要再压缩一遍
-        comp = _compact_for(sid)
-        if comp["upto"] or comp["summary"]:
-            data["compact"] = comp
-        # 原子写：先写临时文件再 replace。直接 write_text 覆盖时如果进程被杀/连接中断，
-        # 会留下半个 JSON，下次启动解析失败就等于整轮对话丢了
-        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
-        try:
-            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-            os.replace(tmp, p)
-        except Exception:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-            raise
+    """原子写入一个会话文件（实现与合并策略见 session_store.write_session）"""
+    store.write_session(sid, hist, allow_merge)
 
 
 # ---------- 流式正文的增量落盘 ----------
@@ -745,16 +767,6 @@ _RESTORE_MIN_CHARS = 0         # 恢复门槛已取消：一个字也救回来�
 # 只存最后那段正文的话，一轮里先说话、再调工具、再说一段的，中途被杀就只剩最后一段
 _stream_buf: dict = {"sid": "", "text": "", "last": 0.0, "written": 0, "parts": []}
 
-# 会话文件的全部落盘操作都在这一把锁里串行执行。
-# 流式回调（每 1 秒一次）、正式写入、_streaming 清理可能是并发的：
-#   1. 共用同一个 "<sid>.json.tmp" 临时文件 —— 两个线程同时写它，A 刚写完
-#      B 又覆盖，A 再 os.replace 就是把 B 的半截内容换上去，文件损坏；
-#   2. 更常见的是「读到旧数据再整体写回」：A 读到 54 条，B 在同一时刻写入
-#      55 条，A 随后把自己手里的 54 条写回去 —— 刚生成的回复凭空消失。
-#      _write_streaming 正是「读-改-写 _streaming 字段」，最容易踩第 2 条。
-# 加锁后这些读-改-写变成原子序列，最多是内容旧一点，绝不会互相抹掉。
-_SESS_WRITE_LOCK = threading.RLock()
-
 
 def _write_streaming(sid: str, text: str, parts: list[dict] | None = None) -> None:
     """把半截正文写进会话文件的 _streaming 字段（不动 history）
@@ -764,10 +776,10 @@ def _write_streaming(sid: str, text: str, parts: list[dict] | None = None) -> No
       {"type":"event","event":{...}} ← 思维链 / 工具时间线
     只存 text 的话，一轮里先说话、再调工具、再说一段的，中途被杀就只剩最后一段。
     """
-    with _SESS_WRITE_LOCK:
-        if sid in _deleted_sids:
+    with store.lock:
+        if sid in store.deleted_sids:
             return
-        p = _sess_path(sid)
+        p = store.sess_path(sid)
         data: dict = {}
         if p.exists():
             try:
@@ -801,7 +813,7 @@ def persist_stream(text: str, force: bool = False, parts: list[dict] | None = No
     parts 传入时同时更新缓冲区里「屏幕上出现过的内容」有序块列表，
     这样即便只存了最后一段正文，恢复时也能按原顺序把所有段落和事件拼回来。
     """
-    sid = _turn.get("sid") or current_sid
+    sid = store.turn.get("sid") or store.current_sid
     buf = _stream_buf
     if buf["sid"] != sid:
         # 换了会话或开了新一轮：重新开始累积
@@ -838,29 +850,17 @@ def _snapshot_parts(events: list[dict], tail_text: str = "") -> list[dict]:
 
 def clear_stream(sid: str = "") -> None:
     """正文已正式落盘，把残留的 _streaming 字段清掉"""
-    sid = sid or _turn.get("sid") or current_sid
-    _stream_buf.update({"sid": "", "text": "", "last": 0.0, "written": 0, "events": []})
-    with _SESS_WRITE_LOCK:
-        if sid in _deleted_sids:
+    sid = sid or store.turn.get("sid") or store.current_sid
+    _stream_buf.update({"sid": "", "text": "", "last": 0.0, "written": 0, "parts": []})
+    with store.lock:
+        if sid in store.deleted_sids:
             return
-        p = _sess_path(sid)
-        if not p.exists():
-            return
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
+        data = store.read_session(sid)
+        if not data:
             return
         if not data.pop("_streaming", None):
             return
-        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
-        try:
-            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-            os.replace(tmp, p)
-        except Exception:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+        store.rewrite_session(sid, data)
 
 
 _UPLOAD_RE = re.compile(r"!\[[^\]]*\]\((/uploads/[^\s)]+\.(?:png|jpe?g|webp))\)", re.I)
@@ -888,7 +888,7 @@ def _to_vision_content(text: str):
 
 def init_sessions():
     """启动时恢复最近的会话；没有历史则创建默认会话"""
-    global current_sid, history, _ctx_used, _sess_epoch
+    global _ctx_used
     files = sorted(SESSIONS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not files:
         save_current_session()
@@ -900,19 +900,19 @@ def init_sessions():
     # 所以空 history 的文件也当作不合格，继续往旧文件里找。
     def _restore(data: dict, src: Path) -> bool:
         """从一个会话文件恢复出完整状态；成功返回 True"""
-        global current_sid, history, _ctx_used
+        global _ctx_used
         sid = data.get("id") or src.stem
         hist = data.get("history") or []
         if not isinstance(hist, list) or not hist:
             return False
-        current_sid = sid
-        history = hist
+        store.current_sid = sid
+        store.history = hist
         comp = data.get("compact")
         if isinstance(comp, dict) and (comp.get("summary") or comp.get("upto")):
             _set_compact(sid, comp.get("summary") or "",
-                         min(int(comp.get("upto") or 0), len(history)))
+                         min(int(comp.get("upto") or 0), len(store.history)))
         else:
-            _compact_map.pop(sid, None)
+            store.drop_compact(sid)
         # 上一轮回答被打断：把当时流式落盘的半截正文恢复成一条「回答中断」的消息，
         # 否则用户只看到自己的提问，像是回答凭空消失了
         partial = data.pop("_streaming", None)
@@ -936,23 +936,23 @@ def init_sessions():
             partial_text = (partial_text + "\n\n" + tail_text).strip() if partial_text else tail_text
         if partial_text or evs:
             note = "\n\n（以上回答被中断，已保留屏幕上出现过的全部内容）"
-            history.append({"role": "assistant",
-                            "content": (partial_text.rstrip() + note) if partial_text else note.strip(),
-                            "events": evs, "interrupted": True,
-                            "ts": (partial.get("ts") if isinstance(partial, dict) else None) or time.time()})
+            store.history.append({"role": "assistant",
+                                  "content": (partial_text.rstrip() + note) if partial_text else note.strip(),
+                                  "events": evs, "interrupted": True,
+                                  "ts": (partial.get("ts") if isinstance(partial, dict) else None) or time.time()})
             print(f"[DeckMeido] 已恢复被中断的回答（{len(partial_text)} 字，{len(evs)} 个事件）",
                   file=sys.stderr)
-        _ctx_used = _estimate_tokens(_build_llm_msgs(history, SYSTEM_PROMPT, current_sid))
+        _ctx_used = _estimate_tokens(_build_llm_msgs(store.history, SYSTEM_PROMPT, store.current_sid))
         if partial is not None:
             # 无论是「恢复成消息」还是「判定太短丢弃」，都要把临时字段抹掉后落盘：
             #   - 不落盘：恢复出来的内容后端再死一次又没了
             #   - 不抹字段：文件上的 _streaming 还在，下次启动再恢复一遍，
             #     同一条回答会越重启越多
             try:
-                _write_session(current_sid, history)
+                _write_session(store.current_sid, store.history)
             except Exception as e:
                 print(f"[DeckMeido] 恢复中断回答后落盘失败：{e}", file=sys.stderr)
-        print(f"[DeckMeido] 已从 {src.name} 恢复会话 {current_sid}（{len(history)} 条）",
+        print(f"[DeckMeido] 已从 {src.name} 恢复会话 {store.current_sid}（{len(store.history)} 条）",
               file=sys.stderr)
         return True
 
@@ -976,13 +976,15 @@ def init_sessions():
             continue
 
     # 全部不可用：开一个全新会话顶上（换随机 sid，避免和目录里残存的旧文件撞号）
-    current_sid = _fresh_sid()
-    history = []
+    store.current_sid = _fresh_sid()
+    store.history = []
     _ctx_used = 0
     save_current_session()
 
 
-init_sessions()
+_load_initial_sessions = init_sessions
+_init_sessions = init_sessions
+_init_sessions()
 
 # 消息 feed（供原生客户端轮询同步，增量拉取）
 feed: list[dict] = []
@@ -995,8 +997,20 @@ def feed_push(type_: str, **kw):
     feed.append({"id": _feed_seq, "type": type_, "ts": time.time(), **kw})
     del feed[:-200]  # 最多保留 200 条
 
-# 待确认的危险操作 {name, args, description}
+# 待确认的危险操作 {name, args, description, sid, epoch, client, device}
+# sid/epoch/client/device 是「谁在什么会话里提的」：确认只认原会话原来源，
+# 否则任何连上的客户端随便一句「好」就能放行别人发起的危险命令
 pending_action: dict | None = None
+
+
+def _pending_matches(p: dict, sid: str, epoch: int,
+                     client: str | None, device: str | None) -> bool:
+    """这条待确认操作是不是本轮发起者自己提的"""
+    if p.get("sid") != sid or p.get("epoch") != epoch:
+        return False
+    # 来源也一起比：同一会话里换了个端发「好」不算确认（网页和插件能同时连）
+    return (p.get("client") or "") == (client or "") \
+        and (p.get("device") or "") == (device or "")
 
 
 # ---------- WebSocket 连接管理 ----------
@@ -1009,18 +1023,20 @@ class ConnectionManager:
         await ws.accept()
         self.active.add(ws)
 
-    def disconnect(self, ws: WebSocket):
+    async def disconnect(self, ws: WebSocket):
         self.active.discard(ws)
 
     async def broadcast(self, msg: dict):
-        dead = []
-        for ws in self.active:
-            try:
-                await ws.send_json(msg)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.active.discard(ws)
+        # 并发发：这里串行 await 的话，一条卡住的连接（手机切到后台、网络半死
+        # 但没断）就会把后面所有端的流式输出一起堵住
+        targets = list(self.active)
+        if not targets:
+            return
+        results = await asyncio.gather(*(ws.send_json(msg) for ws in targets),
+                                       return_exceptions=True)
+        for ws, res in zip(targets, results):
+            if isinstance(res, BaseException):
+                self.active.discard(ws)
 
     async def close_all(self, code: int = 1000):
         """按指定原因码断开所有连接（改令牌后用 4401，让前端回到鉴权页）"""
@@ -1089,7 +1105,8 @@ def get_status(gaming: bool | None = None) -> dict:
     if gaming is None:
         gaming = tools.mode_is_gaming()
     win = context_window()
-    used = _ctx_used or _estimate_tokens(_build_llm_msgs(history, SYSTEM_PROMPT, current_sid))
+    used = _ctx_used or _estimate_tokens(
+        _build_llm_msgs(store.history, SYSTEM_PROMPT, store.current_sid))
     pct = round(min(used / win, 1.0) * 100, 1) if win else 0
     return {
         "battery": int(battery) if battery.isdigit() else None,
@@ -1101,13 +1118,17 @@ def get_status(gaming: bool | None = None) -> dict:
         "running": bool(current_task and not current_task.done()),
         "llm_configured": llm.configured,
         "model": llm.model,
+        "thinking": bool(llm.reasoning_effort),
         "context": {
-            "messages": len(history),
-            "chars": sum(len(str(m.get("content", ""))) for m in history),
+            "messages": len(store.history),
+            "chars": sum(len(str(m.get("content", ""))) for m in store.history),
             "used": used,
             "window": win,
             "percent": pct,
             "compact_at": round(COMPACT_RATIO * 100),
+            # 最近一次请求的前缀缓存命中率（DeepSeek 才有；别家是 0，
+            # 前端据此决定要不要显示「缓存 xx%」）
+            "cache": llm.cache_stats(),
         },
         "workspace": str(tools.WORKSPACE),
         # 控制类控件（点击输入/窗口聚焦/原生打字/构建依赖）的实测结果，
@@ -1289,8 +1310,14 @@ def _expand_context(text: str, workspace: Path | None = None) -> str:
         if not p.is_absolute():
             p = root / p
         try:
+            # 和文件工具同一套边界：非 full 模式下不许把工作区外的文件
+            # （配置里的 Key、会话记录）读进提示词发给上游
+            p = tools.resolve_in_workspace(str(p))
             body = p.read_text(encoding="utf-8", errors="replace")[:6000]
             return f"\n[文件 {p} 的内容]：\n```\n{body}\n```\n"
+        except tools.OutsideWorkspace:
+            return (f"\n[文件 {p} 不在工作区内，已跳过。"
+                    f"需要读它请让用户切到「完全访问」]\n")
         except OSError as e:
             return f"\n[文件 {p} 读取失败：{e}]\n"
     return _CTX_RE.sub(repl, text) if "@{" in text else text
@@ -1304,7 +1331,7 @@ _TEXT_EXT = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", ".sh",
 _UPLOAD_MAX = 20 * 1024 * 1024
 
 
-def _extract_text(raw: bytes, ext: str):
+async def _extract_text(raw: bytes, ext: str):
     """尽量把文档抽成纯文本；抽不出来返回 None（按二进制附件处理）"""
     if ext in _TEXT_EXT:
         return raw.decode("utf-8", errors="replace")
@@ -1320,10 +1347,13 @@ def _extract_text(raw: bytes, ext: str):
         xml = xml.replace("</w:p>", "\n")
         return re.sub(r"<[^>]+>", "", xml).strip()
     if ext == ".pdf":
-        # 有 pdftotext 就抽文字层，没有就算了
+        # 有 pdftotext 就抽文字层，没有就算了。
+        # 走 to_thread：大 PDF 解析可能要十几秒，阻塞事件循环会让所有 ws 心跳停摆
         try:
-            r = subprocess.run(["pdftotext", "-q", "-", "-"], input=raw,
-                               capture_output=True, timeout=25)
+            r = await asyncio.to_thread(
+                subprocess.run, ["pdftotext", "-q", "-", "-"], input=raw,
+                capture_output=True, timeout=25,
+            )
         except (OSError, subprocess.SubprocessError):
             return None
         if r.returncode != 0:
@@ -1358,7 +1388,7 @@ async def api_upload(file: UploadFile):
 
     up = tools.WORKSPACE / "uploads"
     up.mkdir(parents=True, exist_ok=True)
-    body = _extract_text(raw, ext)
+    body = await _extract_text(raw, ext)
     if body is not None:
         # 有文字层就存成 .txt，@{} 展开时不会喂二进制给模型
         keep = up / f"{ts}_{stem}.txt"
@@ -1406,12 +1436,11 @@ async def api_workspace_file(path: str):
     return FileResponse(target, filename=target.name)
 
 
-@app.post("/api/file_stat", dependencies=[Depends(check_token)])
-async def api_file_stat(payload: dict):
-    """附件卡片补大小：{path: 相对工作区的路径} → {size, name}"""
-    rel = str(payload.get("path", "")).strip()
-    if not rel:
-        raise HTTPException(status_code=404, detail="file not found")
+def _workspace_file(rel: str) -> Path:
+    """把「相对工作区的路径」解析成真实文件，越界或不存在一律 404
+
+    模型给的链接是相对工作区的路径，这里只认这个根，防止 ../ 一路穿到工作区外面去。
+    """
     root = tools.WORKSPACE.resolve()
     try:
         target = (root / rel).resolve()
@@ -1419,6 +1448,75 @@ async def api_file_stat(payload: dict):
         raise HTTPException(status_code=404, detail="file not found")
     if root != target and root not in target.parents:
         raise HTTPException(status_code=403, detail="outside workspace")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    return target
+
+
+@app.post("/api/file_stat_batch", dependencies=[Depends(check_token)])
+async def api_file_stat_batch(payload: dict):
+    """附件卡片补大小（批量）：{paths: [...]} → {sizes: {path: 字节数}}
+
+    一条消息里可能有十几张卡片，逐张发请求在手机上就是十几次往返，
+    这里一次问完；查不到的路径直接不出现在结果里，前端就不显示大小。
+    """
+    paths = payload.get("paths") or []
+    if not isinstance(paths, list):
+        raise HTTPException(status_code=400, detail="paths must be a list")
+    sizes: dict[str, int] = {}
+    for rel in paths[:200]:          # 条数封顶：这是一次 UI 补全，不是文件浏览器
+        try:
+            sizes[str(rel)] = _workspace_file(str(rel)).stat().st_size
+        except (HTTPException, OSError):
+            continue
+    return {"sizes": sizes}
+
+
+@app.get("/api/zip", dependencies=[Depends(check_token)])
+async def api_zip(path: list[str] = Query(default=[]), name: str = Query(default="files.zip")):
+    """把多个工作区文件打成一个 zip 下载（网页端「打包下载」用）
+
+    在内存里打：一次打包的通常是模型刚生成的几个文档，几十 MB 量级，
+    落到临时文件反而要操心清理。
+    """
+    if not path:
+        raise HTTPException(status_code=400, detail="no files")
+    buf = io.BytesIO()
+    used: set[str] = set()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for rel in path[:200]:
+            try:
+                target = _workspace_file(rel)
+            except HTTPException:
+                continue
+            # 同名文件加序号，别让后面的覆盖前面的
+            arc = target.name
+            n = 1
+            while arc in used:
+                n += 1
+                arc = f"{target.stem}_{n}{target.suffix}"
+            used.add(arc)
+            try:
+                zf.write(target, arcname=arc)
+            except OSError:
+                continue
+    if not used:
+        raise HTTPException(status_code=404, detail="file not found")
+    data = buf.getvalue()
+    safe = re.sub(r"[^\w\-.]+", "_", Path(name).name)[:60] or "files.zip"
+    if not safe.lower().endswith(".zip"):
+        safe += ".zip"
+    return Response(data, media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{safe}"'})
+
+
+@app.post("/api/file_stat", dependencies=[Depends(check_token)])
+async def api_file_stat(payload: dict):
+    """附件卡片补大小：{path: 相对工作区的路径} → {size, name}"""
+    rel = str(payload.get("path", "")).strip()
+    if not rel:
+        raise HTTPException(status_code=404, detail="file not found")
+    target = _workspace_file(rel)
     try:
         return {"size": target.stat().st_size, "name": target.name}
     except OSError:
@@ -1495,9 +1593,11 @@ class ConfigUpdate(BaseModel):
     model: str | None = None
     tts_enable: bool | None = None
     permission_mode: str | None = None
+    # 深度思考档位：空串 / low / medium / high（前端滑条的「无 / 低 / 中 / 高」）
+    reasoning_effort: str | None = None
     workspace: str | None = None
     token: str | None = None
-    # 人设：整体写回 [persona]，空字符串表示「恢复默认」
+    # 人设：整体写回 meidosoul.json，空字符串表示「恢复默认」
     persona_name: str | None = None
     persona_address: str | None = None
     persona_tone: str | None = None
@@ -1506,11 +1606,27 @@ class ConfigUpdate(BaseModel):
     persona_forbid: str | None = None
     # 「截屏询问」提示词模板：空字符串表示恢复默认
     ask_template: str | None = None
+    # 更新源：mirror / github / mirror-only / github-only
+    update_source: str | None = None
 
 
 class AskTemplateUpdate(BaseModel):
     # 空 / 全空白表示恢复默认模板
     text: str = ""
+
+
+class MemoryItem(BaseModel):
+    """设置页手工教学用的记忆条目（text 为空 = 删除这条）"""
+    id: str | None = None
+    kind: str = "note"
+    text: str = ""
+
+
+class SoulImport(BaseModel):
+    """导入备份：人设 + 记忆。两部分都可缺省，缺的保持原样"""
+    persona: dict | None = None
+    memory: list[dict] | None = None
+    replace: bool = True
 
 
 def _mask_key(key: str) -> str:
@@ -1537,6 +1653,7 @@ async def api_get_config():
         "api_key_set": bool(llm.api_key.strip()),
         "api_key_masked": _mask_key(llm.api_key),
         "model": llm.model,
+        "reasoning_effort": llm.reasoning_effort,
         "tts_enable": tts.enable,
         "permission_mode": PERMISSION_MODE,
         "workspace": str(tools.WORKSPACE),
@@ -1555,7 +1672,89 @@ async def api_get_config():
         # 「截屏询问」的提示词模板：插件设置区里可以直接改
         "ask_template": ASK_TEMPLATE,
         "ask_template_default": DEFAULT_ASK_TEMPLATE,
+        # 更新源：updater 从 config.toml 的 [update] 段读，缺省即默认值
+        "update_source": updater.update_cfg()["source"],
+        "update_source_label": updater.source_label(),
+        "update_mirror": updater.update_cfg()["mirror"],
+        # 长期记忆的条数概览（正文单独走 /api/memory，设置页按需拉）
+        "memory": memory.stats(),
     }
+
+
+@app.get("/api/memory", dependencies=[Depends(check_token)])
+async def api_get_memory():
+    """全部长期记忆，按「类别 + 创建时间」排好，和注入顺序一致"""
+    items = memory.load()["items"]
+    order = list(memory.KINDS)
+    items = sorted(items, key=lambda x: (order.index(x["kind"]), x["created"]))
+    return {"items": items, "kinds": [{"id": k, "name": v} for k, v in memory.KINDS.items()]}
+
+
+@app.post("/api/memory", dependencies=[Depends(check_token)])
+async def api_save_memory(req: MemoryItem):
+    """新增 / 修改 / 删除一条记忆
+
+    带 id 且 text 为空 = 删除；带 id 且 text 非空 = 修改；不带 id = 新增。
+    """
+    if not req.id:
+        item = memory.add(req.kind, req.text)
+        if not item:
+            raise HTTPException(status_code=400, detail="内容不能为空")
+        return {"ok": True, "item": item}
+    if not memory.update(req.id, req.text, req.kind):
+        raise HTTPException(status_code=404, detail="这条记忆已不存在")
+    return {"ok": True}
+
+
+@app.delete("/api/memory/{mid}", dependencies=[Depends(check_token)])
+async def api_delete_memory(mid: str):
+    if not memory.remove(mid):
+        raise HTTPException(status_code=404, detail="这条记忆已不存在")
+    return {"ok": True}
+
+
+@app.delete("/api/memory", dependencies=[Depends(check_token)])
+async def api_clear_memory():
+    memory.clear()
+    return {"ok": True}
+
+
+# ---------- 人设 + 记忆的导出 / 导入 ----------
+# 这两样就是「她这个人」的全部：人设在 meidosoul.json，记忆在 memory.json，
+# 换机器、重装系统、想备份一份，都应该一次拷走。
+
+@app.get("/api/soul/export", dependencies=[Depends(check_token)])
+async def api_export_soul():
+    """导出人设与全部记忆，返回一个可以直接存盘的 JSON"""
+    items = memory.load()["items"]
+    order = list(memory.KINDS)
+    items = sorted(items, key=lambda x: (order.index(x["kind"]), x["created"]))
+    return {
+        "kind": "meidosoul",
+        "version": 1,
+        "exported": time.time(),
+        "persona": persona.load(),
+        "memory": items,
+    }
+
+
+@app.post("/api/soul/import", dependencies=[Depends(check_token)])
+async def api_import_soul(req: SoulImport):
+    """导入备份。replace=True 覆盖，False 则只补缺（人设仍整体覆盖）"""
+    if req.persona is not None:
+        persona.save(req.persona)
+        reload_persona()
+    added = 0
+    if req.memory is not None:
+        if req.replace:
+            memory.clear()
+        # 逐条走 memory.add：它自己会去重、截断、按上限淘汰，
+        # 备份文件里就算有脏数据也不会把记忆撑坏
+        for it in req.memory:
+            if isinstance(it, dict) and memory.add(str(it.get("kind") or "note"),
+                                                   str(it.get("text") or "")):
+                added += 1
+    return {"ok": True, "added": added, "memory": memory.stats()}
 
 
 @app.get("/api/token/gen", dependencies=[Depends(check_token)])
@@ -1621,6 +1820,10 @@ async def api_set_config(req: ConfigUpdate):
         updates["llm"] = llm_updates
     if req.tts_enable is not None:
         updates["tts"] = {"enable": req.tts_enable}
+    if req.reasoning_effort is not None and req.reasoning_effort in ("", "low", "medium", "high"):
+        # 深度思考滑条：空串 = 不带参数（不思考），其余原样写进 [llm]。
+        # 空串要显式落盘，不能当作「没传」忽略，否则关掉之后再打开还是旧的档位
+        llm_updates["reasoning_effort"] = req.reasoning_effort
     if req.permission_mode in ("manual", "auto", "full"):
         updates["security"] = {"permission_mode": req.permission_mode}
     if req.workspace is not None and req.workspace.strip():
@@ -1631,20 +1834,25 @@ async def api_set_config(req: ConfigUpdate):
         tpl = req.ask_template.strip() or DEFAULT_ASK_TEMPLATE
         updates.setdefault("agent", {})["ask_template"] = tpl
     if req.persona_name is not None:
-        # 人设走设置页写入，用户不需要（也不该被迫）去改 config.toml。
+        # 人设存 meidosoul.json（和记忆放在一起，方便导出备份），不写 config.toml。
         # 留空就写回默认值，避免空串把人设搞没。
         forbid = [w.strip() for w in re.split(r"[,，、\s]+", req.persona_forbid or "") if w.strip()]
-        updates["persona"] = {
+        persona.save({
             "name": req.persona_name.strip() or "DeckMeido",
             "traits": PERSONA.get("traits", ""),
+            "extra": PERSONA.get("extra", ""),
             "style": {
-                "address": (req.persona_address or "").strip() or "主人",
-                "tone": (req.persona_tone or "").strip(),
-                "ending": (req.persona_ending or "").strip(),
-                "suffix": (req.persona_suffix or "").strip(),
+                "address": req.persona_address or "",
+                "tone": req.persona_tone or "",
+                "ending": req.persona_ending or "",
+                "suffix": req.persona_suffix or "",
                 "forbid": forbid,
             },
-        }
+        })
+        reload_persona()
+    if req.update_source in ("mirror", "github", "mirror-only", "github-only"):
+        # 只写 source；mirror / github_repo 的地址留给 [update] 段（一般不用改）
+        updates["update"] = {"source": req.update_source}
     if req.token is not None:
         # 统一存成小写，避免 config 里大小写混着看花眼（校验本来就不分大小写）
         new_token = req.token.strip().lower()
@@ -1663,7 +1871,10 @@ async def api_set_config(req: ConfigUpdate):
         if TOKEN != old_token:
             await manager.close_all(4401)
     return {"ok": True, "llm_configured": llm.configured, "workspace": str(tools.WORKSPACE),
-            "token": TOKEN}
+            "token": TOKEN,
+            # 回传归一之后的实值：前端滑条按它落位（比如 DeepSeek 上的「中」实际是 high）
+            "reasoning_effort": llm.reasoning_effort,
+            "model": llm.model}
 
 
 @app.post("/api/tts", dependencies=[Depends(check_token_any)])
@@ -1702,6 +1913,8 @@ async def api_version():
     return {
         "version": VERSION,
         "repo": updater.REPO,
+        "update_source": updater.update_cfg()["source"],
+        "update_source_label": updater.source_label(),
         "is_git": (INSTALL_DIR / ".git").exists(),
         "install_dir": str(INSTALL_DIR),
         "update": update_cache,
@@ -1741,15 +1954,20 @@ async def update_watch_loop():
     while True:
         try:
             info = await updater.check()
+            # used=实际问到结果的源；fallback=前面失败的源（用于提示「已切备用源」）
+            used = info.get("source") or ""
+            base = {"source": used, "source_label": info.get("source_label", ""),
+                    "fallback": info.get("fallback_from") or []}
             if info["has_update"]:
                 update_cache = {"has_update": True, "latest": info["tag"],
-                                "current": info["current"], "url": info.get("url", "")}
+                                "current": info["current"], "url": info.get("url", ""), **base}
                 await manager.broadcast({"type": "update_available", **update_cache})
             else:
-                update_cache = {"has_update": False, "current": info["current"]}
-        except Exception:
-            # 网络不通、被墙都属正常，静默跳过，下次再试
-            pass
+                update_cache = {"has_update": False, "current": info["current"], **base}
+        except Exception as exc:
+            # 两个源都连不上（断网、被墙）属正常情况，记下原因下次再试
+            update_cache = {"has_update": False, "current": updater.current_version(),
+                            "error": str(exc)[:300]}
         await asyncio.sleep(UPDATE_INTERVAL)
 
 
@@ -1787,13 +2005,15 @@ async def api_models(base_url: str = "", api_key: str = ""):
 @app.post("/api/retry", dependencies=[Depends(check_token)])
 async def api_retry():
     global pending_action
-    if pending_action:
+    # 只有本会话挂起的操作才挡重试；别的会话挂着的与本端无关
+    if pending_action and _pending_matches(
+            pending_action, store.current_sid, store.epoch, None, None):
         raise HTTPException(status_code=400, detail="有待确认的操作，先回复确认或取消")
-    if history and history[-1]["role"] == "assistant":
-        history.pop()
-    if not history or history[-1]["role"] != "user":
+    if store.history and store.history[-1]["role"] == "assistant":
+        store.history.pop()
+    if not store.history or store.history[-1]["role"] != "user":
         raise HTTPException(status_code=400, detail="没有可重试的用户消息")
-    text = history.pop()["content"]
+    text = store.history.pop()["content"]
     return await start_chat(text, announce=False)
 
 
@@ -1803,15 +2023,19 @@ async def handle_chat(text: str, announce: bool = True,
                       workspace: Path | None = None,
                       client: str | None = None,
                       device: str | None = None,
-                      brief: str = "") -> dict:
+                      brief: str = "",
+                      turn_id: str = "") -> dict:
     """brief 是给界面看的短文案（可选）：截屏询问那套提示词有一百多字，
    插件面板长显会把整个面板撑开。它只随消息存下来供各端显示，
    真正发给模型、算进上下文的仍然是 text。"""
     global pending_action, _ctx_used
     # 本轮归属快照：整轮全程只认这份 sid/epoch，中途别的端新建/切换会话也不影响它
-    turn_sid = current_sid
-    turn_epoch = _sess_epoch
-    _turn.update({"sid": turn_sid, "epoch": turn_epoch, "active": True})
+    turn_sid = store.current_sid
+    turn_epoch = store.epoch
+    store.turn.update({"sid": turn_sid, "epoch": turn_epoch, "active": True,
+                       "turn_id": turn_id,
+                       # 谁提的这一轮：危险操作挂起时要跟着记下，确认时只认它
+                       "client": client or "", "device": device or ""})
     # 每轮开头强制复位一次遮罩状态：上一轮若在取消/异常路径里漏了
     # set_overlay(False)，这里不清就会一直盖着；passthrough 漏了就反过来，
     # 遮罩会一直藏着不显示（用户就没了终止入口），所以两个都复位
@@ -1820,8 +2044,12 @@ async def handle_chat(text: str, announce: bool = True,
     _overlay_state["passthrough"] = False
     # 本轮使用的历史对象。会话操作已改成「换对象」而不是原地清空，
     # 所以这里拿到的引用在被切走之后依然只属于这一轮
-    hist = history
+    hist = store.history
     sid_tag = {"sid": turn_sid}
+    # 发起端自带的 turn_id 原样回显到这一轮的每条广播上：sid 是整个会话共用的，
+    # 别的端提问时 sid 一样，发起端没法靠它认出「哪些 δ 是我这一轮的」
+    if turn_id:
+        sid_tag["turn_id"] = turn_id
     # 图片解析失败不能静默丢掉：用户以为「发了张图」，模型却只收到了文字
     image_part, image_blob = _pack_image(image, image_prompt) if image else (None, None)
     if image and not image_part:
@@ -1872,9 +2100,11 @@ async def handle_chat(text: str, announce: bool = True,
     if image_part:
         hist.append(image_part)
     events: list[dict] = []
+    # run_agent 在终止时会往这里塞本轮执行过的工具，供落盘时做交接（见 _aborted_note）
+    tool_log: list[dict] = []
     # 标题取自第一条用户消息，所以用户一发出就落盘并刷新侧栏，不必等整轮回答结束
     save_session_snapshot(turn_sid, hist)
-    await manager.broadcast({"type": "session_changed", "current": current_sid})
+    await manager.broadcast({"type": "session_changed", "current": store.current_sid})
 
     # 上下文逼近模型窗口上限时自动压缩（摘要替换旧对话，不再直接丢弃）。
     # _ctx_used 在切换会话等路径上会归零，这时按当前历史重新估算一次，
@@ -1890,21 +2120,29 @@ async def handle_chat(text: str, announce: bool = True,
         # 遮罩的起落就在下面调用工具的前后（见 tools.touches_screen），这里不再常开。
         if not llm.configured:
             reply = "还没有配置模型。点右上角「设置」填好 API 地址和 Key 就能开始对话。"
+        elif pending_action and not _pending_matches(
+                pending_action, turn_sid, turn_epoch, client, device):
+            # 挂起的操作不是这个会话/这个端提的：既不能替别人确认，也不该
+            # 因为别处的对话把这边的手头操作清掉，按普通消息继续
+            reply = await _run_agent_guarded(events, hist=hist, image_part=image_part,
+                                             tool_log=tool_log)
         elif pending_action and tools.is_confirm(text):
             # 用户确认了挂起的危险操作
             action, pending_action = pending_action, None
             events.append({"type": "tool", "name": action["name"],
                            "summary": action["description"], "files": [], "approved": True})
             result = await tools.execute(action["name"], action["args"])
+            tool_log.append({"name": action["name"], "summary": action["description"]})
             reply = f"已完成：{action['description']}\n{result}"
         elif pending_action:
             # 有新消息但未确认，取消挂起操作
             action, pending_action = pending_action, None
             reply = f"已取消：{action['description']}。\n\n" + await run_agent(
-                events, hist=hist, image_part=image_part)
+                events, hist=hist, image_part=image_part, tool_log=tool_log)
         else:
             # 画面要一路传进 run_agent：它才知道这一轮不用自己再截图
-            reply = await _run_agent_guarded(events, hist=hist, image_part=image_part)
+            reply = await _run_agent_guarded(events, hist=hist, image_part=image_part,
+                                             tool_log=tool_log)
     except asyncio.CancelledError:
         # 用户点了终止：广播终止消息并向上传递
         await manager.broadcast({"type": "assistant_message", "text": "已终止当前操作",
@@ -1919,13 +2157,17 @@ async def handle_chat(text: str, announce: bool = True,
         killed_text = "\n\n".join(s.strip() for s in killed_segs if s.strip()).strip()
         if partial.strip() and partial.strip() not in killed_text:
             killed_text = (killed_text + "\n\n" + partial.strip()).strip() if killed_text else partial.strip()
-        if killed_text:
-            hist.append({"role": "assistant", "content": killed_text,
-                         "events": events, "interrupted": True, "ts": time.time(),
-                         **src_tag})
+        # 无论有没有留下正文，都要落一条带 aborted_turn 的 assistant 消息：
+        # 它带着这一轮做过哪些工具，下一轮靠它告诉模型「已经终止，别接着做」
+        # （见 _aborted_note）。以前只在有正文时才落，于是刚开跑就被终止的
+        # 那一轮在历史里不留痕迹，模型下一句就照旧把半截任务续上
+        hist.append({"role": "assistant", "content": killed_text,
+                     "events": events, "interrupted": True, "aborted_turn": True,
+                     "tool_log": list(tool_log), "ts": time.time(),
+                     **src_tag})
         save_session_snapshot(turn_sid, hist)
         clear_stream(turn_sid)
-        _turn["active"] = False
+        store.turn["active"] = False
         raise
     finally:
         set_overlay(False)
@@ -1943,8 +2185,8 @@ async def handle_chat(text: str, announce: bool = True,
     # 正文已正式进 history，清掉流式残留（否则下次启动会多恢复出一条重复的「中断回答」）
     clear_stream(turn_sid)
     detached = _turn_detached(turn_epoch)
-    _turn["active"] = False
-    turn_deleted = turn_sid in _deleted_sids
+    store.turn["active"] = False
+    turn_deleted = turn_sid in store.deleted_sids
     if turn_deleted:
         # 这一轮跑到一半会话被删了：结果按用户意愿丢弃，但要明确告知，
         # 否则用户看到的是「回答消失了」
@@ -1980,6 +2222,17 @@ def _need_compact(used: int) -> bool:
     return bool(win) and used / win >= COMPACT_RATIO
 
 
+def _recent_limit() -> int:
+    """一次请求里最多带多少条历史
+
+    旧版 DeepSeek 接口有「单次最多 64 条 message、超出静默丢弃」的限制，
+    现在这条限制已经取消，按 token 压缩就够了，不必为了凑条数去砍历史——
+    砍掉中间一段反而会让后面的前缀全部失配（缓存直接掉到 0）。
+    这里仍留一个宽松上限兜底，防止超长工具循环把请求撑到离谱。
+    """
+    return 200
+
+
 def _compact_end(hist: list[dict], start: int) -> int:
     """算出这次压缩要把游标推进到第几条（即 end：history[start:end] 会被摘要）
 
@@ -1987,6 +2240,10 @@ def _compact_end(hist: list[dict], start: int) -> int:
     COMPACT_TARGET_LEFT」为止。这样压缩完上下文会明显低于触发阈值，
     而不是像以前那样只压掉几条、下一轮工具调用又顶回去。
     最近 2 条（用户那句 + 上一条）永远保留，避免新一轮刚开始就没有前文。
+
+    条数上限按「请求里最多带多少条」反推（见 _recent_limit）：超过上限的消息
+    DeepSeek 会直接忽略、而且不报错，表现就是「它突然忘了刚才说的事」。
+    所以宁可多压一点，也不能让留给模型的那段被服务端悄悄截掉。
     """
     total = len(hist)
     if total - start <= 2:
@@ -1995,8 +2252,9 @@ def _compact_end(hist: list[dict], start: int) -> int:
     acc = 0
     end = total
     # 从最新一条往前累，直到快超出剩余额度为止。
-    # 60 条的位置上限只是兜底：避免极短消息堆积时留下几十条造成「该压却不压」
-    for i in range(total - 1, max(start, total - 60), -1):
+    # 位置上限 = 请求条数上限减去「本轮新加的工具往返」的余量
+    oldest = max(start, total - _recent_limit())
+    for i in range(total - 1, oldest, -1):
         acc += _estimate_tokens([hist[i]])
         if acc > budget:
             break
@@ -2011,7 +2269,6 @@ def _compact_end(hist: list[dict], start: int) -> int:
     return min(end, total)
 
 
-
 async def compact_history(auto: bool = False, hist: list[dict] | None = None,
                           sid: str = "") -> str:
     """把较早的对话压缩成摘要，**只影响发给模型的上下文，不动界面历史**
@@ -2021,8 +2278,8 @@ async def compact_history(auto: bool = False, hist: list[dict] | None = None,
     摘要与 upto 存进文件，history 保持完整，重启后界面能一条不少地回放。
     """
     global _ctx_used
-    hist = history if hist is None else hist
-    sid = sid or _turn.get("sid") or current_sid
+    hist = store.history if hist is None else hist
+    sid = sid or store.turn.get("sid") or store.current_sid
     comp = _compact_for(sid)
     # 已经压缩过的部分不再重复参与摘要。
     #
@@ -2043,22 +2300,35 @@ async def compact_history(auto: bool = False, hist: list[dict] | None = None,
     if comp["summary"].strip():
         parts.append("【前情摘要】\n" + comp["summary"])
     parts.append("【新增对话】\n" + "\n".join(
-        f"{'用户' if m['role'] == 'user' else '助手'}: {str(m.get('content'))[:500]}" for m in old))
+        # 每条按固定长度截断：摘要请求不带 tools、system 也固定，
+        # 只要游标是从同一位置往后压，前缀就能和上一轮对齐（DeepSeek 硬盘缓存）
+        f"{'用户' if m['role'] == 'user' else '助手'}: {_digest_text(m)[:500]}" for m in old))
+    digest = "\n\n".join(parts)
+    sys_msg = {"role": "system", "content": (
+        "把下面的对话压缩成一份简洁摘要（中文），保留：用户的目标/偏好、"
+        "已完成的操作及结果、待办事项、关键文件路径。直接输出摘要正文。")}
     try:
-        summary = await llm.chat([
-            {"role": "system", "content": "把下面的对话压缩成一份简洁摘要（中文），保留：用户的目标/偏好、已完成的操作及结果、待办事项、关键文件路径。直接输出摘要正文。"},
-            {"role": "user", "content": "\n\n".join(parts)},
-        ])
+        summary = await llm.chat([sys_msg, {"role": "user", "content": digest}])
+        # 弱模型有时只回一句「用户询问了某问题」，那么长的历史一压就没了。
+        # 摘要短到不成比例时补一次：明确指出漏了哪些栏位，仍不合格就用原文兜底。
+        if len(summary.strip()) < max(120, len(digest) // 20):
+            retry_sys = {"role": "system", "content": (
+                "上一次的摘要太简略，丢掉了很多信息。请重新压缩，必须分段写清："
+                "① 用户的目标与偏好 ② 已执行的操作及结果（含命令与文件路径）"
+                "③ 未完成的待办 ④ 已知的结论与报错。不要评论，直接输出摘要正文。")}
+            again = await llm.chat([retry_sys, {"role": "user", "content": digest}])
+            if len(again.strip()) > len(summary.strip()):
+                summary = again
     except Exception as e:
         return f"压缩失败，历史原样保留：{e}"
     _set_compact(sid, summary, end)
     _ctx_used = _estimate_tokens(_build_llm_msgs(hist, SYSTEM_PROMPT, sid))
     # 游标要和会话文件一起持久化，否则重启后模型会重新吃到全量历史
-    if sid == current_sid:
+    if sid == store.current_sid:
         save_current_session()
     else:
         save_session_snapshot(sid, hist)
-    if sid in _deleted_sids:
+    if sid in store.deleted_sids:
         # 压缩摘要别往已删除的会话上写系统提示
         return summary
     note = (f"{'已自动压缩上下文' if auto else '已压缩上下文'}"
@@ -2102,7 +2372,15 @@ def _sd_card_info() -> dict:
 
 @app.get("/api/sysinfo", dependencies=[Depends(check_token)])
 async def api_sysinfo():
-    """侧栏状态卡：CPU / 内存 / SSD / 内存卡占用 / 电量 / 运行时长 / 局域网 IP"""
+    """侧栏状态卡：CPU / 内存 / SSD / 内存卡占用 / 电量 / 运行时长 / 局域网 IP
+
+    采集全程要读 /proc、遍历挂载点、还要 fork 一次 `ip`，放到线程里做：
+    这个接口是 5 秒一刷的，同步跑会把事件循环卡住。
+    """
+    return await asyncio.to_thread(_read_sysinfo)
+
+
+def _read_sysinfo() -> dict:
     try:
         import psutil
         vm = psutil.virtual_memory()
@@ -2158,28 +2436,29 @@ async def api_sessions():
                           "updated": d.get("updated", 0), "messages": len(d.get("history", []))})
         except Exception:
             continue
-    return {"current": current_sid, "items": items}
+    return {"current": store.current_sid, "items": items}
 
 
 @app.post("/api/sessions/create", dependencies=[Depends(check_token)])
 async def api_session_create():
-    global current_sid, history, _ctx_used, _sess_epoch
+    global _ctx_used
     save_current_session()
-    current_sid = _fresh_sid()
+    store.current_sid = _fresh_sid()
     # 换对象而不是原地 clear：还在跑的那一轮持有旧列表引用，
     # 原地清空会把它的历史一起抹掉，结果就变成「有问无答」
-    history = []
+    store.history = []
     # 上下文占用计数必须一起清零，否则新会话会沿用上一个会话的用量
     _ctx_used = 0
     # 代次 +1：正在跑的那一轮会据此发现自己的会话已被换掉
-    _sess_epoch += 1
-    _turn["active"] = False
+    store.bump_epoch()
+    store.turn["active"] = False
     save_current_session()
-    await manager.broadcast({"type": "history", "messages": history, "sid": current_sid})
-    await manager.broadcast({"type": "session_changed", "current": current_sid})
+    await manager.broadcast({"type": "history", "messages": store.history,
+                             "sid": store.current_sid})
+    await manager.broadcast({"type": "session_changed", "current": store.current_sid})
     await manager.broadcast({"type": "system", "text": "已开始新会话", "ts": time.time()})
     feed_push("system", text="已开始新会话")
-    return {"ok": True, "id": current_sid}
+    return {"ok": True, "id": store.current_sid}
 
 
 class SwitchReq(BaseModel):
@@ -2188,26 +2467,28 @@ class SwitchReq(BaseModel):
 
 @app.post("/api/sessions/switch", dependencies=[Depends(check_token)])
 async def api_session_switch(req: SwitchReq):
-    global current_sid, history, _ctx_used, _sess_epoch
+    global _ctx_used
     p = _sess_path(req.id)
     if not p.exists():
         raise HTTPException(status_code=404, detail="session not found")
     save_current_session()
     data = json.loads(p.read_text(encoding="utf-8"))
-    current_sid = data.get("id", req.id)
+    store.current_sid = data.get("id", req.id)
     # 同样换对象：在跑的那一轮仍持有旧列表，不受切换影响
-    history = data.get("history", [])
+    store.history = data.get("history", [])
     comp = data.get("compact")
     if isinstance(comp, dict) and (comp.get("summary") or comp.get("upto")):
-        _set_compact(current_sid, comp.get("summary") or "",
-                     min(int(comp.get("upto") or 0), len(history)))
+        _set_compact(store.current_sid, comp.get("summary") or "",
+                     min(int(comp.get("upto") or 0), len(store.history)))
     else:
-        _compact_map.pop(current_sid, None)
-    _ctx_used = _estimate_tokens(_build_llm_msgs(history, SYSTEM_PROMPT, current_sid))
-    _sess_epoch += 1
-    _turn["active"] = False
-    await manager.broadcast({"type": "history", "messages": history, "sid": current_sid})
-    await manager.broadcast({"type": "session_changed", "current": current_sid})
+        store.drop_compact(store.current_sid)
+    _ctx_used = _estimate_tokens(
+        _build_llm_msgs(store.history, SYSTEM_PROMPT, store.current_sid))
+    store.bump_epoch()
+    store.turn["active"] = False
+    await manager.broadcast({"type": "history", "messages": store.history,
+                             "sid": store.current_sid})
+    await manager.broadcast({"type": "session_changed", "current": store.current_sid})
     return {"ok": True}
 
 
@@ -2229,14 +2510,14 @@ async def api_message_delete(req: MsgDeleteReq):
     只有一条），用序号会删错行。ts 是每条消息落盘时就写进去的，唯一且稳定。
     """
     global _ctx_used
-    if _turn.get("active"):
+    if store.turn.get("active"):
         raise HTTPException(status_code=409, detail="本轮回答还在生成，请等它结束再删除")
 
     hidx = -1
     if req.ts:
         # 时间戳浮点比较留一点容差：JSON 往返可能丢精度
         best = None
-        for i, m in enumerate(history):
+        for i, m in enumerate(store.history):
             t = m.get("ts")
             if not isinstance(t, (int, float)):
                 continue
@@ -2247,55 +2528,56 @@ async def api_message_delete(req: MsgDeleteReq):
     if hidx < 0:
         # 没有匹配到 ts：退化成「删同角色最后一条」，避免前端按钮完全失效
         want = req.role if req.role in ("user", "assistant") else "assistant"
-        for i in range(len(history) - 1, -1, -1):
-            if history[i].get("role") == want:
+        for i in range(len(store.history) - 1, -1, -1):
+            if store.history[i].get("role") == want:
                 hidx = i
                 break
     if hidx < 0:
         raise HTTPException(status_code=404, detail="找不到这条消息")
 
-    target = history[hidx]
+    target = store.history[hidx]
     removed = 1
     # 删用户消息时，把紧跟着的那条助手回答一起带走：
     # 只删提问留着回答，模型下次读历史会看到「没有问题的答案」，很容易胡接
     if req.with_reply and target.get("role") == "user":
-        if hidx + 1 < len(history) and history[hidx + 1].get("role") == "assistant":
-            del history[hidx + 1]
+        if hidx + 1 < len(store.history) and store.history[hidx + 1].get("role") == "assistant":
+            del store.history[hidx + 1]
             removed += 1
-    del history[hidx]
+    del store.history[hidx]
 
     # 压缩游标要跟着收：否则游标指向的条数比历史还长，
     # 发给模型的上下文会整段错位（摘要跳过了还没被摘要的消息）
-    sid = current_sid
+    sid = store.current_sid
     comp = _compact_for(sid)
-    if comp["upto"] > len(history):
-        _set_compact(sid, comp["summary"], len(history))
+    if comp["upto"] > len(store.history):
+        _set_compact(sid, comp["summary"], len(store.history))
 
     save_current_session()
-    _ctx_used = _estimate_tokens(_build_llm_msgs(history, SYSTEM_PROMPT, current_sid))
-    await manager.broadcast({"type": "session_changed", "current": current_sid})
-    return {"ok": True, "removed": removed, "left": len(history)}
+    _ctx_used = _estimate_tokens(
+        _build_llm_msgs(store.history, SYSTEM_PROMPT, store.current_sid))
+    await manager.broadcast({"type": "session_changed", "current": store.current_sid})
+    return {"ok": True, "removed": removed, "left": len(store.history)}
 
 
 @app.delete("/api/sessions/{sid}", dependencies=[Depends(check_token)])
 async def api_session_delete(sid: str):
-    global current_sid, history, _ctx_used, _sess_epoch
+    global _ctx_used
     # 先拉黑再删文件：反过来的话，删完到拉黑之间那一瞬间的落盘（流式回调）
     # 就能把文件写回来，等于白删
-    _deleted_sids.add(sid)
+    store.deleted_sids.add(sid)
     p = _sess_path(sid)
     if p.exists():
         try:
             p.unlink()
         except OSError as e:
-            _deleted_sids.discard(sid)
+            store.deleted_sids.discard(sid)
             raise HTTPException(status_code=500, detail=f"删除失败：{e}")
-    if sid == current_sid:
+    if sid == store.current_sid:
         # 删掉的是当前会话。以前这里无条件 _fresh_sid() 再落盘一个空会话，
         # 于是「删一个」必然「多一个」；现在先试着切到剩下最新的那个，
         # 真的一个都不剩了才新建（且标题带时间，不再和别的「新会话」重名）
-        _sess_epoch += 1
-        _turn["active"] = False
+        store.bump_epoch()
+        store.turn["active"] = False
         rest = []
         for f in sorted(SESSIONS_DIR.glob("*.json"),
                         key=lambda x: x.stat().st_mtime, reverse=True):
@@ -2303,29 +2585,31 @@ async def api_session_delete(sid: str):
                 d = json.loads(f.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            if (d.get("id") or f.stem) in _deleted_sids:
+            if (d.get("id") or f.stem) in store.deleted_sids:
                 continue
             rest.append(d)
         nxt = next((d for d in rest if d.get("history")), None)
         if nxt is None:
-            current_sid = _fresh_sid()
-            history = []
+            store.current_sid = _fresh_sid()
+            store.history = []
             _ctx_used = 0
             save_current_session()
         else:
-            current_sid = nxt.get("id") or _fresh_sid()
+            store.current_sid = nxt.get("id") or _fresh_sid()
             # 换对象而不是原地 clear：在跑的那一轮仍持有旧列表引用
-            history = nxt.get("history") or []
+            store.history = nxt.get("history") or []
             comp = nxt.get("compact")
             if isinstance(comp, dict) and (comp.get("summary") or comp.get("upto")):
-                _set_compact(current_sid, comp.get("summary") or "",
-                             min(int(comp.get("upto") or 0), len(history)))
+                _set_compact(store.current_sid, comp.get("summary") or "",
+                             min(int(comp.get("upto") or 0), len(store.history)))
             else:
-                _compact_map.pop(current_sid, None)
-            _ctx_used = _estimate_tokens(_build_llm_msgs(history, SYSTEM_PROMPT, current_sid))
-        await manager.broadcast({"type": "history", "messages": history, "sid": current_sid})
-        await manager.broadcast({"type": "session_changed", "current": current_sid})
-    return {"ok": True, "current": current_sid}
+                store.drop_compact(store.current_sid)
+            _ctx_used = _estimate_tokens(
+                _build_llm_msgs(store.history, SYSTEM_PROMPT, store.current_sid))
+        await manager.broadcast({"type": "history", "messages": store.history,
+                                 "sid": store.current_sid})
+        await manager.broadcast({"type": "session_changed", "current": store.current_sid})
+    return {"ok": True, "current": store.current_sid}
 
 
 # 旧接口兼容：新会话
@@ -2344,7 +2628,7 @@ async def api_checkpoint():
     flushed = False
     try:
         text = _stream_buf.get("text") or ""
-        if _turn.get("active") and text.strip():
+        if store.turn.get("active") and text.strip():
             persist_stream(text, force=True, parts=_stream_buf.get("parts") or [])
             flushed = True
     except Exception:
@@ -2352,11 +2636,22 @@ async def api_checkpoint():
     # 只刷「还没落盘的流式正文」，不要拿内存 history 覆盖文件：
     # 用户消息在 handle_chat 开头就落盘了，正文在收尾时落盘，内存里的东西不比文件新。
     # 反过来覆盖一次就可能把文件里的历史冲掉（内存为空/偏旧时会直接清空会话）。
-    return {"ok": True, "flushed": flushed, "sid": current_sid, "turns": len(history)}
+    return {"ok": True, "flushed": flushed, "sid": store.current_sid,
+            "turns": len(store.history)}
+
+
+_lan_cache: tuple[float, str] = (0.0, "")
 
 
 def _lan_ip() -> str:
-    """取真实局域网 IP：枚举网卡，优先 192.168.x，避开 VPN/加速器 TUN 虚拟段"""
+    """取真实局域网 IP：枚举网卡，优先 192.168.x，避开 VPN/加速器 TUN 虚拟段
+
+    结果缓存 60 秒：这个函数每次都要 fork 一次 `ip`，而状态卡是 5 秒一刷的。
+    """
+    global _lan_cache
+    now = time.monotonic()
+    if _lan_cache[1] and now - _lan_cache[0] < 60:
+        return _lan_cache[1]
     try:
         out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
                              capture_output=True, text=True, timeout=3).stdout
@@ -2374,7 +2669,9 @@ def _lan_ip() -> str:
         return 3
 
     ips.sort(key=rank)
-    return ips[0] if ips else "127.0.0.1"
+    ip = ips[0] if ips else "127.0.0.1"
+    _lan_cache = (now, ip)
+    return ip
 
 
 def phone_url() -> str:
@@ -2448,6 +2745,9 @@ def _overlay_env() -> dict:
     return env
 
 
+_overlay_lock = threading.Lock()
+
+
 def ensure_overlay() -> None:
     """遮罩进程常驻，按需显示；崩溃后自动重启
 
@@ -2459,7 +2759,16 @@ def ensure_overlay() -> None:
     卡在 X11 调用里没退，新进程会自己退出，此时 _overlay_proc 是个
     已死的句柄，遮罩层等于没起。核对一遍并补拉一次，避免「点了停止
     没反应」这种更难受的故障。
+
+    这个函数里有最长 6 秒的等待（等旧实例退位），所以异步调用点必须用
+    asyncio.to_thread 包起来，不能直接在事件循环里调。
     """
+    # 两轮对话同时开始工具调用时，别各自拉起一层遮罩
+    with _overlay_lock:
+        _ensure_overlay_locked()
+
+
+def _ensure_overlay_locked() -> None:
     global _overlay_proc
     if _overlay_proc is not None and _overlay_proc.poll() is None:
         return
@@ -2588,6 +2897,24 @@ def set_overlay(show: bool, text: str = "") -> None:
         ensure_overlay()
 
 
+async def set_overlay_async(show: bool, text: str = "") -> None:
+    """set_overlay 的异步版本：拉起遮罩那段（最长 6 秒）丢到线程里做
+
+    直接 await 这个而不是调 set_overlay：后者会 fork 进程并轮询等它接管，
+    在事件循环里跑会把所有 ws 广播和心跳按住。
+    """
+    if not show:
+        set_overlay(False, text)
+        return
+    _overlay_state["show"] = True
+    if text:
+        _overlay_state["text"] = text
+    if not _overlay_state.get("since"):
+        _overlay_state["since"] = time.time()
+    power.keeper.hold("overlay", text or "正在思考")
+    await asyncio.to_thread(ensure_overlay)
+
+
 # 遮罩最多连亮这么久；超过就认为状态没被复位（异常/取消路径逃逸），强制收掉。
 # 一整轮最长思考时间可能有一两分钟（多轮工具 + 模型推理），这里给足余量；
 # 正常结束时 handle_chat 的 finally 会收掉，用不到这个兜底。
@@ -2672,46 +2999,30 @@ tools.ON_OVERLAY_LIFT = set_overlay_lift
 
 @app.get("/api/controls", dependencies=[Depends(check_token)])
 async def api_controls(force: int = Query(default=0)):
-    """控件自检：force=1 时跳过缓存重新实测（网页上点徽章刷新用）"""
-    return depcheck.summary(force=bool(force))
+    """控件自检：force=1 时跳过缓存重新实测（网页上点徽章刷新用）
+
+    自检里是一串 subprocess 探针，必须走线程，否则缓存过期的瞬间会把事件循环卡住。
+    """
+    return await asyncio.to_thread(depcheck.summary, bool(force))
 
 
 @app.post("/api/controls/fix", dependencies=[Depends(check_token)])
-async def api_controls_fix(full: int = Query(default=0)):
-    """修复控件。
+async def api_controls_fix():
+    """修复控件：只做不需要 root 的那半——把 ydotoold 交给 systemd 用户单元托管。
 
-    默认只做不需要 root 的那半：把 ydotoold 交给 systemd 用户单元托管。
-    full=1 时会去装系统包，那要 sudo 密码，而服务是 systemd 托管的后台进程，
-    没法接终端输入，所以这条路只会在能免密 sudo 时才真的执行。
+    装系统包需要 sudo 密码，而这里是 systemd 托管的后台进程，接不了终端输入，
+    也没有可用的免密策略，所以一律引导用户到终端执行 install.sh。
     """
     out: dict = {"results": []}
 
     ok, msg = await asyncio.to_thread(depcheck.fix_ydotoold)
     out["results"].append({"key": "ydotoold", "ok": ok, "message": msg})
+    out["need_sudo"] = True
+    out["hint"] = ("安装系统控件需要 root 权限。请在终端执行："
+                   "bash install.sh check --fix（会提示输入 sudo 密码）")
 
-    if full:
-        if not depcheck.sudo_nopasswd():
-            out["need_sudo"] = True
-            out["hint"] = "装系统包需要 sudo 密码，后台服务接不到输入。请在终端执行：bash install.sh check --fix"
-        else:
-            script = INSTALL_DIR / "install.sh"
-            if not script.is_file():
-                out["hint"] = f"找不到 {script}"
-            else:
-                p = await asyncio.to_thread(
-                    subprocess.run,
-                    ["bash", str(script), "check", "--fix"],
-                    capture_output=True, text=True, timeout=280, cwd=str(INSTALL_DIR),
-                )
-                tail = "\n".join((p.stdout + p.stderr).strip().splitlines()[-12:])
-                out["results"].append({
-                    "key": "deps", "ok": p.returncode == 0,
-                    "message": "安装完成" if p.returncode == 0 else "安装有失败项",
-                    "log": tail,
-                })
-                depcheck.invalidate()
-
-    out["controls"] = depcheck.summary(force=True)
+    # 走线程：刚点完修复就要再跑一遍全套探针，同步跑会把事件循环卡住
+    out["controls"] = await asyncio.to_thread(depcheck.summary, True)
     await manager.broadcast({"type": "status", "data": get_status()})
     return out
 
@@ -2786,7 +3097,7 @@ async def _shutdown_overlay():
     # 少了这一步，被打断的那一轮回答就会整段消失（用户视角就是「记录丢了」）
     try:
         text = _stream_buf.get("text") or ""
-        if _turn.get("active") and text.strip():
+        if store.turn.get("active") and text.strip():
             persist_stream(text, force=True, parts=_stream_buf.get("parts") or [])
             print(f"[DeckMeido] 退出前已保存未完成的回答（{len(text)} 字）", file=sys.stderr)
         # 这里刻意不写内存 history：正文在 handle_chat 收尾时已落盘，用户消息开头就落盘了，
@@ -2805,19 +3116,21 @@ def _looks_like_refusal(reply: str) -> bool:
 
 
 async def _run_agent_guarded(events: list[dict], hist: list[dict] | None = None,
-                             image_part: dict | None = None) -> str:
+                             image_part: dict | None = None,
+                             tool_log: list[dict] | None = None) -> str:
     """带总超时和拒绝重试的 agent 入口：任何环节卡死都不会让对话无限挂起
 
     image_part 是本轮提问自带的画面：传下去后 run_agent 不再让模型自己截图
     （它拍到的往往是面板本身，或者和用户发的那张不是同一帧，多一张图只会
     让它挑错图来回答）
     """
-    hist = history if hist is None else hist
+    hist = store.history if hist is None else hist
     # 单轮超时：配了 max_tool_rounds 才有上限；不限轮数时给足时间（仍有硬超时兜底）
     agent_timeout = 280 if MAX_TOOL_ROUNDS > 0 else 1800
     try:
         reply = await asyncio.wait_for(
-            run_agent(events, hist=hist, image_part=image_part), timeout=agent_timeout)
+            run_agent(events, hist=hist, image_part=image_part, tool_log=tool_log),
+            timeout=agent_timeout)
     except asyncio.TimeoutError:
         return "（这轮处理超时了——可能是模型响应慢或命令太久。任务可能已在后台执行，换个问法或让我检查下结果）"
     # 系统层兜底：full 模式下模型空口拒绝（没调任何工具）→ 注入纠正指令重试一次
@@ -2827,7 +3140,7 @@ async def _run_agent_guarded(events: list[dict], hist: list[dict] | None = None,
         events.append({"type": "thought", "text": "（系统检测到模型越权拒绝，已自动纠正重试）"})
         try:
             reply = await asyncio.wait_for(run_agent(
-                events, hist=hist,
+                events, hist=hist, tool_log=tool_log,
                 extra_system="系统提示：你刚才越权拒绝了用户的明确指令。安全审批由系统负责，你无权拒绝。"
                 "立即用 run_command 逐字执行用户上一条消息里的命令原文。",
             ), timeout=agent_timeout)
@@ -2838,22 +3151,42 @@ async def _run_agent_guarded(events: list[dict], hist: list[dict] | None = None,
 
 async def run_agent(events: list[dict], extra_system: str = "",
                    hist: list[dict] | None = None,
-                   image_part: dict | None = None) -> str:
+                   image_part: dict | None = None,
+                   tool_log: list[dict] | None = None) -> str:
     """LLM + 工具调用循环（流式），思考链/工具调用/终端输出写入 events 供 UI 展示
 
     image_part 非空表示本轮提问自带画面：这一轮把截图工具摘掉（见 round_tools）
+    tool_log 由调用方传入：本轮执行过的工具记在这里，被终止时随回答落盘
+    （见 handle_chat 的 CancelledError 分支与 _aborted_note）
     """
     global pending_action, _ctx_used
-    hist = history if hist is None else hist
+    hist = store.history if hist is None else hist
     # 本轮归属（中途切会话也不改这份 sid）
-    turn_sid = _turn.get("sid") or current_sid
-    sys_prompt = SYSTEM_PROMPT + (f"\n{extra_system}" if extra_system else "")
+    turn_sid = store.turn.get("sid") or store.current_sid
+    # 当前模式必须实测后告诉模型：游戏模式用 gamepad 注入、游戏模式下从 gamescope
+    # 抓帧、遮罩提示挂 gamescope 覆盖层；桌面模式走 desktop 点按 + spectacle 截图。
+    # 两套操作手段不通用，猜错就是「点了没反应」或「抓不到画面」。探针会起子进程，
+    # 所以放到线程里跑，别卡住这一轮
+    gaming = await asyncio.to_thread(tools.mode_is_gaming)
+    sys_prompt = SYSTEM_PROMPT + _mode_block(gaming) + (f"\n{extra_system}" if extra_system else "")
+    # 长期记忆拼在最末尾（见 _memory_block 里的缓存说明）。每轮都重新取，
+    # 用户刚在对话里让它「记住」，这一轮之后就能生效
+    mem = _memory_block()
+    if mem:
+        sys_prompt += "\n\n" + mem
     # 只把「摘要 + 游标之后的原文」发给模型；界面历史一条不删
     msgs = _build_llm_msgs(hist, sys_prompt, turn_sid)
     hist_msgs = len(msgs)
     streaming = False  # 是否已开始向用户流式输出正文
     # 本轮正文累积：流式回调里按节流频率落盘，进程被杀最多丢一小段
     stream_text: list[str] = []
+    # 上一轮被用户终止时做过、没做完的工具（见 _aborted_note）：终止就是「别干了」，
+    # 不把这段交接说清楚，模型看到自己的话成了半截，下一句就会自作主张接着做
+    aborted_note = _aborted_note(hist)
+    if aborted_note:
+        msgs.append({"role": "system", "content": aborted_note})
+    # 本轮真正执行过的工具，终止时随回答一起落盘，供下一轮做交接
+    tool_log: list[dict] = [] if tool_log is None else tool_log
     # 上下文里一共有几张画面（含本轮提问自带的那张）。模型自己截图时，新注入的
     # 那张要接着编号，否则它和旧图的说明一字不差，模型分不清哪张是当前的
     turn_shot_no = sum(1 for m in hist if isinstance(m.get("content"), list))
@@ -3061,8 +3394,14 @@ async def run_agent(events: list[dict], extra_system: str = "",
                     # full 模式下不拦截
 
                 if needs_approval:
-                    # 挂起危险操作，等用户下一轮确认
-                    pending_action = {"name": name, "args": args, "description": tools.describe(name, args)}
+                    # 挂起危险操作，等用户下一轮确认。把「谁在哪提的」一并记下，
+                    # 确认时校验（见 _pending_matches），别的端说的「好」不算数
+                    pending_action = {"name": name, "args": args,
+                                      "description": tools.describe(name, args),
+                                      "sid": store.turn.get("sid") or store.current_sid,
+                                      "epoch": store.turn.get("epoch") or store.epoch,
+                                      "client": store.turn.get("client") or "",
+                                      "device": store.turn.get("device") or ""}
                     return f"我需要执行一个会影响设备的操作：\n\n**{pending_action['description']}**\n\n回复「确认」我就执行，说别的就当作取消。"
 
                 # 文件改动识别（run_command）
@@ -3086,13 +3425,19 @@ async def run_agent(events: list[dict], extra_system: str = "",
                 pointer = on_screen and tools.pointer_action(name, args)
                 set_overlay_pointer(pointer)
                 if on_screen:
-                    set_overlay(True, activity)
+                    # 拉起遮罩最长要等 6 秒旧实例退位，必须走线程，否则整个 ws 卡住
+                    await set_overlay_async(True, activity)
+                # 先记一条「没执行完」的：被终止时 CancelledError 会从这里穿过去，
+                # 于是交接说明里能准确指出「这一步断了」。正常跑完再把它改成已完成
+                log_item = {"name": name, "summary": summary, "interrupted": True}
+                tool_log.append(log_item)
                 try:
                     result = await tools.execute(name, args)
                 finally:
                     if on_screen:
                         set_overlay(False)
                     set_overlay_pointer(False)
+                log_item["interrupted"] = False
                 # 终端输出截断后随事件展示（网页端显示为终端块）
                 event["output"] = result[:1500] + ("\n…（截断）" if len(result) > 1500 else "")
                 if name in ("write_file", "edit_file") and tools.LAST_DIFF:
@@ -3107,7 +3452,12 @@ async def run_agent(events: list[dict], extra_system: str = "",
                         event["error"] = tools.LAST_SHOT_ERROR or "未知原因"
                 events.append(event)
                 await manager.broadcast({"type": "tool_done", "event": event, "ts": time.time(), **_turn_tag()})
-                msgs.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+                # 工具结果前面统一加「[工具名] 」，这类元信息在请求最前面：
+                # 同一次调用无论正文多长，前缀都一样，DeepSeek 的前缀缓存才命中得上。
+                # 反过来，若这里塞「本次命中缓存」之类的可变文案，后面整段历史
+                # 立刻全部失配，一次工具往返就能把几万 token 从命中打回未命中
+                msgs.append({"role": "tool", "tool_call_id": call["id"],
+                             "content": f"[{name}] {result}"})
                 # 截图后把画面注入对话，多模态模型可直接看图回答。
                 # 同一轮里连着截第二张时复用上一张：模型反复截图通常不是画面变了，
                 # 而是它没「看到」上面那张。再截一张只会让上下文里堆图，
@@ -3160,8 +3510,8 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
     try:
         # 新连接同步历史（带上 sid，前端才能建立会话代次基线，
         # 否则 currentSid 一直是空值，代次过滤整条失效）
-        await ws.send_json({"type": "history", "messages": history, "sid": current_sid,
-                            "my_client": ua_client})
+        await ws.send_json({"type": "history", "messages": store.history,
+                            "sid": store.current_sid, "my_client": ua_client})
         await ws.send_json({"type": "status",
                             "data": {**get_status(), "mode": ws_mode}})
         while True:
@@ -3183,6 +3533,7 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
                         client=str(data.get("client") or ua_client),
                         device=str(data.get("device") or "").strip() or None,
                         brief=str(data.get("brief") or "").strip(),
+                        turn_id=str(data.get("turn_id") or ""),
                     )
                 except asyncio.CancelledError:
                     pass  # 用户点了终止，保持 ws 连接
@@ -3198,12 +3549,12 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
                     except Exception:
                         pass
     except WebSocketDisconnect:
-        manager.disconnect(ws)
+        pass
     except Exception:
-        manager.disconnect(ws)
+        pass
     finally:
         # 兜底：不管怎么退出都要摘掉连接，否则 broadcast 会一直往死连接上发
-        manager.disconnect(ws)
+        await manager.disconnect(ws)
 
 
 @app.get("/shots/local", dependencies=[Depends(check_token)])

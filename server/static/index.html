@@ -89,6 +89,9 @@
     display: flex; align-items: center; justify-content: flex-end;
     gap: 8px; flex-wrap: wrap;
   }
+  /* 实时画面入口：桌面模式下也留着，只是置灰——直接藏起来会让人以为功能没了 */
+  #btnLive { flex: 0 0 auto; white-space: nowrap; }
+  #btnLive.off { opacity: .45; }
 
   /* 通用胶囊按钮（分享弹窗等） */
   .menu-btn {
@@ -384,6 +387,55 @@
     background: var(--surface-2); color: var(--muted);
     font-size: 16px; cursor: pointer; flex: 0 0 auto;
   }
+  /* 深度思考档位：无 / 低 / 中 / 高。整块做成没有边框的胶囊，
+     左侧文字随拖动实时变化，右侧四个刻度点指示落点 */
+  .think-slider {
+    display: flex; align-items: center; gap: 8px;
+    height: 34px; padding: 0 12px 0 10px; border-radius: 10px;
+    background: var(--surface-2); flex: 0 0 auto;
+    transition: background .18s ease;
+  }
+  .think-slider:hover { background: var(--surface-3, var(--surface-1)); }
+  .think-slider span {
+    font-size: 12.5px; color: var(--muted); min-width: 2.2em;
+    transition: color .18s ease, font-weight .18s ease;
+  }
+  .think-slider.level-0 span { color: var(--muted); }
+  .think-slider.level-1 span, .think-slider.level-2 span,
+  .think-slider.level-3 span { color: var(--brand); font-weight: 600; }
+  /* 滑轨用自绘的：浏览器原生 range 在 QtWebEngine 里样式各版本不一，
+     自绘才能做「已填充段 + 圆点跟随」的动画 */
+  .think-track {
+    position: relative; width: 64px; height: 16px;
+    display: flex; align-items: center; cursor: pointer;
+  }
+  .think-rail, .think-fill {
+    position: absolute; left: 0; height: 4px; border-radius: 2px;
+  }
+  .think-rail { width: 100%; background: var(--line); }
+  .think-fill {
+    width: 0; background: var(--brand);
+    /* 值一变，填充条和圆点一起滑过去，而不是瞬移 */
+    transition: width .22s cubic-bezier(.22, .8, .3, 1);
+  }
+  .think-knob {
+    position: absolute; left: 0; width: 14px; height: 14px; border-radius: 50%;
+    background: #fff; border: 2px solid var(--brand); box-sizing: border-box;
+    transform: translateX(-50%);
+    transition: left .22s cubic-bezier(.22, .8, .3, 1), box-shadow .18s ease;
+  }
+  .think-slider:hover .think-knob,
+  .think-track:active .think-knob { box-shadow: 0 0 0 5px rgba(127, 127, 127, .18); }
+  .think-slider.level-0 .think-knob { border-color: var(--line); }
+  /* 四个刻度点：当前档位实心，其余空心，给小数点一个参照 */
+  .think-ticks {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: space-between; pointer-events: none;
+  }
+  .think-ticks i {
+    width: 3px; height: 3px; border-radius: 50%;
+    background: var(--muted); opacity: .45; transition: opacity .18s ease;
+  }
   .cb-select {
     height: 34px; border: 1px solid var(--line); border-radius: 10px;
     background: var(--surface-2); color: var(--muted);
@@ -429,6 +481,13 @@
     padding: 5px 10px; border-radius: 8px; cursor: pointer;
   }
   .file-card .fc-dl:hover { border-color: var(--brand); color: var(--brand); }
+  /* 多文件消息末尾的打包下载入口 */
+  .fc-zip {
+    display: inline-block; margin-top: 6px; padding: 5px 10px;
+    border: 1px dashed var(--line); border-radius: 8px;
+    font-size: 12px; color: var(--muted); text-decoration: none;
+  }
+  .fc-zip:hover { border-color: var(--brand); color: var(--brand); }
   /* 附件菜单 / 文件选择弹层 */
   /* 弹层贴输入框左上方展开，左边距与下边距保持同一间距 */
   #plusMenu, #fileList {
@@ -596,14 +655,112 @@
     content: ''; position: absolute; top: 3px; right: 3px;
     width: 7px; height: 7px; border-radius: 50%; background: #e5484d;
   }
+  /* 设置：全屏页，左边分区导航、右边内容。内容区单独滚动，
+     顶部标题栏和底部操作条固定，滚动时始终能看见「保存」 */
   #settingsPanel {
     position: fixed; inset: 0;
-    background: var(--overlay);
+    background: var(--bg);
     display: none;
-    align-items: flex-end;
     z-index: 20;
   }
   #settingsPanel.show { display: flex; }
+  .set-nav {
+    flex: 0 0 208px;
+    display: flex; flex-direction: column;
+    background: var(--surface);
+    border-right: 1px solid var(--line);
+    padding: 18px 12px;
+    padding-top: calc(18px + env(safe-area-inset-top));
+    padding-bottom: calc(18px + env(safe-area-inset-bottom));
+  }
+  .set-nav h2 {
+    font-size: 15px; font-weight: 600;
+    padding: 0 10px 14px; letter-spacing: .02em;
+  }
+  .set-tab {
+    display: flex; align-items: center; gap: 8px;
+    width: 100%; padding: 10px 12px; margin-bottom: 4px;
+    border: 0; border-radius: 10px; background: transparent;
+    color: var(--muted); font-size: 14px; text-align: left; cursor: pointer;
+    font-family: inherit;
+  }
+  .set-tab:hover { background: var(--hover); color: var(--text); }
+  .set-tab.on { background: var(--surface-2); color: var(--text); font-weight: 600; }
+  .set-nav .spacer { flex: 1; }
+  .set-main {
+    flex: 1; min-width: 0;
+    display: flex; flex-direction: column;
+  }
+  .set-body {
+    flex: 1; overflow-y: auto; overscroll-behavior: contain;
+    padding: 22px 26px 32px;
+    padding-top: calc(22px + env(safe-area-inset-top));
+  }
+  .set-inner { max-width: 760px; margin: 0 auto; }
+  /* 分区标题：进页时只有当前分区可见 */
+  .set-pane { display: none; }
+  .set-pane.on { display: block; }
+  .set-pane > h3 {
+    font-size: 18px; font-weight: 600; margin-bottom: 4px;
+  }
+  .set-pane > .pane-desc {
+    font-size: 13px; color: var(--muted); margin-bottom: 20px; line-height: 1.6;
+  }
+  /* 一页里的一组字段：灰底卡片，用边线分隔，比一堆裸输入框整齐 */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 16px 18px;
+    margin-bottom: 16px;
+  }
+  .card > .card-title {
+    font-size: 13px; font-weight: 600; color: var(--text);
+    margin-bottom: 12px; letter-spacing: .02em;
+  }
+  .card > .field:last-child { margin-bottom: 0; }
+  .set-foot {
+    flex: 0 0 auto;
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 26px;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+    border-top: 1px solid var(--line);
+    background: var(--surface);
+  }
+  .set-foot #cfgHint { flex: 1; margin: 0; text-align: left; }
+  #saveCfg {
+    flex: none;
+    padding: 10px 26px;
+    border: none; border-radius: 10px;
+    background: var(--brand); color: #fff;
+    font-size: 14px; font-weight: 600;
+  }
+  #saveCfg:active { filter: brightness(.92); }
+  #setClose {
+    flex: none; height: 40px; padding: 0 16px;
+    border: 1px solid var(--line); border-radius: 10px;
+    background: transparent; color: var(--muted); font-size: 14px; cursor: pointer;
+  }
+  #setClose:hover { color: var(--text); border-color: var(--muted); }
+  /* 窄屏：导航从左侧竖排换成顶部横排（Deck 竖握、手机） */
+  @media (max-width: 720px) {
+    #settingsPanel { flex-direction: column; }
+    .set-nav {
+      flex: none; flex-direction: row; align-items: center;
+      gap: 4px; padding: 10px 12px;
+      padding-top: calc(10px + env(safe-area-inset-top));
+      border-right: 0; border-bottom: 1px solid var(--line);
+      overflow-x: auto;
+      /* 横向滑动的标签条不画滚动条，否则会压掉文字底部 */
+      scrollbar-width: none;
+    }
+    .set-nav::-webkit-scrollbar { display: none; }
+    .set-nav h2, .set-nav .spacer { display: none; }
+    .set-tab { width: auto; flex: none; margin: 0; white-space: nowrap; }
+    .set-body { padding: 16px 14px 24px; }
+    .card { padding: 14px; }
+    .set-foot { padding: 10px 14px; padding-bottom: calc(10px + env(safe-area-inset-bottom)); }
+  }
   .sheet {
     background: var(--surface);
     width: 100%;
@@ -656,6 +813,8 @@
     cursor: pointer;
   }
   .mini-btn:hover { border-color: var(--brand); color: var(--brand); }
+  /* 预设按钮夹在提示文字里：矮一点、跟着基线走，别把提示撑成两个大按钮 */
+  .field-hint .mini-btn { height: 26px; padding: 0 8px; margin-left: 4px; font-size: 12px; }
   /* 「语气」这类多行输入：和单行输入框同一套外观，可拖高 */
   .field textarea {
     width: 100%;
@@ -671,6 +830,16 @@
     resize: vertical;
   }
   .field-hint { font-size: 12px; color: var(--muted); margin-top: 6px; min-height: 16px; }
+  /* 设置页里的下拉框：和输入框同一套外观，别再各写一份内联样式 */
+  .cfg-select {
+    width: 100%; padding: 12px 14px;
+    border: 1px solid var(--line); border-radius: 10px;
+    background: var(--surface-2); color: var(--text);
+    font-size: 15px; font-family: inherit; outline: none;
+  }
+  .cfg-select:focus, .field input:focus, .field textarea:focus, .mem-add input:focus {
+    border-color: var(--brand);
+  }
   /* 扫码连接 */
   .qr-box { display: none; margin-top: 10px; text-align: center; }
   .qr-box.show { display: block; }
@@ -694,15 +863,38 @@
   }
   .switch input:checked + .slider { background: var(--brand); }
   .switch input:checked + .slider::before { transform: translateX(20px); background: #fff; }
-  #saveCfg {
-    width: 100%;
-    padding: 13px;
-    border: none; border-radius: 10px;
-    background: var(--brand); color: #fff;
-    font-size: 16px; font-weight: 600;
-    margin-top: 4px;
-  }
   #cfgHint { text-align: center; font-size: 13px; color: var(--muted); margin-top: 10px; min-height: 18px; }
+
+  /* 长期记忆：新增行 + 分组列表 */
+  .mem-add { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+  .mem-add input { flex: 1; min-width: 0; }
+  .mem-kind {
+    flex: none; height: 44px; padding: 0 10px;
+    border: 1px solid var(--line); border-radius: 10px;
+    background: var(--surface-2); color: var(--text); font-size: 13px; outline: none;
+  }
+  .mem-list { margin-top: 10px; }
+  .mem-empty { font-size: 13px; color: var(--muted); padding: 10px 0; }
+  .mem-group {
+    font-size: 12px; font-weight: 600; color: var(--muted);
+    margin: 12px 0 6px; letter-spacing: .04em;
+  }
+  .mem-item {
+    display: flex; gap: 8px; align-items: flex-start;
+    padding: 8px 10px; margin-bottom: 6px;
+    border: 1px solid var(--line); border-radius: 10px;
+    background: var(--surface-2);
+  }
+  .mem-item input {
+    flex: 1; min-width: 0; padding: 0; border: 0; background: transparent;
+    color: var(--text); font-size: 14px; line-height: 1.5; outline: none;
+    font-family: inherit;
+  }
+  .mem-item.editing { border-color: var(--brand); }
+  .mem-item .mini-btn { height: 26px; padding: 0 8px; font-size: 12px; }
+  .mem-del:hover { border-color: #e5534b; color: #e5534b; }
+  .mem-foot { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+  .mem-foot .field-hint { margin: 0; flex: 1; }
 
   /* 设置页底部：版本号 + 检查/安装更新 */
   .about-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -853,6 +1045,8 @@
        模式徽章本身要留——在游戏模式里刷 QAM 以外的网页时，它就靠这个
        认出「当前是游戏模式」，藏掉反而让人以为回桌面了 */
     #ctxBadge { display: none !important; }
+    /* 画面入口必须留着（游戏模式下就靠它开画面），不许被 nowrap 挤没 */
+    #btnLive { flex: 0 0 auto; }
     /* 极窄屏（<360px）：模式徽章也收窄，但必须留着 */
     #modeBadge { padding: 3px 7px; font-size: 10.5px; }
     .hdr-right:empty { display: none; }
@@ -994,7 +1188,7 @@
   <span class="spacer"></span>
   <div class="hdr-right">
     <span class="badge" id="ctxBadge" hidden></span>
-    <button class="badge" id="btnLive" title="实时画面（游戏模式）" hidden>画面</button>
+    <button class="badge" id="btnLive" title="实时画面（游戏模式）">画面</button>
     <span class="badge ctrl" id="ctrlBadge" hidden></span>
     <span class="badge" id="modeBadge" hidden></span>
   </div>
@@ -1036,6 +1230,18 @@
         <option value="auto">智能审批</option>
         <option value="full">完全访问</option>
       </select>
+      <!-- 深度思考档位：无 / 低 / 中 / 高，跟着权限下拉走 -->
+      <label class="think-slider" id="thinkWrap" title="深度思考档位">
+        <span id="thinkLabel">高</span>
+        <input type="range" id="thinkRange" min="0" max="3" step="1" value="3"
+               aria-label="深度思考档位" hidden>
+        <div class="think-track" id="thinkTrack">
+          <div class="think-rail"></div>
+          <div class="think-fill" id="thinkFill"></div>
+          <div class="think-ticks"><i></i><i></i><i></i><i></i></div>
+          <div class="think-knob" id="thinkKnob"></div>
+        </div>
+      </label>
     </div>
     <div class="cb-right">
       <select class="cb-select" id="modelSelect" title="模型"></select>
@@ -1090,93 +1296,197 @@
 </div>
 
 <div id="settingsPanel">
-  <div class="sheet">
+  <nav class="set-nav">
     <h2>设置</h2>
-    <div class="field">
-      <label>API 接口地址（base_url）</label>
-      <input id="cfgBaseUrl" type="text" placeholder="https://api.openai.com/v1" autocomplete="off">
-    </div>
-    <div class="field">
-      <label>API Key</label>
-      <div class="token-row">
-        <input id="cfgApiKey" type="password" placeholder="sk-…" autocomplete="off">
-        <button id="clearApiKey" class="mini-btn" type="button">清除</button>
+    <button class="set-tab on" type="button" data-pane="model">模型接入</button>
+    <button class="set-tab" type="button" data-pane="persona">人设</button>
+    <button class="set-tab" type="button" data-pane="memory">长期记忆</button>
+    <button class="set-tab" type="button" data-pane="device">设备与连接</button>
+    <button class="set-tab" type="button" data-pane="about">关于与更新</button>
+    <div class="spacer"></div>
+  </nav>
+  <div class="set-main">
+    <div class="set-body">
+      <div class="set-inner">
+
+        <section class="set-pane on" data-pane="model">
+          <h3>模型接入</h3>
+          <p class="pane-desc">填写服务商的接口地址与 Key，保存后立即生效。</p>
+          <div class="card">
+            <div class="card-title">接口</div>
+            <div class="field">
+              <label>API 接口地址（base_url）</label>
+              <input id="cfgBaseUrl" type="text" placeholder="https://api.deepseek.com" autocomplete="off">
+              <div class="field-hint">
+                默认按 DeepSeek 配置（填 https://api.deepseek.com 即可，不用加 /v1）。
+                其他 OpenAI 兼容服务照旧填它们的地址。
+                <button id="presetDeepseek" class="mini-btn" type="button">填入 DeepSeek 预设</button>
+              </div>
+            </div>
+            <div class="field">
+              <label>API Key</label>
+              <div class="token-row">
+                <input id="cfgApiKey" type="password" placeholder="sk-…" autocomplete="off">
+                <button id="clearApiKey" class="mini-btn" type="button">清除</button>
+              </div>
+              <div id="apiKeyHint" class="field-hint"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="set-pane" data-pane="persona">
+          <h3>人设</h3>
+          <p class="pane-desc">决定她怎么称呼你、用什么语气说话。改完保存立即生效，新会话也保持一致。</p>
+          <div class="card">
+            <div class="card-title">称呼</div>
+            <div class="field">
+              <label>名字</label>
+              <input id="cfgPersonaName" type="text" placeholder="DeckMeido" autocomplete="off">
+            </div>
+            <div class="field">
+              <label>怎么称呼你</label>
+              <input id="cfgPersonaAddress" type="text" placeholder="主人" autocomplete="off">
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-title">语气</div>
+            <div class="field">
+              <label>说话方式</label>
+              <textarea id="cfgPersonaTone" rows="3" placeholder="礼貌、简洁、干练，偶尔一点俏皮，但不撒娇卖萌"></textarea>
+            </div>
+            <div class="field">
+              <label>句尾习惯（可留空）</label>
+              <input id="cfgPersonaEnding" type="text" placeholder="例如：说完结论就好，不加任何语气词" autocomplete="off">
+            </div>
+            <div class="field">
+              <label>落款（可留空）</label>
+              <input id="cfgPersonaSuffix" type="text" placeholder="例如：——女仆长" autocomplete="off">
+            </div>
+            <div class="field">
+              <label>禁用的词句（逗号隔开，一次都不许出现）</label>
+              <input id="cfgPersonaForbid" type="text" placeholder="喵，呢~，人家" autocomplete="off">
+            </div>
+          </div>
+        </section>
+
+        <section class="set-pane" data-pane="memory">
+          <h3>长期记忆</h3>
+          <p class="pane-desc">
+            记在这里的内容每次对话都会带上，重启也还在。对话里说「记住…」她也会自己记一条；
+            纠正她的做法（「不对，应该…」）同样会记下来。只记你真想让她长期记住的，写多了会占掉上下文。
+          </p>
+          <div class="card">
+            <div class="card-title">新增一条</div>
+            <div class="mem-add">
+              <select id="memKind" class="mem-kind">
+                <option value="profile">用户画像</option>
+                <option value="env">环境经验</option>
+                <option value="note">知识条目</option>
+              </select>
+              <input id="memText" type="text" placeholder="例如：我不喜欢回答里带表情符号" autocomplete="off">
+              <button id="memAdd" class="mini-btn" type="button">记住</button>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-title">备份</div>
+            <p class="pane-desc" style="margin-top:0">
+              人设和下面的记忆就是「她这个人」的全部，导出一个 JSON 就能换机器、重装后恢复。
+            </p>
+            <div class="mem-foot">
+              <span class="field-hint">不含 API Key 与对话记录</span>
+              <button id="soulExport" class="mini-btn" type="button">导出备份</button>
+              <button id="soulImport" class="mini-btn" type="button">导入备份</button>
+              <input id="soulFile" type="file" accept=".json,application/json" hidden>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-title">已记住的内容</div>
+            <div class="mem-list" id="memList"></div>
+            <div class="mem-foot">
+              <span id="memCount" class="field-hint"></span>
+              <button id="memClear" class="mini-btn" type="button">清空全部</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="set-pane" data-pane="device">
+          <h3>设备与连接</h3>
+          <p class="pane-desc">她的权限范围、工作目录，以及其他设备连上这台 Deck 的方式。</p>
+          <div class="card">
+            <div class="card-title">权限</div>
+            <div class="field">
+              <label>AI 控制权限</label>
+              <select id="cfgPerm" class="cfg-select">
+                <option value="manual">手动审批（每条命令都问你）</option>
+                <option value="auto">智能审批（危险命令才问你）</option>
+                <option value="full">完全访问（不再询问）</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>工作区目录（编程/文件任务默认位置）</label>
+              <input id="cfgWorkspace" type="text" placeholder="~/deckmeido_workspace" autocomplete="off">
+            </div>
+            <div class="field field-row">
+              <label style="margin:0">语音播报回复</label>
+              <label class="switch">
+                <input id="cfgTts" type="checkbox">
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-title">连接</div>
+            <div class="field">
+              <label>访问令牌（连接这台 Deck 用，4-32 位数字或字母，不分大小写）</label>
+              <div class="token-row">
+                <input id="cfgToken" type="text" placeholder="例如 x7k2m" autocomplete="off" maxlength="32" spellcheck="false">
+                <button id="genToken" class="mini-btn" type="button">随机生成</button>
+              </div>
+              <div id="tokenHint" class="field-hint"></div>
+            </div>
+            <div class="field">
+              <label>手机/其他设备连接</label>
+              <div class="token-row">
+                <input id="cfgUrl" type="text" readonly autocomplete="off">
+                <button id="qrBtn" class="mini-btn" type="button">二维码</button>
+              </div>
+              <div id="qrBox" class="qr-box"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="set-pane" data-pane="about">
+          <h3>关于与更新</h3>
+          <p class="pane-desc">版本信息与升级渠道。升级会保留配置、会话与长期记忆。</p>
+          <div class="card">
+            <div class="card-title">版本</div>
+            <div class="about-row">
+              <span class="ver-tag" id="verTag">版本 …</span>
+              <button id="updCheck" class="mini-btn" type="button">检查更新</button>
+            </div>
+            <div class="upd-note" id="updNote"></div>
+            <button id="updApply" type="button">立即升级到最新版</button>
+          </div>
+          <div class="card">
+            <div class="card-title">更新源</div>
+            <div class="field">
+              <select id="cfgUpdSource" class="cfg-select">
+                <option value="mirror">国内镜像优先（镜像不通时用 GitHub）</option>
+                <option value="github">GitHub 优先（失败再用镜像）</option>
+                <option value="mirror-only">只用国内镜像</option>
+                <option value="github-only">只用 GitHub</option>
+              </select>
+              <div class="field-hint" id="updSourceHint"></div>
+            </div>
+          </div>
+        </section>
+
       </div>
-      <div id="apiKeyHint" class="field-hint"></div>
     </div>
-    <div class="field field-row">
-      <label style="margin:0">语音播报回复</label>
-      <label class="switch">
-        <input id="cfgTts" type="checkbox">
-        <span class="slider"></span>
-      </label>
-    </div>
-    <div class="field">
-      <label>AI 控制权限</label>
-      <select id="cfgPerm" style="width:100%; padding:12px 14px; border:1px solid var(--line); border-radius:10px; background:var(--surface-2); color:var(--text); font-size:15px; outline:none;">
-        <option value="manual">手动审批（每条命令都问你）</option>
-        <option value="auto">智能审批（危险命令才问你）</option>
-        <option value="full">完全访问（不再询问）</option>
-      </select>
-    </div>
-    <div class="field">
-      <label>工作区目录（编程/文件任务默认位置）</label>
-      <input id="cfgWorkspace" type="text" placeholder="~/deckmeido_workspace" autocomplete="off">
-    </div>
-    <div class="field">
-      <label>女仆的人设</label>
-      <div class="field-hint">决定她怎么称呼你、用什么语气说话，改完保存立即生效，新会话也保持一致。</div>
-    </div>
-    <div class="field">
-      <label>名字</label>
-      <input id="cfgPersonaName" type="text" placeholder="DeckMeido" autocomplete="off">
-    </div>
-    <div class="field">
-      <label>怎么称呼你</label>
-      <input id="cfgPersonaAddress" type="text" placeholder="主人" autocomplete="off">
-    </div>
-    <div class="field">
-      <label>语气</label>
-      <textarea id="cfgPersonaTone" rows="3" placeholder="礼貌、简洁、干练，偶尔一点俏皮，但不撒娇卖萌"></textarea>
-    </div>
-    <div class="field">
-      <label>句尾习惯（可留空）</label>
-      <input id="cfgPersonaEnding" type="text" placeholder="例如：说完结论就好，不加任何语气词" autocomplete="off">
-    </div>
-    <div class="field">
-      <label>落款（可留空）</label>
-      <input id="cfgPersonaSuffix" type="text" placeholder="例如：——女仆长" autocomplete="off">
-    </div>
-    <div class="field">
-      <label>禁用的词句（逗号隔开，一次都不许出现）</label>
-      <input id="cfgPersonaForbid" type="text" placeholder="喵，呢~，人家" autocomplete="off">
-    </div>
-    <div class="field">
-      <label>访问令牌（连接这台 Deck 用，4-32 位数字或字母，不分大小写）</label>
-      <div class="token-row">
-        <input id="cfgToken" type="text" placeholder="例如 x7k2m" autocomplete="off" maxlength="32" spellcheck="false">
-        <button id="genToken" class="mini-btn" type="button">随机生成</button>
-      </div>
-      <div id="tokenHint" class="field-hint"></div>
-    </div>
-    <div class="field">
-      <label>手机/其他设备连接</label>
-      <div class="token-row">
-        <input id="cfgUrl" type="text" readonly autocomplete="off">
-        <button id="qrBtn" class="mini-btn" type="button">二维码</button>
-      </div>
-      <div id="qrBox" class="qr-box"></div>
-    </div>
-    <button id="saveCfg">保存</button>
-    <div id="cfgHint"></div>
-    <div class="field" style="margin-top:18px">
-      <label>关于</label>
-      <div class="about-row">
-        <span class="ver-tag" id="verTag">版本 …</span>
-        <button id="updCheck" class="mini-btn" type="button">检查更新</button>
-      </div>
-      <div class="upd-note" id="updNote"></div>
-      <button id="updApply" type="button">立即升级到最新版</button>
+    <div class="set-foot">
+      <div id="cfgHint"></div>
+      <button id="setClose" type="button">关闭</button>
+      <button id="saveCfg" type="button">保存</button>
     </div>
   </div>
 </div>
@@ -1294,27 +1604,56 @@
          + '<a class="fc-dl" href="' + href + '" download="' + escapeHtml(name) + '">下载</a>'
          + '</div>';
   }
-  // 卡片渲染进 DOM 之后补大小；走 JSON 接口，token 不用拼进链接
+
+  // 卡片渲染进 DOM 之后补大小：走一次性批量接口，一块消息里有多少张卡片
+  // 都只发一个请求（原来是每张卡片一个，一轮列出十个文件就是十次往返）
   function fillFileSizes(root) {
-    var cards = (root || document).querySelectorAll('.file-card');
-    Array.prototype.forEach.call(cards, function (card) {
-      if (card.dataset.sized) return;
+    var cards = Array.prototype.filter.call((root || document).querySelectorAll('.file-card'),
+                                            function (c) { return !c.dataset.sized; });
+    var paths = [];
+    cards.forEach(function (card) {
       card.dataset.sized = '1';
-      var path = card.dataset.path;
-      if (!path) return;
-      fetch('/api/file_stat?token=' + encodeURIComponent(token), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: path })
-      })
-        .then(function (r) { return r.json(); })
-        .then(function (d) {
-          if (!d || d.size == null) return;
-          var el = card.querySelector('.fc-size');
-          if (el) el.textContent = fmtSize(d.size);
-        })
-        .catch(function () {});
+      if (card.dataset.path) paths.push(card.dataset.path);
     });
+    addZipBtn(root, cards);
+    if (!paths.length) return;
+    fetch('/api/file_stat_batch?token=' + encodeURIComponent(token), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths: paths })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var sizes = (d && d.sizes) || {};
+        Array.prototype.forEach.call(cards, function (card) {
+          var size = sizes[card.dataset.path];
+          if (size == null) return;
+          var el = card.querySelector('.fc-size');
+          if (el) el.textContent = fmtSize(size);
+        });
+      })
+      .catch(function () {});
+  }
+
+  // 一条消息里有多张文件卡片时，末尾补一个「打包下载」：单个 zip 一次拿全，
+  // 不用逐张点（手机上一篇回复里的附件逐个点也很烦）
+  function addZipBtn(root, cards) {
+    if (!root || !root.closest) return;
+    if (cards.length < 2) return;
+    // 卡片可能挂在气泡、事件时间线或图片行里，往上找到这一整条消息
+    var host = root.closest('.msg, .events');
+    if (!host || host.querySelector('.fc-zip')) return;
+    var n = cards.filter(function (c) { return !!c.dataset.path; }).length;
+    if (n < 2) return;
+    var a = document.createElement('a');
+    a.className = 'fc-zip';
+    a.textContent = '打包下载（' + n + ' 个文件）';
+    // 下载走 GET，只能把路径放进查询参数（浏览器不会给 <a> 加自定义头）
+    a.href = '/api/zip?token=' + encodeURIComponent(token) + '&name=files.zip'
+           + cards.filter(function (c) { return c.dataset.path; })
+                  .map(function (c) { return '&path=' + encodeURIComponent(c.dataset.path); }).join('');
+    a.setAttribute('download', 'files.zip');
+    host.appendChild(a);
   }
 
   // 轻量 markdown 渲染（代码块/行内码/加粗/标题/列表/链接）
@@ -1387,6 +1726,10 @@
     return device ? '电脑' : '';
   }
 
+  // 网页端消息区不裁剪：浏览器渲染上万个节点也不卡，往回翻要能看到完整对话。
+  // 20 条的上限只在插件（QAM）那边，见 plugin/main.py 的 _THREAD_MAX
+  function trimMessages() {}
+
   function addMsg(role, text, ts, events, client, device) {
     // 历史回放：事件与正文按「屏幕上出现过的顺序」串成一条时间线。
     // 旧版把事件块整体摆在正文上方，于是「思考→说话→执行」的顺序被打乱成
@@ -1398,6 +1741,7 @@
       // 一轮的尾巴：正文接在它真正说完的那个位置之后
       box.appendChild(makeTextBubble(text, true, ts));
       messages.appendChild(box);
+      trimMessages();
       fillFileSizes(box);
       scrollBottomSafe();
       return;
@@ -1436,6 +1780,7 @@
       el.appendChild(t);
     }
     messages.appendChild(el);
+    trimMessages();
     fillFileSizes(el);
     scrollBottomSafe();
   }
@@ -1675,6 +2020,7 @@
     box.className = 'events';
     events.forEach(function (ev) { renderEvent(ev, box); });
     messages.appendChild(box);
+    trimMessages();
     fillFileSizes(box);
     scrollBottomSafe();
   }
@@ -1684,6 +2030,7 @@
     el.className = 'msg system';
     el.textContent = text;
     messages.appendChild(el);
+    trimMessages();
     scrollBottomSafe();
   }
 
@@ -2121,6 +2468,14 @@
     return String(n);
   }
 
+  // 闲置时长（秒）→ 人话，只用在缓存过期提示里
+  function fmtIdle(sec) {
+    if (sec < 60) return '不到 1 分钟';
+    if (sec < 3600) return Math.round(sec / 60) + ' 分钟';
+    if (sec < 86400) return Math.round(sec / 3600) + ' 小时';
+    return Math.round(sec / 86400) + ' 天';
+  }
+
   function renderControls(c) {
     // 控制类控件自检：绿/黄/红灯 + 「可用数/总数」，点开可看明细与修复
     lastControls = c || null;
@@ -2185,15 +2540,11 @@
       + (yd.enabled ? '，已设开机自启（重启后自动恢复）' : '，未设开机自启（重启后会失效）');
     ctrlYd.append(b1, s1);
 
-    // 免密 sudo 才可能一键装包；否则引导去终端
-    if (c.sudo_nopasswd) {
-      ctrlFixBtn.textContent = '一键修复';
-      ctrlHint.textContent = '';
-    } else {
-      ctrlFixBtn.textContent = '修复守护进程';
-      ctrlHint.textContent = '装系统包需要 sudo 密码，网页这边只能修守护进程。'
-        + '要补装控件请在终端执行：bash install.sh check --fix';
-    }
+    // 网页端只修不需要 root 的部分（ydotoold 托管）；装系统包要 sudo 密码，
+    // 后台进程接不了终端输入，一律引导到终端，由 sudo 自己提示
+    ctrlFixBtn.textContent = '修复守护进程';
+    ctrlHint.textContent = '网页这边只修 ydotoold 守护进程。'
+      + '要补装控件请在终端执行：bash install.sh check --fix（会提示输入 sudo 密码）';
   }
 
   function openCtrlPanel() {
@@ -2216,21 +2567,17 @@
       .catch(function () { ctrlHint.textContent = '读取失败（连接异常）'; return null; });
   }
 
-  function runCtrlFix(full) {
+  function runCtrlFix() {
     ctrlFixBtn.disabled = true;
     ctrlHint.textContent = '处理中…';
     ctrlLog.textContent = '';
-    fetch('/api/controls/fix?full=' + (full ? 1 : 0) + '&token=' + encodeURIComponent(token), { method: 'POST' })
+    fetch('/api/controls/fix?token=' + encodeURIComponent(token), { method: 'POST' })
       .then(function (r) { return r.json(); })
       .then(function (res) {
         var lines = (res.results || []).map(function (x) {
           return (x.ok ? '✓ ' : '✗ ') + x.message;
         });
         ctrlLog.textContent = lines.join('\n');
-        if (res.results && res.results.length === 1 && res.results[0].key === 'ydotoold'
-            && !res.results[0].ok && !res.hint) {
-          ctrlLog.textContent += '\n（完整修复请在终端：bash install.sh check --fix）';
-        }
         if (res.hint) ctrlHint.textContent = res.hint;
         if (res.controls) { fillCtrlPanel(res.controls); renderControls(res.controls); }
       })
@@ -2246,9 +2593,8 @@
     fetchCtrl(true);
   });
   ctrlFixBtn.addEventListener('click', function () {
-    var c = lastControls;
-    // 能免密 sudo 才尝试装包；否则只修守护进程
-    runCtrlFix(!!(c && c.sudo_nopasswd));
+    // 只修守护进程；装系统包走终端（后端会回一条提示）
+    runCtrlFix();
   });
 
   function renderStatus(s) {
@@ -2285,8 +2631,13 @@
     if (s.mode) {
       modeBadge.hidden = false;
       modeBadge.textContent = s.mode === 'gaming' ? '游戏模式' : '桌面模式';
-      // 实时画面只有游戏模式下有 gamescope 节点可抓；切回桌面就把面板收掉
-      btnLive.hidden = s.mode !== 'gaming';
+      // 画面入口一直显示：桌面模式下没有 gamescope 节点可抓，只置灰并提示原因，
+      // 直接藏掉会让人以为「实时画面」这个功能没了
+      btnLive.hidden = false;
+      btnLive.classList.toggle('off', s.mode !== 'gaming');
+      btnLive.title = s.mode === 'gaming'
+        ? '实时画面'
+        : '实时画面 · 仅游戏模式可用（当前是桌面模式）';
       if (s.mode !== 'gaming' && liveOn) liveClose();
     }
     if (s.context) {
@@ -2301,7 +2652,18 @@
         + '\n达到 ' + c.compact_at + '% 时自动压缩';
       ctxBadge.hidden = false;
       ctxBadge.textContent = '上下文 ' + pct + '%' + (c.used ? (' · ' + fmtTokens(c.used) + '/' + fmtTokens(c.window)) : '');
-      ctxBadge.title = ctxRow.title;
+      // DeepSeek 的前缀缓存命中率：命中越高越便宜（命中部分按更低价计费）。
+      // 数字突然掉下来通常意味着前缀被打断（换会话、改人设、升级后第一轮）
+      var cache = c.cache || null;
+      var cacheLine = '';
+      if (cache && cache.prompt) {
+        cacheLine = '\n前缀缓存命中 ' + cache.percent + '%（' + fmtTokens(cache.hit)
+                  + ' / ' + fmtTokens(cache.prompt) + ' 输入 token）'
+                  + '\n缓存按前缀保存，闲置几个小时到几天后会过期：'
+                  + (cache.idle ? ('距上次请求 ' + fmtIdle(cache.idle)) : '尚未请求过');
+      }
+      ctxBadge.title = ctxRow.title + cacheLine;
+      ctxRow.title = ctxBadge.title;
       // 用量越接近上限越醒目：85% 起变黄，95% 变红
       ctxBadge.classList.toggle('warn', pct >= 85 && pct < 95);
       ctxBadge.classList.toggle('danger', pct >= 95);
@@ -2426,6 +2788,7 @@
   }
 
   function refreshStatus() {
+    if (document.hidden) return;
     fetch('/api/status?token=' + encodeURIComponent(token))
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (s) { if (s) renderStatus(s); })
@@ -2663,7 +3026,14 @@
   var updCheck = document.getElementById('updCheck');
   var updNote = document.getElementById('updNote');
   var updApply = document.getElementById('updApply');
+  var cfgUpdSource = document.getElementById('cfgUpdSource');
+  var updSourceHint = document.getElementById('updSourceHint');
   var verLoaded = false;
+
+  // 后端回来的「实际用到的源」→ 给用户看的名字
+  function srcName(src) {
+    return src === 'github' ? 'GitHub' : (src === 'mirror' ? '国内镜像' : '');
+  }
 
   // 后台自动查到新版本时：设置按钮打红点，设置页里也把提示填好
   function markUpdate(latest, current) {
@@ -2707,7 +3077,10 @@
   loadBrandVersion();
 
   updCheck.addEventListener('click', function () {
-    updNote.textContent = '正在查询 GitHub 最新版本…';
+    // 只回显「优先源」，实际顺序由后端按 [update].source 决定（失败会自动切备用源）
+    var src = cfgUpdSource ? cfgUpdSource.value : 'mirror';
+    var via = src.indexOf('github') === 0 ? 'GitHub' : '国内镜像';
+    updNote.textContent = '正在查询最新版本（优先 ' + via + '）…';
     updApply.style.display = 'none';
     updCheck.disabled = true;
     fetch('/api/update/check?token=' + encodeURIComponent(token))
@@ -2717,15 +3090,19 @@
         if (!res.ok) { updNote.textContent = (res.body && res.body.detail) || '检查失败'; return; }
         var d = res.body;
         verTag.textContent = '版本 v' + d.current;
+        // 显示实际查到的源；前面那个源失败了就顺带说明一句
+        var used = srcName(d.source);
+        var tail = used ? '　更新源：' + used : '';
+        if ((d.fallback_from || []).length) tail += '（备用源）';
         if (!d.has_update) {
-          updNote.textContent = d.tag
+          updNote.textContent = (d.tag
             ? '已是最新版本（v' + d.current + '）'
-            : '还没有发布版本信息，已是最新';
+            : '还没有发布版本信息，已是最新') + tail;
           return;
         }
         updNote.innerHTML = '发现新版本 <b>v' + d.tag + '</b>' +
-          (d.published_at ? '（' + d.published_at.slice(0, 10) + '）' : '') +
-          '\n升级会自动拉取新代码并重启服务，配置与对话记录都会保留。';
+          (d.published_at ? '（' + d.published_at.slice(0, 10) + '）' : '') + '\n' +
+          '升级会自动拉取新代码并重启服务，配置与对话记录都会保留。' + tail;
         updApply.style.display = 'block';
       })
       .catch(function () { updCheck.disabled = false; updNote.textContent = '检查失败，请检查网络'; });
@@ -2742,7 +3119,8 @@
           updNote.textContent = (res.body && res.body.detail) || '升级失败';
           return;
         }
-        updNote.textContent = '升级已开始，服务马上会重启，稍等几秒后刷新本页即可。';
+        updNote.textContent = (res.body && res.body.message)
+          || '升级已开始，服务马上会重启，稍等几秒后刷新本页即可。';
       })
       .catch(function () {
         updApply.disabled = false;
@@ -2752,11 +3130,20 @@
 
   function openSettings() {
     settingsPanel.classList.add('show');
+    // 每次打开都从第一页开始；上次停在哪页容易让人以为设置不见了
+    showSetPane('model');
     cfgHint.textContent = '';
     tokenHint.textContent = '';
     qrBox.classList.remove('show');
     qrBox.innerHTML = '';
+    loadMemory();
     loadVersion();
+    loadCfgForm();
+  }
+
+  // 读一次配置填进设置页表单。导入备份改了人设之后也要再填一遍，
+  // 所以单独拆出来
+  function loadCfgForm() {
     fetch('/api/config?token=' + encodeURIComponent(token))
       .then(function (r) {
         if (!r.ok) throw new Error(r.status === 401 ? '旧令牌已失效，请重新登录' : '读取失败');
@@ -2788,6 +3175,9 @@
         document.getElementById('cfgPersonaForbid').value = c.persona_forbid || '';
         cfgToken.value = c.token || '';
         cfgUrl.value = location.origin + '/?token=' + encodeURIComponent(c.token || '');
+        // 更新源：老配置没有 [update] 段时后端按默认值回传
+        cfgUpdSource.value = c.update_source || 'mirror';
+        updSourceHint.textContent = c.update_mirror ? '镜像地址：' + c.update_mirror : '';
         // 没配 Key 时直接把设置页顶到最显眼的位置当首次引导
         if (!c.llm_configured) {
           cfgHint.textContent = '首次使用：填好上面的 API 地址和 Key，保存后就能开始对话';
@@ -2799,10 +3189,228 @@
       });
   }
 
-  settingsBtn.addEventListener('click', openSettings);
-  settingsPanel.addEventListener('click', function (e) {
-    if (e.target === settingsPanel) settingsPanel.classList.remove('show');
+  // ---------- 设置页：长期记忆 ----------
+  // 每次打开设置页拉一次列表；增删改都立即提交，不跟「保存」按钮绑定，
+  // 免得改完记忆却忘了点保存
+  var memList = document.getElementById('memList');
+  var memKind = document.getElementById('memKind');
+  var memText = document.getElementById('memText');
+  var memCount = document.getElementById('memCount');
+  var memKinds = [];      // [{id,name}]，顺序由后端给，列表分组也按它排
+
+  function memFetch(path, opt) {
+    return fetch(path + (path.indexOf('?') >= 0 ? '&' : '?')
+                 + 'token=' + encodeURIComponent(token), opt)
+      .then(function (r) { return r.json(); });
+  }
+
+  function loadMemory() {
+    return memFetch('/api/memory')
+      .then(function (res) {
+        if (!res || !res.items) throw new Error('bad');
+        memKinds = res.kinds || [];
+        fillMemKindSelect();
+        renderMemory(res.items);
+      })
+      .catch(function () {
+        memList.innerHTML = '<div class="mem-empty">记忆读取失败</div>';
+      });
+  }
+
+  function fillMemKindSelect() {
+    if (!memKinds.length) return;
+    var cur = memKind.value;
+    memKind.innerHTML = '';
+    memKinds.forEach(function (k) {
+      var o = document.createElement('option');
+      o.value = k.id;
+      o.textContent = k.name;
+      memKind.appendChild(o);
+    });
+    if (cur) memKind.value = cur;
+  }
+
+  function renderMemory(items) {
+    memList.innerHTML = '';
+    memCount.dataset.n = items.length;
+    memCount.textContent = items.length ? ('共 ' + items.length + ' 条') : '';
+    if (!items.length) {
+      memList.innerHTML = '<div class="mem-empty">还没有记忆。对话里说「记住…」就会记在这里。</div>';
+      return;
+    }
+    // 按类别分组；后端已按类别、时间排好序，这里只负责切段
+    var lastKind = null;
+    items.forEach(function (it) {
+      if (it.kind !== lastKind) {
+        lastKind = it.kind;
+        var h = document.createElement('div');
+        h.className = 'mem-group';
+        h.textContent = (memKinds.filter(function (k) { return k.id === it.kind; })[0] || {}).name || it.kind;
+        memList.appendChild(h);
+      }
+      memList.appendChild(memItemNode(it));
+    });
+  }
+
+  function memItemNode(it) {
+    var row = document.createElement('div');
+    row.className = 'mem-item';
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.value = it.text;
+    input.maxLength = 300;
+    var saveBtn = document.createElement('button');
+    saveBtn.type = 'button';
+    saveBtn.className = 'mini-btn mem-save';
+    saveBtn.textContent = '保存';
+    saveBtn.hidden = true;
+    var delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.className = 'mini-btn mem-del';
+    delBtn.textContent = '删除';
+
+    input.addEventListener('input', function () {
+      var dirty = input.value !== it.text;
+      row.classList.toggle('editing', dirty);
+      saveBtn.hidden = !dirty;
+    });
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { input.blur(); saveBtn.click(); }
+      if (e.key === 'Escape') { input.value = it.text; input.blur(); input.dispatchEvent(new Event('input')); }
+    });
+    saveBtn.addEventListener('click', function () {
+      var text = input.value.trim();
+      // 清空即视为删掉这条，与后端的约定一致
+      if (!text) { delBtn.click(); return; }
+      if (text === it.text) return;
+      memFetch('/api/memory', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: it.id, kind: it.kind, text: text })
+      }).then(function (res) {
+        if (!res || !res.ok) { addSystem(res && res.detail ? res.detail : '保存失败'); return; }
+        it.text = text;
+        row.classList.remove('editing');
+        saveBtn.hidden = true;
+      }).catch(function () { addSystem('保存记忆失败'); });
+    });
+    delBtn.addEventListener('click', function () {
+      memFetch('/api/memory/' + encodeURIComponent(it.id), { method: 'DELETE' })
+        .then(function (res) {
+          // 已经没了（比如在另一端删掉了）也照样刷新，这一行会一起消失
+          if (res && res.detail) addSystem(res.detail);
+          loadMemory();
+        })
+        .catch(function () { addSystem('删除记忆失败'); });
+    });
+
+    row.appendChild(input);
+    row.appendChild(saveBtn);
+    row.appendChild(delBtn);
+    return row;
+  }
+
+  function addMemory() {
+    var text = memText.value.trim();
+    if (!text) { memText.focus(); return; }
+    memFetch('/api/memory', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: memKind.value, text: text })
+    }).then(function (res) {
+      // 成功后端回 {ok:true, item}，重复内容也回 ok（不会存第二遍）
+      if (!res || !res.ok) { addSystem(res && res.detail ? res.detail : '保存失败'); return; }
+      memText.value = '';
+      loadMemory();
+    }).catch(function () { addSystem('保存记忆失败'); });
+  }
+
+  document.getElementById('memAdd').addEventListener('click', addMemory);
+  memText.addEventListener('keydown', function (e) { if (e.key === 'Enter') addMemory(); });
+  document.getElementById('memClear').addEventListener('click', function () {
+    if (!Number(memCount.dataset.n)) return;
+    if (!confirm('确定清空全部长期记忆？清空后之前的教学就都没了。')) return;
+    memFetch('/api/memory', { method: 'DELETE' })
+      .then(loadMemory)
+      .catch(function () { addSystem('清空记忆失败'); });
   });
+
+  // 备份：人设 + 记忆打包成一个 JSON，导入时整体覆盖
+  document.getElementById('soulExport').addEventListener('click', function () {
+    memFetch('/api/soul/export').then(function (res) {
+      if (!res || res.kind !== 'meidosoul') {
+        addSystem(res && res.detail ? res.detail : '导出失败');
+        return;
+      }
+      var blob = new Blob([JSON.stringify(res, null, 2)], { type: 'application/json' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'meidosoul.json';
+      document.body.appendChild(a);
+      a.click();
+      // 撤销要等浏览器真正开始下载，否则个别浏览器会拿到空文件
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    }).catch(function () { addSystem('导出失败'); });
+  });
+
+  var soulFile = document.getElementById('soulFile');
+  document.getElementById('soulImport').addEventListener('click', function () {
+    soulFile.value = '';
+    soulFile.click();
+  });
+  soulFile.addEventListener('change', function () {
+    var f = soulFile.files && soulFile.files[0];
+    if (!f) return;
+    f.text().then(function (txt) {
+      var data;
+      try { data = JSON.parse(txt); } catch (e) { addSystem('这个文件不是有效的 JSON'); return; }
+      if (!data || (data.persona == null && data.memory == null)) {
+        addSystem('文件里没有人设或记忆，可能不是 DeckMeido 的备份');
+        return;
+      }
+      if (!confirm('导入会覆盖当前的人设和全部记忆，确定继续？')) return;
+      memFetch('/api/soul/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ persona: data.persona, memory: data.memory, replace: true })
+      }).then(function (res) {
+        if (!res || !res.ok) { addSystem(res && res.detail ? res.detail : '导入失败'); return; }
+        addSystem('已导入，记忆 ' + res.added + ' 条');
+        loadMemory();
+        loadCfgForm();   // 人设变了，设置页表单要跟着刷新
+      }).catch(function () { addSystem('导入失败'); });
+    });
+  });
+
+  // 设置页分区：左侧导航切换右侧内容。切页时内容区回到顶部，
+  // 否则从长页（人设）切到短页会停在半空
+  var setBody = settingsPanel.querySelector('.set-body');
+
+  function showSetPane(name) {
+    Array.prototype.forEach.call(settingsPanel.querySelectorAll('.set-tab'), function (b) {
+      b.classList.toggle('on', b.dataset.pane === name);
+    });
+    Array.prototype.forEach.call(settingsPanel.querySelectorAll('.set-pane'), function (p) {
+      p.classList.toggle('on', p.dataset.pane === name);
+    });
+    setBody.scrollTop = 0;
+  }
+
+  Array.prototype.forEach.call(settingsPanel.querySelectorAll('.set-tab'), function (b) {
+    b.addEventListener('click', function () { showSetPane(b.dataset.pane); });
+  });
+  // 全屏页没有「点遮罩关闭」，要有一个明确的出口
+  document.getElementById('setClose').addEventListener('click', function () {
+    settingsPanel.classList.remove('show');
+  });
+  // Esc 关闭（输入框里按 Esc 只撤销编辑，不关页面）
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape' || !settingsPanel.classList.contains('show')) return;
+    if (document.activeElement && /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) return;
+    settingsPanel.classList.remove('show');
+  });
+
+  settingsBtn.addEventListener('click', openSettings);
 
   // 扫码连接：展示局域网地址对应的二维码，手机一扫即带上令牌
   qrBtn.addEventListener('click', function () {
@@ -2844,6 +3452,15 @@
     }
   });
 
+  // 一键回到默认配置：地址填 DeepSeek 官方域名（不带 /v1），Key 不动。
+  // 模型也一起落到 deepseek-chat：只改地址的话，原来选的 gpt-* 会被服务端归一
+  // 替换掉，但输入框里还留着旧名字，看着像没生效
+  document.getElementById('presetDeepseek').addEventListener('click', function () {
+    cfgBaseUrl.value = 'https://api.deepseek.com';
+    fillModelSelect([], 'deepseek-chat');
+    cfgHint.textContent = '已填入 DeepSeek 地址与默认模型，点「保存」后生效';
+  });
+
   // 拉取当前配置（已保存的地址和 Key）的模型列表，同步到底部下拉框
   function reloadModels() {
     modelsPromise = null;
@@ -2877,7 +3494,8 @@
       persona_tone: document.getElementById('cfgPersonaTone').value,
       persona_ending: document.getElementById('cfgPersonaEnding').value,
       persona_suffix: document.getElementById('cfgPersonaSuffix').value,
-      persona_forbid: document.getElementById('cfgPersonaForbid').value
+      persona_forbid: document.getElementById('cfgPersonaForbid').value,
+      update_source: cfgUpdSource.value
     };
     if (keyInput) { payload.api_key = keyInput; }
     if (apiKeyClear) { payload.clear_api_key = true; }
@@ -2897,13 +3515,13 @@
         }
         cfgHint.textContent = res.llm_configured ? '已保存，正在拉取模型列表…' : '已保存（API Key 为空，对话暂不可用）';
         if (!res.llm_configured) {
-          setTimeout(function () { settingsPanel.classList.remove('show'); }, 1200);
+          // 全屏设置页不再自动关闭：主人可能还要接着改下一项，
+          // 想退出点「关闭」或按 Esc 即可
           return null;
         }
         return reloadModels().then(function (list) {
           cfgHint.textContent = list.length ? ('已保存并生效，共 ' + list.length + ' 个模型') : '已保存，但没拉到模型列表';
           loadToolbar();  // 刷新右上角当前模型显示
-          setTimeout(function () { settingsPanel.classList.remove('show'); }, 1200);
         });
       })
       .catch(function (err) { cfgHint.textContent = (err && err.message) || '保存失败'; });
@@ -3052,7 +3670,7 @@
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch)
-    }).catch(function () {});
+    }).then(function (r) { return r.json(); }).catch(function () { return null; });
   }
 
   function loadToolbar() {
@@ -3060,6 +3678,7 @@
       .then(function (r) { return r.json(); })
       .then(function (c) {
         if (c.permission_mode) permSelect.value = c.permission_mode;
+        setThinkLevel(THINK_LEVELS.indexOf(c.reasoning_effort || ''));
         // 模型下拉：先用当前模型占位，再异步补上服务商真实模型列表
         fillModelSelect([c.model]);
         if (c.model) modelSelect.value = c.model;
@@ -3102,6 +3721,75 @@
     postConfig({ permission_mode: permSelect.value });
     addSystem('权限模式已切换：' + permSelect.options[permSelect.selectedIndex].text);
   });
+  // 深度思考档位：无 / 低 / 中 / 高。四档在后端只落成 llm.reasoning_effort
+  // 一个字符串（空 / low / medium / high），DeepSeek 与 OpenAI 系都认这套取值。
+  // 真正的滑块是自绘的（.think-track），下面的 range 只当前端状态用
+  var thinkWrap = document.getElementById('thinkWrap');
+  var thinkRange = document.getElementById('thinkRange');
+  var thinkLabel = document.getElementById('thinkLabel');
+  var thinkTrack = document.getElementById('thinkTrack');
+  var thinkFill = document.getElementById('thinkFill');
+  var thinkKnob = document.getElementById('thinkKnob');
+  var THINK_LEVELS = ['', 'low', 'medium', 'high'];
+  var THINK_NAMES = ['无', '低', '中', '高'];
+  function clampLevel(lv) {
+    lv = parseInt(lv, 10);
+    return isNaN(lv) ? 0 : Math.max(0, Math.min(3, lv));
+  }
+  function setThinkLevel(lv) {
+    lv = clampLevel(lv);
+    thinkRange.value = lv;
+    thinkLabel.textContent = THINK_NAMES[lv];
+    // 圆点半径的一半留在两端之外会溢出，所以两端各让出 7px
+    var pct = 'calc(' + (lv / 3 * 100) + '% + ' + ((0.5 - lv / 3) * 14).toFixed(2) + 'px)';
+    thinkFill.style.width = pct;
+    thinkKnob.style.left = pct;
+    thinkWrap.classList.remove('level-0', 'level-1', 'level-2', 'level-3');
+    thinkWrap.classList.add('level-' + lv);
+    thinkWrap.title = lv ? ('深度思考：' + THINK_NAMES[lv] + '（档位越高越聪明，也越慢越费 token）')
+                         : '深度思考：无（不输出思维链，最快最省）';
+    return lv;
+  }
+  // 点击/拖动滑轨：按横向位置换算成最近的档位，松手才写配置。
+  // 拖动时不做吸附动画，松手后 setThinkLevel 会带过渡把圆点推到整档上
+  function levelFromX(clientX) {
+    var r = thinkTrack.getBoundingClientRect();
+    if (!r.width) return 0;
+    return clampLevel(Math.round((clientX - r.left - 7) / (r.width - 14) * 3));
+  }
+  var thinkDragging = false;
+  function dragTo(clientX) {
+    var lv = levelFromX(clientX);
+    if (lv !== clampLevel(thinkRange.value)) setThinkLevel(lv);
+  }
+  thinkTrack.addEventListener('pointerdown', function (e) {
+    thinkDragging = true;
+    try { thinkTrack.setPointerCapture(e.pointerId); } catch (_) {}
+    dragTo(e.clientX);
+    e.preventDefault();
+  });
+  thinkTrack.addEventListener('pointermove', function (e) {
+    if (thinkDragging) dragTo(e.clientX);
+  });
+  // 松手后先按本地档位落位，再以服务端回传的归一值校正：
+  // DeepSeek 只有 high / max，「低」「中」会被它映射成 high，滑条要如实跳回去，
+  // 免得以为设了「低」实际一直在跑高档
+  function commitThink(lv) {
+    lv = setThinkLevel(lv);
+    postConfig({ reasoning_effort: THINK_LEVELS[lv] }).then(function (c) {
+      if (!c || typeof c.reasoning_effort !== 'string') return;
+      var real = setThinkLevel(THINK_LEVELS.indexOf(c.reasoning_effort));
+      addSystem('深度思考已设为：' + THINK_NAMES[real]
+                + (real !== lv ? '（该服务商不支持「' + THINK_NAMES[lv] + '」，已按实际档位显示）' : ''));
+    });
+  }
+  thinkTrack.addEventListener('pointerup', function (e) {
+    if (!thinkDragging) return;
+    thinkDragging = false;
+    commitThink(thinkRange.value);
+  });
+  // 键盘无障碍：方向键、Home/End 也能调档
+  thinkRange.addEventListener('change', function () { commitThink(thinkRange.value); });
   modelSelect.addEventListener('change', function () {
     postConfig({ model: modelSelect.value });
     addSystem('模型已切换为 ' + modelSelect.value);
@@ -3295,6 +3983,8 @@
   }
   function pollSys() {
     if (!token) return;
+    // 页面在后台时别刷：手机切走/锁屏后每 5 秒一次请求只是白烧电和后端 CPU
+    if (document.hidden) return;
     fetch('/api/sysinfo?token=' + encodeURIComponent(token))
       .then(function (r) { return r.json(); })
       .then(function (d) {
@@ -3329,6 +4019,14 @@
   }
   pollSys();
   setInterval(pollSys, 5000);
+
+  // 回到前台立刻补刷一次：上面两个轮询在后台时是跳过的，不补的话
+  // 切回来最多要等一轮间隔才更新
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) return;
+    pollSys();
+    refreshStatus();
+  });
 
   // ---------- 侧栏：会话列表 ----------
   var sessList = document.getElementById('sessList');
@@ -3487,7 +4185,13 @@
     liveStop();
   };
   btnLive.addEventListener('click', function () {
-    if (liveOn) liveClose(); else liveOpen();
+    if (liveOn) { liveClose(); return; }
+    // 桌面模式下后端拿不到 gamescope 节点，点开只会是个黑框，直接说清楚
+    if (btnLive.classList.contains('off')) {
+      addSystem('实时画面只在游戏模式下可用：回到游戏（gamescope 接管画面）后再点顶部的「画面」。');
+      return;
+    }
+    liveOpen();
   });
   document.getElementById('lvClose').addEventListener('click', function () { liveClose(); });
   document.getElementById('lvReload').addEventListener('click', function () {

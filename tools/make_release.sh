@@ -5,10 +5,18 @@
 #   bash tools/make_release.sh v0.2.0    指定版本号
 # 产物：dist/deckmeido-<版本>.tar.gz
 #       dist/deckmeido-<版本>.tar.gz.sha256（也汇总进 dist/SHA256SUMS）
+#       dist/latest.json   镜像站/客户端查最新版用，指向本次打的包
 #
 # 包内额外带两个文件：
 #   VERSION        安装时 install.sh 优先读它写进安装目录
 #   RELEASE-NOTES.md  上一 tag 到本次 tag 之间的提交标题
+#
+# 镜像站目录布局（把 dist/ 里的文件按原样传上去即可）：
+#   <mirror>/latest.json
+#   <mirror>/SHA256SUMS
+#   <mirror>/deckmeido-<版本>.tar.gz
+#   <mirror>/deckmeido-<版本>.tar.gz.sha256
+#   <mirror>/install.sh          → 就是本仓库的 install.sh（供 from-mirror 引导）
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -71,6 +79,9 @@ fi
 
 tar -C "$STAGE" -czf "$OUT/$NAME.tar.gz" "$NAME"
 
+# 安装包每次都要带一份最新的 install.sh 到镜像根目录，from-mirror 引导靠它
+cp -f "$ROOT/install.sh" "$OUT/install.sh"
+
 # 校验和：单文件一份 + 汇总一份，安装前可 sha256sum -c 核对
 (
   cd "$OUT"
@@ -84,3 +95,31 @@ tar -C "$STAGE" -czf "$OUT/$NAME.tar.gz" "$NAME"
 
 echo "已生成 $OUT/$NAME.tar.gz"
 echo "已生成 $OUT/SHA256SUMS"
+
+# latest.json：镜像站的版本指针，客户端的「检查更新」读它。
+# 用 python 拼，保证 notes 里的换行/引号被正确转义。
+SHA256="$(sha256sum "$OUT/$NAME.tar.gz" | awk '{print $1}')"
+python3 - "$OUT/latest.json" "$VER" "$NAME.tar.gz" "$SHA256" "$STAGE/$NAME/RELEASE-NOTES.md" <<'PY'
+import json, sys, datetime, pathlib
+dest, ver, tarball, sha, notes_path = sys.argv[1:6]
+notes = ""
+p = pathlib.Path(notes_path)
+if p.exists():
+    notes = p.read_text(encoding="utf-8")[:4000]
+data = {
+    "tag": ver,
+    "name": f"DeckMeido {ver}",
+    "notes": notes,
+    "published_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+    "files": {"tarball": tarball, "sha256": sha},
+}
+pathlib.Path(dest).write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                              encoding="utf-8")
+PY
+echo "已生成 $OUT/latest.json（tag=$VER）"
+echo
+echo "上传到镜像站（示例，按自己的服务器改）："
+echo "  rsync -av $OUT/latest.json $OUT/SHA256SUMS \\"
+echo "        $OUT/$NAME.tar.gz $OUT/$NAME.tar.gz.sha256 \\"
+echo "        user@meido.meagames.cn:/var/www/deckmeido/"
+echo "  再传一次 install.sh：scp install.sh user@meido.meagames.cn:/var/www/deckmeido/"

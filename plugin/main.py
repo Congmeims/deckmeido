@@ -24,6 +24,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -151,6 +152,7 @@ def _save_ticket(ticket: str):
     global _SESSION_TICKET, _ticket_at
     _SESSION_TICKET = ticket
     _ticket_at = time.time()
+    _restore_owner()
     path = _session_path()
     try:
         path.write_text(
@@ -574,6 +576,44 @@ def _run_as() -> list[str]:
     return _RUN_AS
 
 
+def _plugin_dir() -> Path:
+    """插件代码目录（~/homebrew/plugins/DeckMeido）"""
+    try:
+        cand = str(getattr(decky, "DECKY_PLUGIN_DIR", "") or "")
+        if cand:
+            return Path(cand)
+    except Exception:
+        pass
+    return Path(__file__).resolve().parent
+
+
+_OWNER_CHECKED = False
+
+
+def _restore_owner():
+    """把插件目录的属主还给 deck。
+
+    Decky 以 root 加载插件，插件目录是 deck 的仓库软链接，root 在这里写
+    __pycache__、票据之后，deck 用户再 `git pull` 就会报
+    `unable to unlink old 'plugin/main.py': Permission denied`。
+    这里在首次落盘时纠一次，代价是一次 stat 遍历。
+    """
+    global _OWNER_CHECKED
+    if _OWNER_CHECKED or os.getuid() != 0:
+        return
+    _OWNER_CHECKED = True
+    uid = _target_uid()
+    root = _plugin_dir()
+    try:
+        if root.stat().st_uid != uid:
+            os.chown(root, uid, -1)
+        for child in root.rglob("*"):
+            if child.stat().st_uid != uid:
+                os.chown(child, uid, -1)
+    except (OSError, AttributeError):
+        pass
+
+
 def _runtime_dir() -> str:
     """gamescope 的 PipeWire socket 在 /run/user/<deck uid> 下"""
     return f"/run/user/{_target_uid()}"
@@ -627,6 +667,7 @@ def _backend_log_fd() -> int:
     client/main.py 的做法留一代备份，超过 5MB 就滚动。
     """
     log = INSTALL_DIR / "server" / "backend.log"
+    _restore_owner()
     try:
         log.parent.mkdir(parents=True, exist_ok=True)
         if log.exists() and log.stat().st_size > 5 * 1024 * 1024:
@@ -674,10 +715,28 @@ async def _start_backend(port: int) -> tuple[bool, str]:
     for _ in range(80):
         core = await _core_http(port, token, "GET", "/api/status", timeout=2.0)
         if core.get("ok"):
+            if proc.returncode is not None:
+                pass    # 守卫让它自己退了、端口上是既有那份，属正常
+            else:
+                # 不要直接丢引用：子进程对象被回收时 asyncio 会留一个
+                # 「任务还没结束」的警告，而且退出码也没人收
+                def _reap(p=proc):
+                    try:
+                        p.wait(timeout=1)
+                    except Exception:
+                        pass
+                threading.Thread(target=_reap, daemon=True).start()
             return True, ""
         if proc.returncode is not None:
             return False, f"后端进程退出了（code {proc.returncode}），日志：{log}"
         await asyncio.sleep(0.5)
+    # 40 秒没应答：这份进程要么卡在启动里，要么永远不会应答，杀掉免得占着端口
+    if proc.returncode is None:
+        try:
+            proc.kill()
+            await asyncio.wait_for(proc.wait(), timeout=3)
+        except Exception:
+            pass
     return False, f"后端 40 秒内没有应答，日志：{log}"
 
 
@@ -686,6 +745,7 @@ async def _gamescope_pw_node() -> tuple[str | None, str]:
     if not shutil.which("pw-dump"):
         return None, "机器上没有 pw-dump（pipewire 工具未安装）"
     cmd = _run_as() + ["pw-dump"]
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -695,6 +755,12 @@ async def _gamescope_pw_node() -> tuple[str | None, str]:
         )
         out, err = await asyncio.wait_for(proc.communicate(), timeout=15)
     except asyncio.TimeoutError:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=3)
+            except Exception:
+                pass
         return None, "pw-dump 超时（15s）"
     except Exception as exc:
         return None, f"pw-dump 跑不起来：{exc}"
@@ -743,6 +809,7 @@ async def _capture_once(node: str, gst: str, timeout: int = 25) -> tuple[bool, s
         gst, "-q", "pipewiresrc", f"path={node}", "num-buffers=6", "!",
         "videoconvert", "!", "jpegenc", "quality=90", "!", "filesink", f"location={tmp}",
     ]
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -765,6 +832,14 @@ async def _capture_once(node: str, gst: str, timeout: int = 25) -> tuple[bool, s
     except Exception as exc:
         return False, f"抓帧出错：{exc}"
     finally:
+        # 超时/异常时 gst 还挂在 PipeWire 上：不杀掉，下一次抓帧会再起一个，
+        # 几轮下来就是一堆没人读的抓帧进程
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=3)
+            except Exception:
+                pass
         try:
             tmp.unlink()
         except FileNotFoundError:
@@ -1219,8 +1294,10 @@ class _Backend:
         self.url = url
         self._impl = None
         self._send_lock = asyncio.Lock()
-        # 本端这一轮的 sid：history 回来时填上，之后靠它认出哪些 δ 是自己的
-        self.sid = ""
+        # 本端这一轮的 turn_id：发 chat 时自己生成，之后靠它认出哪些 δ 是自己的。
+        # 不能用 history 里的 sid：那是「会话」id，所有端共享，别的端提问时
+        # δ 的 sid 和本端完全一样，会被误当成自己这一轮拼进正文
+        self.turn = ""
 
     async def open(self):
         # 后端用 UA 判断「这条连接是网页还是手机」，插件不声明就会被当成一个
@@ -1269,7 +1346,9 @@ _LAST_REPLY = ""     # 本轮确定下来的完整正文
 _FINAL_EVENT = asyncio.Event()
 # 面板展示的对话：所有端的提问和回复，{role, text, client, ts}
 _THREAD: list[dict] = []
-_THREAD_MAX = 200     # 只留最近这么多条，再往前翻也用不上
+# 面板只显示最近这么多条：QAM 里挂着几百条会把滚动拖卡。
+# 这只是显示上限，完整对话在后端历史里，网页端照样能看到全部
+_THREAD_MAX = 20
 # 最近一次推给面板的 thread 快照，等界面 ready 时补发（见 _emit）
 _LAST_THREAD: dict | None = None
 # 最近一次截图落盘的本地路径：它比后端回显的 /shots/ 更早可用。
@@ -1433,11 +1512,10 @@ async def _read_loop(bk: _Backend):
         except Exception:
             continue
         typ = msg.get("type")
-        sid = str(msg.get("sid") or "")
-        mine = bool(sid) and sid == bk.sid
+        # 只认本端这一轮的 turn_id：会话 sid 是所有端共用的，拿它过滤等于没过滤
+        tid = str(msg.get("turn_id") or "")
+        mine = bool(tid) and tid == bk.turn
         if typ == "history":
-            if not bk.sid:
-                bk.sid = sid
             _sync_thread(msg.get("messages") or [])
             continue
         if typ == "status":
@@ -1529,12 +1607,7 @@ async def _ensure_backend() -> tuple[_Backend | None, str]:
         return None, f"连不上后端 :{port}（{exc}）"
     _BACKEND = bk
     _READER = asyncio.create_task(_read_loop(bk))
-    # 等 history：拿到 sid 才能认出哪条 δ 是本端这一轮的
-    for _ in range(100):
-        if bk.sid:
-            break
-        await asyncio.sleep(0.05)
-    decky.logger.info(f"已连上后端 :{port}，本端 {bk.sockname()}，sid={bk.sid or '(空)'}")
+    decky.logger.info(f"已连上后端 :{port}，本端 {bk.sockname()}")
     return bk, ""
 
 
@@ -1667,6 +1740,9 @@ class Plugin:
         node, why = await _gamescope_pw_node()
         core = await _core_status(port, token)
         prefs = await _core_prefs(port, token) if core.get("ok") else {}
+        # 查游戏名要扫进程表、读 Steam 日志，放线程里做：面板一刷新就调这个接口，
+        # 同步跑会把 Decky 的事件循环卡住
+        game = await asyncio.to_thread(_current_game)
         # 面板只会写「探测失败（原因）」，日志里留一份，事后能对上时间点
         decky.logger.info(
             f"get_status：核心 {'正常' if core.get('ok') else '异常'}"
@@ -1697,7 +1773,7 @@ class Plugin:
             "version": str(prefs.get("version") or _PLUGIN_VERSION),
             # 当前正在运行的游戏名：抓帧时会再查一次，这里给面板一个初值，
             # 让用户按「截屏询问」之前就能看到这一问会带上哪款游戏
-            "game_name": (_current_game().get("name") or ""),
+            "game_name": (game.get("name") or ""),
             # 虚拟手柄能不能用：设备节点在 + 进程有写权限
             "gamepad": os.access("/dev/uinput", os.W_OK) if os.path.exists("/dev/uinput") else False,
             # 本机鉴权状态：false 时前端只显示解锁框
@@ -1920,7 +1996,11 @@ class Plugin:
         _ACC = ""
         _LAST_REPLY = ""
         _FINAL_EVENT.clear()
-        payload = {"type": "chat", "text": text, "client": "qam"}
+        # 本轮 turn_id：由本端生成，_read_loop 靠它把 δ 和 final 认出来。
+        # 同一时刻只允许一轮，所以发之前先把它记在连接上
+        bk.turn = f"qam-{os.urandom(6).hex()}"
+        payload = {"type": "chat", "text": text, "client": "qam",
+                   "turn_id": bk.turn}
         if brief:
             payload["brief"] = str(brief).strip()
         if image:
@@ -1962,6 +2042,7 @@ class Plugin:
         token = str(cfg.get("token", "") or "")
         await _drop_backend()
         err = ""
+        writer = None
         try:
             reader, writer = await asyncio.open_connection("127.0.0.1", port)
             req = (
@@ -1974,11 +2055,18 @@ class Plugin:
             writer.write(req.encode())
             await writer.drain()
             resp = await asyncio.wait_for(reader.read(), timeout=10)
-            writer.close()
             if b" 200 " not in resp.split(b"\r\n", 1)[0]:
                 err = resp.split(b"\r\n", 1)[0].decode("utf-8", "replace")[:80]
         except Exception as exc:
             err = str(exc)
+        finally:
+            # 读超时/连接被拒时异常路径也要关：不然每次终止都漏一个 fd
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
         _ACC += "\n（已中断）" if _ACC else "已中断"
         _finalize(cancelled=True)
         if err:
@@ -1988,6 +2076,8 @@ class Plugin:
     async def _main(self):
         decky.logger.info(f"DeckMeido 插件已加载，安装目录 {INSTALL_DIR}")
         _run_as()
+        # 以 root 加载会把属主写歪，加载时先纠一次，免得 deck 用户 git pull 失败
+        _restore_owner()
         # 开机默认进游戏模式，这时后端通常没在跑，用户不点「启动后端」就等于插件不可用。
         # 后台自动拉一次：成功与否都不打扰用户，面板上本来就有状态和执行按钮。
         asyncio.get_running_loop().create_task(self._autostart_backend())

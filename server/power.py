@@ -30,9 +30,11 @@ import threading
 import time
 
 WHO = "DeckMeido"
-# 后台线程核对间隔：进程被外部杀掉、模式从桌面切到游戏，最多这么久被发现
+# 持有抑制期间核对间隔：抑制进程被外部杀掉、模式从桌面切到游戏，最多这么久被发现。
+# 没有抑制时线程不轮询，只在 hold/release 时被唤醒（见 AwakeKeeper._loop），
+# 空闲状态下一个子进程都不会起。
 POLL_INTERVAL = 2.0
-# 桌面模式判定缓存时间：避免每条命令都 fork 一次 pgrep
+# 模式判定缓存：切模式后最多这么久才反映过来，避免频繁跑 pw-dump
 MODE_TTL = 3.0
 
 
@@ -52,23 +54,22 @@ def _session_env() -> dict:
 def desktop_mode() -> bool:
     """当前是否桌面模式。
 
-    判据和 get_status 里的 mode 一致：gamescope 在跑就是游戏模式。
-    探测失败（pgrep 不存在等）按桌面模式处理——宁可多抑制一次，
-    也不要因为判断不出来而在用户盯着屏幕时黑屏。
+    判据和 get_status、depcheck 共用 tools.mode_is_gaming()：PipeWire 里有没有
+    gamescope 的视频节点。以前这里是 `pgrep -x gamescope`，而 SteamOS 的 gamescope
+    带着一长串参数启动、comm 被截断到 15 字节，pgrep 恒匹配不上 —— 于是人在游戏
+    模式里也会被当成桌面模式，白白挂上息屏抑制。
+    探测失败按桌面模式处理：宁可多抑制一次，也不要因为判断不出来而在用户盯着屏幕时黑屏。
     """
-    try:
-        r = subprocess.run(["pgrep", "-x", "gamescope"],
-                           capture_output=True, timeout=2)
-        return r.returncode != 0
-    except Exception:
-        return True
+    # 延迟导入：tools 在模块顶层 import 了 power，这里不能反过来在顶层 import 它
+    from . import tools
+    return not tools.mode_is_gaming()
 
 
 class AwakeKeeper:
     """按「原因」计数地持有抑制；没有原因时立刻释放"""
 
     def __init__(self) -> None:
-        self.enabled = True
+        self._enabled = True
         self._why = "DeckMeido 正在操作设备"
         self._held: set[str] = set()
         self._lock = threading.Lock()
@@ -81,6 +82,16 @@ class AwakeKeeper:
         self._thread: threading.Thread | None = None
 
     # ---------- 对外接口 ----------
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @enabled.setter
+    def enabled(self, on: bool) -> None:
+        """开关变化时唤醒后台线程：关掉要立刻释放，打开要立刻补挂"""
+        self._enabled = bool(on)
+        self._wake.set()
 
     def hold(self, reason: str, why: str = "") -> None:
         """登记一个「别睡」的原因（command / overlay）"""
@@ -131,20 +142,35 @@ class AwakeKeeper:
         self._thread.start()
 
     def _loop(self) -> None:
+        """只有「要挂抑制」或「抑制还挂着」时才定期核对，空闲时阻塞等事件
+
+        空闲（没有 hold、抑制也已经收干净）时不再定时醒来：这时候没有要挂的抑制，
+        也没有可能被外部杀掉的进程，轮询只会白白去跑一次模式探测。
+        注意判断条件里不能只看 _held：hold 后立刻 release 的那一轮，线程可能还没
+        醒来就看到空集合，得靠「进程还活着」把释放做完。
+        """
         while not self._stop.is_set():
-            self._wake.wait(timeout=POLL_INTERVAL)
+            with self._lock:
+                wanted = bool(self._held) and self._enabled
+            if wanted or self._proc is not None or self._cookie is not None:
+                try:
+                    self._reconcile()
+                except Exception as e:      # 电源抑制失败绝不能拖垮服务
+                    _log(f"保持常亮失败：{e}")
+                self._wake.wait(timeout=POLL_INTERVAL)
+            else:
+                self._wake.wait()
             self._wake.clear()
-            if self._stop.is_set():
-                break
-            try:
-                self._reconcile()
-            except Exception as e:      # 电源抑制失败绝不能拖垮服务
-                _log(f"保持常亮失败：{e}")
 
     def _refresh_mode(self) -> bool:
         now = time.monotonic()
         if now - self._mode_at > MODE_TTL:
-            self._mode = desktop_mode()
+            try:
+                self._mode = desktop_mode()
+            except Exception as e:
+                # 判不出来按桌面处理：宁可多抑制一次，也别在用户盯着屏幕时黑屏
+                _log(f"模式判定失败，按桌面模式处理：{e}")
+                self._mode = True
             self._mode_at = now
         return self._mode
 

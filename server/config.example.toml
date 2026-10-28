@@ -10,13 +10,15 @@ port = 18765
 token = "meido"
 
 [llm]
-# OpenAI 兼容接口，可切换 GPT / Claude(代理) / DeepSeek / Qwen / LM Studio 等
-base_url = "https://api.openai.com/v1"
+# OpenAI 兼容接口。默认填 DeepSeek：地址不用带 /v1，模型 deepseek-chat（非思考）
+# 想换成 GPT / Claude(代理) / Qwen / LM Studio 时，把地址和模型一起改掉即可
+base_url = "https://api.deepseek.com"
 api_key = ""
-model = "gpt-4o-mini"
+model = "deepseek-chat"
 timeout = 60
-# 思维链强度：low / medium / high。多数服务商不传这个字段就不返回 reasoning_content，
-# 留空字符串则不发送该参数（由服务商默认决定）
+# 思维链强度：留空 = 服务商默认（DeepSeek 默认就开思考）
+#   DeepSeek 认 high / max（low、medium 会被它映射成 high），默认模型 deepseek-chat 也支持思考
+#   其他服务商走 reasoning_effort（o 系列 / GPT-5 才认）
 reasoning_effort = "high"
 # 单次输出上限（tokens）。0 = 用满上下文剩余空间（跟随 context_window），
 # 长答复因此不会被固定的小额度硬截断；填具体数字可自行收窄。
@@ -48,28 +50,19 @@ ask_template = """
 # （游戏模式下完全不干预，交给 Steam 自己管电源）
 keep_awake = true
 
-[persona]
-# 人格设定：这些项都在网页「设置 → 女仆的人设」里改，保存即生效（不用重启），
-# 正常情况下不需要动这个文件
-name = "DeckMeido"
-# 性格/语气描述
-traits = "日系女仆式助手：礼貌周到、称用户为主人，办事干练，偶尔带点俏皮的亲近感"
-# 补充人设（口癖、背景等），可留空
-extra = ""
-
-# 语气细节：拼在系统提示最后，优先级最高。旧配置没有这一段也能正常工作，
-# 缺省值是「称呼主人 + 沉稳专业，不自加口癖」
-[persona.style]
-# 怎么称呼用户
-address = "主人"
-# 语气
-tone = "礼貌、简洁、干练，偶尔一点俏皮，但不撒娇卖萌"
-# 句尾习惯，留空 = 不加
-ending = ""
-# 落款，如 "——女仆长"，留空 = 不加
-suffix = ""
-# 禁用词句，出现即违规（包括句尾）
-forbid = ["喵", "呢~", "人家"]
+[update]
+# 更新源。网页「设置 → 关于 → 更新源」可以改，保存即生效。
+#   mirror       国内镜像优先，镜像不可用时自动改用 GitHub
+#   github       GitHub 优先，失败再用镜像
+#   mirror-only  只用国内镜像
+#   github-only  只用 GitHub
+# 镜像站是纯静态目录，放 latest.json 与 deckmeido-<版本>.tar.gz；
+# 走镜像升级不需要 git，覆盖文件时会保留配置、会话与工作区。
+source = "mirror"
+# 镜像站目录（末尾不要加斜杠）
+mirror = "https://meido.meagames.cn/deckmeido"
+# GitHub 仓库，改动前确认是 fork 的自己的仓库
+github_repo = "Congmeims/deckmeido"
 
 [tts]
 # 回复语音播报（调用 Deck 内置 TTS，在 Deck 扬声器上播放）

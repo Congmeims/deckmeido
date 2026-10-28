@@ -10,6 +10,7 @@
 #   bash install.sh uninstall     卸载（默认保留 ~/.config/deckmeido 配置与工作区）
 #   bash install.sh uninstall --purge   连配置一起删
 #   bash install.sh service       生成 systemd 用户单元（默认不装，后端由客户端拉起）
+#   bash install.sh from-mirror   从国内镜像站下载最新版并安装（GitHub 不通时用）
 #
 # 控制类插件（ydotool / kdotool / wtype / espeak-ng / fakeroot）是系统包，
 # 装它们需要 root：默认只在结尾提示并询问一次（y/N），回答 y 才走 sudo。
@@ -19,9 +20,19 @@
 # `pacman -Q` 会出现「记录在、命令没了」的假象。install.sh check 一律实测。
 # 同理 ydotoold 必须由 systemd 用户单元托管（enabled），裸跑的进程重启即失效。
 #
+# 怎么装（三条路，装完都是同一个目录）：
+#   git clone https://github.com/Congmeims/deckmeido.git && cd deckmeido && bash install.sh
+#   已有脚本、只想走镜像拉最新版：bash install.sh from-mirror
+#   国内镜像直连（GitHub 完全不通时用，先取一份脚本再跑）：
+#     curl -fsSL -o /tmp/dm.sh https://meido.meagames.cn/deckmeido/install.sh
+#     bash /tmp/dm.sh from-mirror
+#
 # 环境变量：
-#   DECKMEIDO_DIR   安装目录，默认 ~/deckmeido
-#   DECKMEIDO_PORT  服务端口，默认 18765
+#   DECKMEIDO_DIR        安装目录，默认 ~/deckmeido
+#   DECKMEIDO_PORT       服务端口，默认 18765
+#   DECKMEIDO_MIRROR     镜像站目录，默认 https://meido.meagames.cn/deckmeido
+#   DECKMEIDO_PIP_INDEX  pip 源；留空自动测速挑一个（pip 装失败时自动换下一个）
+#   DECKMEIDO_UPDATE_SOURCE  写进配置的更新源：mirror / github / mirror-only / github-only
 #
 # 注意：不要用 sudo 执行。脚本会把程序装到当前用户家目录、注册用户级服务，
 #       用 root 装会装到 /root 并注册到 root 名下，桌面会话里起不来。
@@ -30,6 +41,10 @@ set -euo pipefail
 APP=deckmeido
 INSTALL_DIR="${DECKMEIDO_DIR:-$HOME/$APP}"
 PORT="${DECKMEIDO_PORT:-18765}"
+# 国内镜像站（纯静态目录：latest.json / deckmeido-<ver>.tar.gz / SHA256SUMS / install.sh）
+MIRROR="${DECKMEIDO_MIRROR:-https://meido.meagames.cn/deckmeido}"
+MIRROR="${MIRROR%/}"
+GITHUB_REPO="Congmeims/deckmeido"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UNIT="deckmeido.service"
@@ -376,9 +391,8 @@ ask_yes() {
 
 sudo_warmup() {
   need_cmd sudo || { warn "没有 sudo，跳过系统依赖安装"; return 1; }
-  if ! sudo -n true 2>/dev/null; then
-    info "安装系统依赖需要 root 权限，接下来会提示输入密码"
-  fi
+  # 不做任何免密探测：sudo -v 自己会在需要时提示输入密码，预判只会多读一次策略
+  info "安装系统依赖需要 root 权限，接下来会提示输入密码"
   sudo -v || { warn "sudo 授权失败，跳过系统依赖安装"; return 1; }
 }
 
@@ -748,7 +762,9 @@ install_deps() {
 # 只处理下面这些已知代码目录，用户数据（config.toml / sessions / uploads /
 # shots / *.log / VERSION）一概不碰。
 CODE_DIRS=(server client assets deploy tools plugin)
-USER_DATA_RE='(^|/)(config\.toml|sessions|uploads|shots)(/|$)|\.log$|(^|/)VERSION$|(^|/)__pycache__(/|$)'
+# deploy/deps/ 里的离线依赖包也必须放过：它们不在源码目录里，照常删的话
+# 每次升级都会把 Release 自带的离线包清空，下次断网就装不上依赖了。
+USER_DATA_RE='(^|/)(config\.toml|sessions|uploads|shots)(/|$)|\.log$|(^|/)VERSION$|(^|/)__pycache__(/|$)|^deploy/deps/'
 
 prune_stale() {
   [ -d "$INSTALL_DIR" ] || return 0
@@ -767,6 +783,12 @@ prune_stale() {
   for d in "${CODE_DIRS[@]}"; do
     [ -d "$INSTALL_DIR/$d" ] || continue
     find "$INSTALL_DIR/$d" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+  done
+  # updater 升级前会打包一份 update-backup-*.tar.gz，成功后会自己删；
+  # 进程半路被杀才会剩下，这里兜底清理，只留最新一份
+  local old
+  for old in $(ls -1t "$INSTALL_DIR"/update-backup-*.tar.gz 2>/dev/null | tail -n +2); do
+    rm -f "$old"
   done
   [ "$removed" -gt 0 ] && dim "清理了 $removed 个新版本中已不存在的旧文件"
   return 0
@@ -801,7 +823,31 @@ sync_files() {
     fi
   done
   chmod +x "$INSTALL_DIR/install.sh" 2>/dev/null || true
+  chmod +x "$INSTALL_DIR/client/launch.sh" 2>/dev/null || true
   write_version_file
+}
+
+# pip 源：国内默认走镜像，PySide6 这类大包从官方 PyPI 拉经常超时。
+# 顺序按「国内一般最快」排，实测失败就换下一个，全都不通才回退官方。
+PIP_INDEXES=(
+  "https://pypi.tuna.tsinghua.edu.cn/simple"
+  "https://mirrors.aliyun.com/pypi/simple"
+  "https://mirrors.ustc.edu.cn/pypi/simple"
+  "https://pypi.org/simple"
+)
+
+# 探一下哪个源最快（能连上就算），返回索引；都连不上返回 -1
+pick_pip_index() {
+  local i best=-1 best_t=99 t
+  need_cmd curl || { printf '%s' 0; return; }
+  for i in "${!PIP_INDEXES[@]}"; do
+    t=$(curl -o /dev/null -sS -m 4 -w '%{time_total}' "${PIP_INDEXES[$i]}/" 2>/dev/null || echo 99)
+    t=${t%%.*}
+    [ -n "$t" ] || t=99
+    if [ "$t" -lt "$best_t" ]; then best_t=$t; best=$i; fi
+  done
+  [ "$best_t" -lt 99 ] || best=-1
+  printf '%s' "$best"
 }
 
 venv_install() {
@@ -811,17 +857,74 @@ venv_install() {
     python3 -m venv "$INSTALL_DIR/.venv"
   fi
   info "安装 Python 依赖（首次较慢，PySide6 体积较大）"
-  "$py" -m pip install --upgrade pip -q
-  "$py" -m pip install -r "$INSTALL_DIR/requirements.txt" -q
+  local idx=0
+  if [ -n "${DECKMEIDO_PIP_INDEX:-}" ]; then
+    PIP_INDEXES=("$DECKMEIDO_PIP_INDEX")
+    dim "使用指定的 pip 源：$DECKMEIDO_PIP_INDEX"
+  else
+    idx=$(pick_pip_index)
+    if [ "$idx" = "-1" ]; then
+      idx=0
+      warn "没测到可用的 pip 源，按默认顺序逐个尝试"
+    else
+      dim "pip 源：${PIP_INDEXES[$idx]}"
+    fi
+  fi
+  "$py" -m pip install --upgrade pip -q -i "${PIP_INDEXES[$idx]}" 2>/dev/null ||
+    "$py" -m pip install --upgrade pip -q
+  # 装依赖：当前源失败就换下一个。以前只跑一次，国内一超时整个安装就中断，
+  # 用户看到一堆 ReadTimeout，其实只是源选错了。
+  local n=${#PIP_INDEXES[@]} i tries=0 ok=0
+  for ((i = 0; i < n; i++)); do
+    local k=$(((idx + i) % n))
+    tries=$((tries + 1))
+    [ "$tries" -gt 1 ] && dim "换源重试（${PIP_INDEXES[$k]}）"
+    if "$py" -m pip install -r "$INSTALL_DIR/requirements.txt" -q -i "${PIP_INDEXES[$k]}"; then
+      ok=1; break
+    fi
+  done
+  if [ "$ok" != 1 ]; then
+    # 最后一招：不吃任何源配置，走 pip 默认（有代理 / 公司内网时反而能成）
+    warn "镜像源都没装成功，再试一次 pip 默认源"
+    "$py" -m pip install -r "$INSTALL_DIR/requirements.txt" -q || {
+      warn "Python 依赖没装全，可稍后重跑：bash $INSTALL_DIR/install.sh upgrade"
+      dim "手动指定源：DECKMEIDO_PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple bash install.sh upgrade"
+      return 1
+    }
+  fi
+  return 0
 }
 
 # 首次安装生成 config.toml；已有则原样保留
 prepare_config() {
   local cfg="$INSTALL_DIR/server/config.toml"
+  local src="${DECKMEIDO_UPDATE_SOURCE:-mirror}"
   if [ -f "$cfg" ]; then
     info "保留已有配置 $cfg"
+    # 老配置没有 [update] 段：补上，并写入当前脚本用的镜像地址，
+    # 免得以后换域名时新旧两批机器指向不同地方
+    if ! grep -q '^\[update\]' "$cfg"; then
+      {
+        echo ""
+        echo "# 更新源（网页「设置 → 关于」可改）"
+        echo "[update]"
+        echo "source = \"$src\""
+        echo "mirror = \"$MIRROR\""
+        echo "github_repo = \"$GITHUB_REPO\""
+      } >> "$cfg"
+      dim "已为旧配置补上 [update] 段"
+    fi
   else
     cp "$INSTALL_DIR/server/config.example.toml" "$cfg"
+    if [ "$src" != "mirror" ]; then
+      # 只改 [update] 段里的那一行，别的地方不动
+      awk -v v="$src" '
+        /^\[update\]/ { inu = 1; print; next }
+        /^\[/        { inu = 0 }
+        inu && /^source *=/ { print "source = \"" v "\""; next }
+        { print }
+      ' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+    fi
     chmod 600 "$cfg"
     info "生成配置 $cfg"
   fi
@@ -934,6 +1037,7 @@ if command -v curl >/dev/null 2>&1 && [ -f "$HERE/server/config.toml" ]; then
   TOK="$(grep -oP '^token\s*=\s*"\K[^"]*' "$HERE/server/config.toml" 2>/dev/null | head -n1 || true)"
   curl -fsS -m 2 -X POST -H "X-Token: $TOK" "http://127.0.0.1:$PORT/api/cancel" >/dev/null 2>&1 || true
 fi
+pkill -f "$HERE/client/launch.sh" 2>/dev/null || true
 pkill -f "$HERE/client/main.py" 2>/dev/null || true
 if command -v systemctl >/dev/null 2>&1; then
   systemctl --user disable --now deckmeido.service >/dev/null 2>&1 || true
@@ -991,12 +1095,14 @@ wait_ready() {
 }
 
 launch_client() {
-  # 服务由客户端拉起，所以装完直接帮用户开一次客户端，服务就齐了
-  local exe="$INSTALL_DIR/.venv/bin/python"
-  local cli="$INSTALL_DIR/client/main.py"
-  [ -x "$exe" ] && [ -f "$cli" ] || return 1
+  # 服务由客户端拉起，所以装完直接帮用户开一次客户端，服务就齐了。
+  # 走 launch.sh 而不是直接跑 main.py：客户端在切游戏模式时会被 gamescope
+  # 掐断 Wayland 连接而 abort，靠外壳脚本负责拉起和写崩溃栈。
+  local launcher="$INSTALL_DIR/client/launch.sh"
+  [ -x "$INSTALL_DIR/.venv/bin/python" ] && [ -f "$INSTALL_DIR/client/main.py" ] || return 1
   if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
-    setsid "$exe" "$cli" >/dev/null 2>&1 &
+    chmod +x "$launcher" 2>/dev/null || true
+    setsid bash "$launcher" >/dev/null 2>&1 &
     return 0
   fi
   return 1
@@ -1075,7 +1181,8 @@ do_install() {
   section "同步程序文件"
   sync_files
   section "Python 运行环境"
-  venv_install
+  # 依赖没装全不该让整个安装中断：代码已经同步好了，联网问题用户之后能自行重试
+  venv_install || true
   section "写入配置"
   prepare_config
   section "桌面入口与服务"
@@ -1112,6 +1219,8 @@ do_install() {
 stop_client() {
   pgrep -f "$INSTALL_DIR/client/main.py" >/dev/null 2>&1 || return 0
   dim "关闭客户端（升级后自动重开）"
+  # 先收掉 launch.sh 的自动重启，否则它看到客户端被杀会立刻再拉起一个
+  pkill -f "$INSTALL_DIR/client/launch.sh" 2>/dev/null || true
   pkill -f "$INSTALL_DIR/client/main.py" 2>/dev/null || true
   local i
   for i in $(seq 1 20); do
@@ -1133,7 +1242,7 @@ do_upgrade() {
   section "同步程序文件"
   sync_files
   section "Python 运行环境"
-  venv_install
+  venv_install || true
   section "桌面入口与服务"
   install_service
   install_desktop
@@ -1154,6 +1263,42 @@ do_upgrade() {
   else
     warn "升级完成。若界面还是旧版本，请关掉托盘里的 DeckMeido 再从桌面图标重开"
   fi
+}
+
+# ---------- 从镜像站安装 ----------
+# GitHub 不通、也没有现成源码目录时用这个：拉一份最新的发布包，解到临时目录，
+# 再交给正常的 install 流程（等价于自己下载解压后跑 bash install.sh）。
+mirror_latest_tag() {
+  curl -fsSL -m 15 "$MIRROR/latest.json" 2>/dev/null |
+    grep -oE '"tag"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 |
+    sed -E 's/.*"([^"]+)"$/\1/' | sed 's/^v//'
+}
+
+do_from_mirror() {
+  need_cmd curl || die "需要 curl：先装 curl（sudo pacman -S curl）"
+  print_banner
+  info "镜像站：$MIRROR"
+  local tag; tag="$(mirror_latest_tag || true)"
+  [ -n "$tag" ] || die "读不到镜像站的版本信息（$MIRROR/latest.json），请检查网络或稍后再试"
+  info "最新版本：v$tag"
+  local url="$MIRROR/deckmeido-$tag.tar.gz"
+  local tmp; tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  info "下载 $url"
+  curl -fL --retry 2 -m 600 -o "$tmp/pkg.tar.gz" "$url" ||
+    die "下载失败：$url"
+  # 有校验和就核一遍，防止半包 / 被篡改
+  if curl -fsSL -m 15 -o "$tmp/pkg.sha256" "$url.sha256" 2>/dev/null; then
+    ( cd "$tmp" && sed "s|deckmeido-$tag.tar.gz|pkg.tar.gz|" pkg.sha256 | sha256sum -c - >/dev/null 2>&1 ) ||
+      die "安装包校验不通过，可能没下完整，请重试"
+    dim "sha256 校验通过"
+  fi
+  tar -xzf "$tmp/pkg.tar.gz" -C "$tmp" || die "解压失败"
+  local src; src="$(find "$tmp" -maxdepth 2 -name install.sh -printf '%h\n' | head -n1)"
+  [ -n "$src" ] || die "安装包结构不对：里面没有 install.sh"
+  info "开始安装（来源：$src）"
+  # 让子进程沿用这次用的镜像地址，写进配置的就是它
+  DECKMEIDO_MIRROR="$MIRROR" bash "$src/install.sh" install "${1:-}"
 }
 
 # 正在跑的任务要先取消：卸载时把后端直接杀掉，正在执行的命令会变成孤儿进程
@@ -1192,6 +1337,7 @@ do_uninstall() {
   # 客户端是后端的父进程，先让它退出，后端会跟着收走
   if pgrep -f "$INSTALL_DIR/client/main.py" >/dev/null 2>&1; then
     dim "关闭客户端"
+    pkill -f "$INSTALL_DIR/client/launch.sh" 2>/dev/null || true
     pkill -f "$INSTALL_DIR/client/main.py" 2>/dev/null || true
     sleep 1
     pkill -9 -f "$INSTALL_DIR/client/main.py" 2>/dev/null || true
@@ -1238,12 +1384,13 @@ do_uninstall() {
 case "${1:-install}" in
   install|"")   do_install "${2:-}" ;;
   upgrade|update) do_upgrade "${2:-}" ;;
+  from-mirror)  do_from_mirror "${2:-}" ;;
   check)        do_check "${2:-}" ;;
   uninstall)    do_uninstall "${2:-}" ;;
   service)      check_user; mkdir -p "$UNIT_DIR"; render_service
                 info "已写入 $UNIT_DIR/$UNIT"
                 dim "启用并启动：systemctl --user daemon-reload && systemctl --user enable --now $UNIT" ;;
   -h|--help|help)
-    grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -n 22 ;;
-  *) die "未知命令：$1（可用：install / upgrade / check / uninstall / service）" ;;
+    grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -n 36 ;;
+  *) die "未知命令：$1（可用：install / upgrade / from-mirror / check / uninstall / service）" ;;
 esac

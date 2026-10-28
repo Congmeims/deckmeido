@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=DeckMeido
 Comment=DeckMeido AI 客户端
-Exec=__INSTALL_DIR__/.venv/bin/python __INSTALL_DIR__/client/main.py
+Exec=__INSTALL_DIR__/client/launch.sh
 Icon=__INSTALL_DIR__/assets/logo.png
 Type=Application
 Terminal=false

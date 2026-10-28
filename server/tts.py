@@ -45,10 +45,17 @@ class TTS:
             self.enable = False
 
     async def stop(self):
-        if self._proc and self._proc.returncode is None:
-            self._proc.terminate()
+        proc, self._proc = self._proc, None
+        if not proc or proc.returncode is not None:
+            return
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            # kill 之后必须再 wait 一次：不等就丢引用会留下僵尸进程，
+            # 而每次播报前都要 stop 一遍
+            proc.kill()
             try:
-                await asyncio.wait_for(self._proc.wait(), timeout=2)
+                await asyncio.wait_for(proc.wait(), timeout=2)
             except asyncio.TimeoutError:
-                self._proc.kill()
-        self._proc = None
+                pass

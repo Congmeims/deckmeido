@@ -38,6 +38,7 @@ TOOL_CN: dict[str, str] = {
     "write_file": "写入文件",
     "edit_file": "编辑文件",
     "self_update": "更新软件",
+    "remember": "记住这件事",
 }
 
 
@@ -313,6 +314,27 @@ TOOLS: list[dict] = [
                                "description": "check 只查版本，upgrade 真的升级"},
                 },
                 "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": ("把一条信息存入长期记忆（跨会话有效，新会话也会带上）。"
+                            "用户明确说「记住」「以后都这样」或纠正你的做法时调用；"
+                            "只顾当前这句话的临时要求不要存。一条只记一件事，"
+                            "用陈述句写成以后也看得懂的一句话"),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "要记住的内容，一句话"},
+                    "kind": {"type": "string", "enum": ["profile", "env", "note"],
+                             "description": ("profile=主人的偏好与习惯（回答风格、称呼、禁忌）；"
+                                             "env=这台设备上的环境与操作经验（怎么装、怎么启动、"
+                                             "某个路径在哪）；note=项目或知识条目。默认 note")},
+                },
+                "required": ["text"],
             },
         },
     },
@@ -719,7 +741,10 @@ async def _spawn_detached(command: str, env: dict) -> str:
     启动后等 1.5s 看它是否立刻失败（命令写错、flatpak 名字不对之类），
     失败时把输出原样交回去，不让用户以为「打开了」。
     """
-    out_path = Path(tempfile.mkstemp(prefix="deckmeido_launch_", suffix=".log")[1])
+    # mkstemp 会返回一个已打开的 fd，这里只借它的文件路径，必须自己关掉，否则每跑一次漏一个
+    _fd, _tmp = tempfile.mkstemp(prefix="deckmeido_launch_", suffix=".log")
+    os.close(_fd)
+    out_path = Path(_tmp)
     wrapped = (
         f"setsid bash -c {shlex.quote(command)} > {shlex.quote(str(out_path))} 2>&1 &"
         " echo $!"
@@ -813,8 +838,9 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
             # 转后台继续跑。注意进程的 stdout 还挂在我们创建的管道上：
             # 一旦没人读，输出写满管道缓冲区（64KB）程序就会卡住，
             # 所以开个线程把它持续抄进日志文件，而不是把管道丢在那里不管。
-            log_path = Path(tempfile.mkstemp(prefix="deckmeido_bg_", suffix=".log")[1])
-            fd = os.open(str(log_path), os.O_WRONLY | os.O_APPEND)
+            _fd, _tmp = tempfile.mkstemp(prefix="deckmeido_bg_", suffix=".log")
+            log_path = Path(_tmp)
+            fd = _fd
 
             async def _drain():
                 try:
@@ -885,15 +911,23 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
         group_file.unlink(missing_ok=True)
     return f"exit={proc.returncode}\n{text}" if text else f"exit={proc.returncode}（无输出）"
 
-_CONFIRM_WORDS = {"确认", "好", "好的", "执行", "可以", "yes", "y", "ok"}
+# 确认危险操作时认的字。只保留意思明确的词：「好」「可以」「ok」这类在
+# 日常对话里太常见（「好的，顺便帮我查下天气」会被当成同意执行），去掉
+_CONFIRM_WORDS = {"确认", "确认执行", "执行", "同意", "yes", "y", "confirm"}
+
+# 去掉首尾空白与标点后再比，避免「确认。」「确认！」认不出
+_CONFIRM_STRIP = " \t\r\n。，,.!！?？~～"
 
 
 def is_confirm(text: str) -> bool:
-    return text.strip().lower() in _CONFIRM_WORDS
+    return text.strip(_CONFIRM_STRIP).lower() in _CONFIRM_WORDS
 
 
 def summarize_tool(name: str, args: dict) -> str:
     """工具调用的简短中文说明（作为界面提示，不含内部函数名和 JSON 括号）"""
+    if name == "remember":
+        t = str(args.get("text", ""))
+        return t if len(t) <= 60 else t[:60] + "…"
     if name == "run_command":
         cmd = str(args.get("command", ""))
         return cmd if len(cmd) <= 120 else cmd[:120] + "…"
@@ -1957,12 +1991,38 @@ def set_workspace(path: str):
     WORKSPACE = p.resolve()
 
 
-def _resolve(path: str) -> Path:
-    return Path(path).expanduser().resolve()
+# 文件工具是否限制在工作区内。main 在权限模式变化时同步开启/关闭
+path_bound = True
+
+
+# 不受工作区约束的路径白名单（绝对路径，已 resolve）。
+# 想放开别处就改这里，不要在调用点临时判断
+FREE_PATHS: list[Path] = []
+
+
+class OutsideWorkspace(Exception):
+    """路径落在工作区之外，且当前权限模式不允许越界"""
+
+
+def resolve_in_workspace(path: str) -> Path:
+    """把用户/模型给的路径解析成绝对路径，并检查是否允许访问。
+
+    只做 expanduser + resolve（会跟着符号链接走），所以「跳出工作区再跳回来」
+    和「工作区里放个指向 / 的软链」这两种绕法都会落在检查之后。
+    full 模式下不设限，与 run_command 的边界保持一致；manual / auto 只能
+    碰工作区，避免一句「读一下 config.toml」把 API Key 连带会话内容送给上游。
+    """
+    p = Path(path).expanduser().resolve()
+    if not path_bound:
+        return p
+    for root in [WORKSPACE, *FREE_PATHS]:
+        if p == root or root in p.parents:
+            return p
+    raise OutsideWorkspace(str(p))
 
 
 async def _list_dir(path: str = "") -> str:
-    d = _resolve(path) if path else WORKSPACE
+    d = resolve_in_workspace(path) if path else WORKSPACE
     d.mkdir(parents=True, exist_ok=True) if not path else None
     if not d.is_dir():
         return f"不是目录：{d}"
@@ -1975,7 +2035,7 @@ async def _list_dir(path: str = "") -> str:
 
 
 async def _read_file(path: str, offset: int = 1, limit: int = 400) -> str:
-    p = _resolve(path)
+    p = resolve_in_workspace(path)
     if not p.is_file():
         return f"文件不存在：{p}"
     lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -1989,7 +2049,7 @@ async def _read_file(path: str, offset: int = 1, limit: int = 400) -> str:
 async def _write_file(path: str, content: str) -> str:
     global LAST_DIFF
     LAST_DIFF = None
-    p = _resolve(path)
+    p = resolve_in_workspace(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     old_lines = len(p.read_text(encoding="utf-8", errors="replace").splitlines()) if p.is_file() else 0
     p.write_text(content, encoding="utf-8")
@@ -2000,7 +2060,7 @@ async def _write_file(path: str, content: str) -> str:
 async def _edit_file(path: str, old: str, new: str) -> str:
     global LAST_DIFF
     LAST_DIFF = None
-    p = _resolve(path)
+    p = resolve_in_workspace(path)
     if not p.is_file():
         return f"文件不存在：{p}"
     text = p.read_text(encoding="utf-8")
@@ -2012,6 +2072,23 @@ async def _edit_file(path: str, old: str, new: str) -> str:
     p.write_text(text.replace(old, new, 1), encoding="utf-8")
     LAST_DIFF = {"add": len(new.splitlines()), "del": len(old.splitlines())}
     return f"已修改 {p}（替换 1 处）"
+
+
+async def _remember(text: str, kind: str = "note") -> str:
+    """写入长期记忆。重复内容不会存第二遍，回给模型的说明要能区分这两种情况"""
+    from . import memory
+    text = str(text or "").strip()
+    if not text:
+        return "没有提供要记住的内容。"
+    existed = any(memory.norm(it["text"]) == memory.norm(text)
+                  for it in memory.load()["items"])
+    item = memory.add(kind, text)
+    if not item:
+        return "没有提供要记住的内容。"
+    label = memory.KINDS[item["kind"]]
+    if existed:
+        return f"这条已经在长期记忆里了（{label}）：{item['text']}"
+    return f"已记入长期记忆（{label}）：{item['text']}"
 
 
 EXECUTORS = {
@@ -2031,6 +2108,7 @@ EXECUTORS = {
     "write_file": _write_file,
     "edit_file": _edit_file,
     "self_update": _self_update,
+    "remember": _remember,
 }
 
 
@@ -2038,7 +2116,7 @@ EXECUTORS = {
 # 设备状态的动作，几毫秒就结束，挂抑制反而是白折腾（每次都 fork 两个外部命令）
 _NO_KEEP_AWAKE = {
     "get_weather", "web_search", "find_game", "list_installed_games",
-    "list_emulator_roms", "check_system_updates", "screenshot",
+    "list_emulator_roms", "check_system_updates", "screenshot", "remember",
 }
 
 
@@ -2060,6 +2138,12 @@ async def execute(name: str, args: dict) -> str:
                 and not args.get("stdin"):
             args["detach"] = True
         return await fn(**args)
+    except OutsideWorkspace as e:
+        # 单独给一句能看懂的：越界是权限策略而不是文件坏了，
+        # 模型该停下来问用户，而不是换个路径继续试
+        return (f"拒绝访问：{e} 在工作区 {WORKSPACE} 之外。"
+                f"当前权限模式只允许操作工作区内的文件；"
+                f"确实需要访问这里，请让用户去设置里切到「完全访问」")
     except Exception as e:
         return f"工具 {name} 执行失败：{e}"
     finally:

@@ -222,19 +222,11 @@ def _collect() -> dict:
         "na": sum(1 for i in items if i["na"]),
         "level": level,
         "ydotoold": _systemd_state(),
-        # 一键修复要 sudo 装系统包，需要用户在终端里敲密码；
-        # 能不能免密执行决定网页上那个按钮是直接干活还是先教主人怎么走
-        "sudo_nopasswd": sudo_nopasswd(),
+        # 这里不再探测 sudo：网页端本来就装不了系统包（要密码，后台进程接不了
+        # 终端输入），探一下只会在用户机器上多一次权限检查，还容易被当成「偷看
+        # 我的密码」。要装包一律引导到终端，由 sudo 自己提示。
         "checked_at": int(time.time()),
     }
-
-
-def sudo_nopasswd() -> bool:
-    """deck 是否能免密 sudo（装了 wheel 的 NOPASSWD 才有）"""
-    if not shutil.which("sudo"):
-        return False
-    rc, _ = _run(["sudo", "-n", "true"], timeout=3.0)
-    return rc == 0
 
 
 def fix_ydotoold() -> tuple[bool, str]:
