@@ -895,6 +895,90 @@ async def _spawn_detached(command: str, env: dict, cwd: str | None = None) -> st
     return f"{msg}\n{text}" if text else msg
 
 
+def _bg_drain(proc: asyncio.subprocess.Process) -> Path:
+    """把仍在运行的进程转后台：开任务持续把 stdout 抄进日志文件并登记，返回日志路径
+
+    进程的 stdout 还挂在我们创建的管道上，一旦没人读，输出写满管道缓冲区（64KB）
+    它就会卡住，所以转后台时必须派人持续读。登记进 _BG_PROCS 是为了「终止」还能收掉它。
+    """
+    _fd, _tmp = tempfile.mkstemp(prefix="deckmeido_bg_", suffix=".log")
+    log_path = Path(_tmp)
+    fd = _fd
+
+    async def _drain():
+        try:
+            while True:
+                chunk = await proc.stdout.read(8192)
+                if not chunk:
+                    break
+                os.write(fd, chunk)
+        except Exception:
+            pass
+        finally:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+    task = asyncio.create_task(_drain())
+    # 保住引用：asyncio 只持弱引用，不存一份会被 GC 连带取消
+    _BG_DRAINERS.add(task)
+    task.add_done_callback(_BG_DRAINERS.discard)
+    _BG_PROCS.add(proc)
+    task.add_done_callback(lambda _t, _p=proc: _BG_PROCS.discard(_p))
+    return log_path
+
+
+async def _read_probe(proc: asyncio.subprocess.Process, seconds: float) -> tuple[bytes, bool, bool]:
+    """读 proc.stdout 最多 seconds 秒，返回 (输出, 是否已 EOF, 期间是否有输出)
+
+    不取消读取（wait_for 超时只是停在这，stdout 之后还能继续读）。「是否有输出」
+    用来区分常驻 GUI（启动后很快静默）和正在干活的长命令（持续吐输出）。
+    """
+    chunks: list[bytes] = []
+    had_output = False
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return b"".join(chunks), False, had_output
+        try:
+            chunk = await asyncio.wait_for(proc.stdout.read(8192), remaining)
+        except asyncio.TimeoutError:
+            return b"".join(chunks), False, had_output
+        if not chunk:
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            return b"".join(chunks), True, had_output
+        chunks.append(chunk)
+        had_output = True
+
+
+async def _read_rest(proc: asyncio.subprocess.Process, budget: float) -> bytes:
+    """继续读 proc.stdout 直到 EOF，最多再等 budget 秒；没读完抛 TimeoutError"""
+    chunks: list[bytes] = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        try:
+            chunk = await asyncio.wait_for(proc.stdout.read(8192), remaining)
+        except asyncio.TimeoutError:
+            raise asyncio.TimeoutError
+        if not chunk:
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
 async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin: str = "",
                        detach: bool = False) -> str:
     timeout = max(1, min(int(timeout or 60), 300))
@@ -950,58 +1034,42 @@ async def _run_command(command: str, reason: str = "", timeout: int = 60, stdin:
     # 给到 3 秒是为了让慢一点的启动器（flatpak、走 D-Bus 激活的）也有机会
     # 把报错吐出来，而不是被当成「已常驻」放过
     launch_wait = 3.0
-    # 真·超时（命令卡死）要杀掉；启动器等满 launch_wait 只是「它在常驻运行」，不能杀
+    # 真·超时（命令卡死）要杀掉；启动器/常驻程序等满前只是「它在运行」，不能杀
     try:
         if launcher:
-            # 常驻程序不会退出：等几秒看它是正常启动还是报错，能拿到输出就先交差
+            # 白名单命中的常驻程序：等几秒看它是正常启动还是报错，能拿到输出就先交差
             try:
                 out, _ = await asyncio.wait_for(proc.communicate(), launch_wait)
                 launcher_done = True
             except asyncio.TimeoutError:
                 launcher_done = False
                 out = b""
-        else:
+        elif feed is not None:
+            # 交互式命令（带 stdin 输入）不能提前判常驻，走原来的等超时路径
             launcher_done = True
             out, _ = await asyncio.wait_for(proc.communicate(feed), timeout)
+        else:
+            # 通用探测：不靠程序名白名单猜「是不是常驻」。先读 launch_wait 秒：
+            #   - 秒退          → 正常返回
+            #   - 静默且还活着    → 常驻程序（GUI/游戏），立刻转后台，不再死等 timeout
+            #   - 有输出且还活着  → 在干活（编译/下载等），继续读满 timeout
+            launcher_done = True
+            out, exited, had_output = await _read_probe(proc, launch_wait)
+            if not exited and not had_output:
+                log_path = _bg_drain(proc)
+                return (f"已在后台启动（进程号 {proc.pid}）。"
+                        f"启动后 {launch_wait:.0f}s 内程序没有输出且未退出，判定为常驻程序，"
+                        f"已转入后台继续运行。如需确认是否正常，用 pgrep / 看窗口检查，不要重复启动。\n"
+                        f"日志：{log_path}")
+            if not exited:
+                # 在干活：把剩余输出读到 EOF；总预算内没读完就交给下面的超时分支
+                out2 = await _read_rest(proc, max(0.5, timeout - launch_wait))
+                out = out + out2
     except asyncio.TimeoutError:
-        # 超时不等于命令出错。很常见的情况是：这条命令其实在启动一个常驻程序，
-        # 只是写法没被 _is_launcher 认出来（比如前面带了 cd、后面接了 & 或重定向），
-        # 于是傻等到超时。这时候进程活得好好的、也没有报错输出，杀掉它等于把
-        # 用户要的程序一起带走（日志里「flatpak run 被卡了 60 秒后终止」就是这样）。
-        # 判据：进程仍然活着。真卡死的命令通常早就退出了（非零退出码），
-        # 还活着且撑满整个超时的，基本都是常驻程序。
+        # 超时不等于命令出错。还活着且撑满整个超时的，基本都是常驻程序。
         alive = proc.returncode is None
         if alive:
-            # 转后台继续跑。注意进程的 stdout 还挂在我们创建的管道上：
-            # 一旦没人读，输出写满管道缓冲区（64KB）程序就会卡住，
-            # 所以开个线程把它持续抄进日志文件，而不是把管道丢在那里不管。
-            _fd, _tmp = tempfile.mkstemp(prefix="deckmeido_bg_", suffix=".log")
-            log_path = Path(_tmp)
-            fd = _fd
-
-            async def _drain():
-                try:
-                    while True:
-                        chunk = await proc.stdout.read(8192)
-                        if not chunk:
-                            break
-                        os.write(fd, chunk)
-                except Exception:
-                    pass
-                finally:
-                    try:
-                        os.close(fd)
-                    except Exception:
-                        pass
-
-            task = asyncio.create_task(_drain())
-            # 保住引用：asyncio 只持弱引用，不存一份会被 GC 连带取消
-            _BG_DRAINERS.add(task)
-            task.add_done_callback(_BG_DRAINERS.discard)
-            # 转后台后仍然登记进程：用户点「终止」时要把这些常驻程序一起收掉，
-            # 否则它们会一直活着，日志文件也只增不减
-            _BG_PROCS.add(proc)
-            task.add_done_callback(lambda _t, _p=proc: _BG_PROCS.discard(_p))
+            log_path = _bg_drain(proc)
             return (f"命令运行超过 {timeout}s 仍未退出，判断是常驻程序，已转入后台继续运行"
                     f"（进程号 {proc.pid}）。\n"
                     f"如需确认它是否正常，用 pgrep / 看窗口 检查，不要重复启动。\n"
