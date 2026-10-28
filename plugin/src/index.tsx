@@ -920,16 +920,21 @@ function Content() {
         />
       </PanelSectionRow>
 
-      {/* 发送单独一行 */}
+      {/* 发送单独一行：与输入框之间留一点距离 */}
       <PanelSectionRow>
         <div
           role="button"
           onClick={busy ? cancel : ask}
-          style={{ width: "100%", ...FAKE_BTN }}
+          style={{ width: "100%", marginTop: 6, ...FAKE_BTN }}
         >
           {busy ? "中断" : "发送"}
         </div>
       </PanelSectionRow>
+
+      {/* 隔断：输入区（输入框 + 发送）与下面的操作按钮之间 */}
+      <div
+        style={{ height: 1, background: "rgba(255,255,255,.12)", margin: "12px 0 12px" }}
+      />
 
       {/* 新会话单独一行 */}
       {status?.core_ok && !busy && (
@@ -943,6 +948,11 @@ function Content() {
           </div>
         </PanelSectionRow>
       )}
+
+      {/* 隔断：新会话与设置之间 */}
+      <div
+        style={{ height: 1, background: "rgba(255,255,255,.12)", margin: "12px 0 12px" }}
+      />
 
       {/* 设置单独一行 */}
       <PanelSectionRow>
@@ -986,25 +996,19 @@ function Content() {
           </PanelSectionRow>
           <PanelSectionRow>
             <div style={{ display: "flex", gap: 8, width: "100%" }}>
-              <div style={{ flex: "1 1 0", minWidth: 0 }}>
-                <ButtonItem layout="below" onClick={saveAskTpl}>
-                  保存提示词
-                </ButtonItem>
+              <div role="button" onClick={saveAskTpl} style={{ flex: "1 1 0", ...FAKE_BTN }}>
+                保存提示词
               </div>
-              <div style={{ flex: "0 0 auto", minWidth: 0 }}>
-                <ButtonItem layout="below" onClick={() => setAskTplEdit(DEFAULT_ASK_TPL)}>
-                  恢复默认
-                </ButtonItem>
+              <div
+                role="button"
+                onClick={() => setAskTplEdit(DEFAULT_ASK_TPL)}
+                style={{ flex: "0 0 auto", ...FAKE_BTN }}
+              >
+                恢复默认
               </div>
             </div>
           </PanelSectionRow>
-          <PanelSectionRow>
-            <div style={{ fontSize: 10, color: DIM }}>
-              后端 {status?.core_ok ? "已连接" : "未连接"} · 工作区{" "}
-              {status?.workspace || "—"}
-            </div>
-          </PanelSectionRow>
-        </>
+          </>
       )}
 
       {/* 底部版本号：主程序版本在前，插件自己的在后。
