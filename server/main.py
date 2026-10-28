@@ -2733,14 +2733,18 @@ def _lan_ip() -> str:
     except Exception:
         ips = []
 
+    # 只在 RFC1918 私有段里挑：198.18.x 是 Clash/加速器的 fake-ip 段、
+    # 169.254.x 是本地链接保留段，都不是别的设备能连上的局域网地址，
+    # 混进来会让状态卡显示一个「代理地址」而不是真实局域网 IP。
+    ips = [a for a in ips if a.startswith("192.168.") or a.startswith("10.")
+           or re.match(r"172\.(1[6-9]|2\d|3[01])\.", a)]
+
     def rank(a: str) -> int:
         if a.startswith("192.168."):
             return 0
         if a.startswith("10."):
             return 1
-        if re.match(r"172\.(1[6-9]|2\d|3[01])\.", a):
-            return 2
-        return 3
+        return 2
 
     ips.sort(key=rank)
     ip = ips[0] if ips else "127.0.0.1"
