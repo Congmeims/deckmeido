@@ -12,6 +12,9 @@ import httpx
 # 只看字符数会误以为是模型在按字符计费
 _LAST_BODY = 0
 
+# 最近一次请求的前缀缓存命中情况，供状态接口展示（0/0 = 服务商不返回）
+_LAST_CACHE = {"hit": 0, "prompt": 0, "at": 0.0}
+
 
 def _body_size(payload: dict) -> int:
     """算出这次请求体的字符数（不序列化到网络，只做量尺）"""
@@ -48,10 +51,6 @@ def _log_usage(usage: dict | None) -> None:
     _LAST_CACHE.update(hit=0, prompt=pin, at=time.time())
     print(f"[DeckMeido] LLM 用量：请求体 {_LAST_BODY} 字符 → "
           f"输入 {pin} token，输出 {pout} token", flush=True)
-
-
-# 最近一次请求的前缀缓存命中情况，供状态接口展示（0/0 = 服务商不返回）
-_LAST_CACHE = {"hit": 0, "prompt": 0, "at": 0.0}
 
 
 # 部分模型（DeepSeek 系）会把工具调用写成正文里的 DSML 标记而不是标准 tool_calls，

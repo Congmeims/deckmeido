@@ -18,12 +18,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import shutil
 import subprocess
 import time
-from pathlib import Path
+
+from .tools import _session_user, _gamescope_pw_node
 
 # 帧率与画质。60fps 是「动作看得顺」的底线（30fps 转身拖影明显）。
 # 硬编走 vaapi 时不看 quality，用固定码率 4Mbps：1280×800@60 的 H.264
@@ -36,57 +36,6 @@ VAAPI_KBPS = 4000
 _STALL_SECONDS = 8.0
 # 起管线后最多等这么久拿到第一帧（gst 协商 + 编码器初始化需要时间）
 _FIRST_FRAME_TIMEOUT = 6.0
-
-
-def _session_user() -> tuple[int, str] | None:
-    """gamescope / PipeWire 所在会话的 (uid, 用户名)
-
-    与 tools 里那份一致：后端常以 root 跑（Decky 插件），此时 os.getuid()
-    是 0，而 gamescope 在 deck 用户的图形会话里，套接字在 /run/user/1000。
-    """
-    import pwd
-
-    if os.getuid() != 0:
-        return os.getuid(), pwd.getpwuid(os.getuid()).pw_name
-    candidates: list[tuple[int, str]] = []
-    try:
-        for d in Path("/run/user").iterdir():
-            if not d.name.isdigit():
-                continue
-            uid = int(d.name)
-            if uid == 0 or not ((d / "pulse").exists() or (d / "bus").exists()):
-                continue
-            try:
-                candidates.append((uid, pwd.getpwuid(uid).pw_name))
-            except KeyError:
-                continue
-    except OSError:
-        return None
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: (x[0] != 1000, x[0]))
-    return candidates[0]
-
-
-async def gamescope_pw_node() -> str | None:
-    """游戏模式下 gamescope 的 PipeWire 视频节点 id；找不到返回 None"""
-    sess = _session_user()
-    env = dict(os.environ)
-    if sess:
-        env["XDG_RUNTIME_DIR"] = f"/run/user/{sess[0]}"
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "pw-dump", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-            env=env,
-        )
-        out, _ = await proc.communicate()
-        for o in json.loads(out or b"[]"):
-            props = (o.get("info") or {}).get("props") or {}
-            if props.get("node.name") == "gamescope" and props.get("media.class") == "Video/Source":
-                return str(o.get("id"))
-    except Exception:
-        return None
-    return None
 
 
 class _Renders:
@@ -224,7 +173,7 @@ class Streamer:
             if not shutil.which("gst-launch-1.0"):
                 self._error = "缺少 gst-launch-1.0（gstreamer1.0-tools 未安装）"
                 raise RuntimeError(self._error)
-            node = await gamescope_pw_node()
+            node = await _gamescope_pw_node()
             if not node:
                 self._error = "没有找到 gamescope 的画面节点（仅游戏模式可用）"
                 raise RuntimeError(self._error)

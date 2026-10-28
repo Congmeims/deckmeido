@@ -175,6 +175,10 @@ def remove(mid: str) -> bool:
 def clear() -> None:
     with _lock:
         _save(_empty())
+    # _USED 里的旧 id 跟着一起清掉：否则「删光记忆」后进程里还捏着一批
+    # 永不匹配任何条目的 used 记录（量很小，纯粹是干净起见）
+    with _used_lock:
+        _USED.clear()
 
 
 def mark_used(ids: list[str]) -> None:

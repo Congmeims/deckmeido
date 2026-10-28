@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import signal
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -1384,26 +1385,23 @@ def _session_user() -> tuple[int, str] | None:
     return candidates[0]
 
 
-async def _gamescope_pw_node() -> str | None:
-    """游戏模式下找 gamescope 的 PipeWire 视频节点 id；找不到返回 None
+def _gamescope_pw_node_sync() -> str | None:
+    """同步版：起 pw-dump 找 gamescope 的 PipeWire 视频节点 id；找不到返回 None
 
-    注意：这个函数是「当前在不在游戏模式」的唯一权威判据（main.get_status、
-    depcheck 都复用它）。不能用 pgrep -x gamescope 代替——SteamOS 上进程名
-    带参数时 comm 会被截断成 "gamescope"（15 字节上限）反而匹配不上，
-    所以 pgrep 一度恒返回 1，桌面网页和插件就一直显示「桌面模式」，
-    实时画面也被判成不可用。
+    这是「当前在不在游戏模式」的唯一权威判据（main.get_status、depcheck、
+    stream 都复用同一条规则）。不能用 pgrep -x gamescope 代替——SteamOS 上
+    进程名带参数时 comm 会被截断成 "gamescope"（15 字节上限）反而匹配不上，
+    所以 pgrep 一度恒返回 1，桌面网页和插件就一直显示「桌面模式」。
     """
     sess = _session_user()
     env = dict(os.environ)
     if sess:
         env["XDG_RUNTIME_DIR"] = f"/run/user/{sess[0]}"
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "pw-dump", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-            env=env,
+        proc = subprocess.run(
+            ["pw-dump"], capture_output=True, text=True, env=env,
         )
-        out, _ = await proc.communicate()
-        nodes = json.loads(out or b"[]")
+        nodes = json.loads(proc.stdout or "[]")
         for o in nodes:
             props = (o.get("info") or {}).get("props") or {}
             if props.get("node.name") == "gamescope" and props.get("media.class") == "Video/Source":
@@ -1411,6 +1409,12 @@ async def _gamescope_pw_node() -> str | None:
     except Exception:
         return None
     return None
+
+
+async def _gamescope_pw_node() -> str | None:
+    """异步包装：抓帧路径用。逻辑与 _gamescope_pw_node_sync 完全相同，
+    经 to_thread 复用同一份实现，避免和模式判断各写一套探针"""
+    return await asyncio.to_thread(_gamescope_pw_node_sync)
 
 
 def _raw_ok(raw: Path) -> bool:
@@ -1447,8 +1451,14 @@ def mode_is_gaming() -> bool:
 
 
 def _mode_probe_sync() -> bool:
-    """同步跑一次探针，给在线程里调用的场合（接口里不要直接阻塞事件循环）"""
-    return asyncio.run(_gamescope_pw_node()) is not None
+    """同步跑一次探针。纯同步实现，事件循环内外都能安全调用
+
+    以前这里用 asyncio.run(_gamescope_pw_node())，一旦调用点正好处于运行中的
+    事件循环（比如广播状态时 get_status() 直接在 async 里同步调用），缓存过期
+    那一刻就会抛「asyncio.run() cannot be called from a running event loop」。
+    改成同步探针后这个隐患没有了。
+    """
+    return _gamescope_pw_node_sync() is not None
 
 
 async def _screenshot_gamescope(path: Path) -> str:
@@ -1760,8 +1770,6 @@ async def _gamepad(action: str, button: str = "", ms: int = 0,
 
 async def _screenshot() -> str:
     """截取当前画面（游戏模式走 gamescope 的 PipeWire 节点，桌面模式用 spectacle/mss）"""
-    import time
-
     shots_dir = Path(__file__).resolve().parent / "static" / "shots"
     shots_dir.mkdir(exist_ok=True)
     # 只保留最近 20 张截图

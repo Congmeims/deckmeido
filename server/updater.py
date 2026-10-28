@@ -277,11 +277,7 @@ def _apply_mirror(info: dict, log_path: Path) -> str:
     with tempfile.TemporaryDirectory(prefix="deckmeido-upd-") as tmp:
         try:
             with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
-                tf.extractall(tmp, filter="data")
-        except TypeError:
-            # Python < 3.12 的 tarfile 没有 filter 参数
-            with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
-                tf.extractall(tmp)
+                _safe_extract(tf, tmp)
         except (tarfile.TarError, OSError) as exc:
             raise RuntimeError(f"安装包解压失败：{exc}")
         roots = [p for p in Path(tmp).iterdir() if p.is_dir()]
@@ -323,6 +319,24 @@ def _merge(src: Path, dst: Path) -> None:
         target = dst / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(item, target)
+
+
+def _safe_extract(tf: tarfile.TarFile, dest: str) -> None:
+    """解压 tarball 到 dest，拒绝路径穿越。
+
+    Python 3.12 的 filter="data" 已经做这件事；更老版本没有 filter 参数，
+    这里先手工校验成员路径再走 extractall 兜底（镜像包若未提供 sha256 且
+    站点被攻破，恶意成员可能把文件写进任意目录）。
+    """
+    root = Path(dest).resolve()
+    for m in tf.getmembers():
+        p = (root / m.name).resolve()
+        if p != root and root not in p.parents:
+            raise RuntimeError(f"安装包里有越界成员：{m.name}")
+    try:
+        tf.extractall(dest, filter="data")
+    except TypeError:  # Python < 3.12 没有 filter 参数
+        tf.extractall(dest)
 
 
 def _backup(log_path: Path) -> Path | None:
