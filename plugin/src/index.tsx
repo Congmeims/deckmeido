@@ -58,6 +58,9 @@ type Delta =
   | { kind: "tool"; text: string }
   // 后端一轮结束后的状态广播，只用来确认「已经空闲」
   | { kind: "status"; running: boolean }
+  // 虚拟手柄建好（to1p）/ 销毁（revert）了：要把 Steam 的控制器排序调一下。
+  // 排序只存在 Steam 进程里，后端碰不到，只能在这里调 SteamClient.Input
+  | { kind: "pad_order"; action: "to1p" | "revert" }
   // 全部对话（history 对齐或新消息追加）
   | { kind: "thread"; items: Item[] };
 
@@ -293,7 +296,8 @@ const DEFAULT_ASK_TPL =
   "再总结成几条可以直接照做的步骤，200 字以内。\n" +
   "不要剧透：只讲眼前这一步怎么过，不要提前说后面的剧情、结局或其他关卡的解法。";
 
-export default definePlugin(() => ({
+export default definePlugin(() => {
+  return {
   name: "DeckMeido",
   titleView: <div>DeckMeido</div>,
   content: <Content />,
@@ -303,7 +307,190 @@ export default definePlugin(() => ({
       <GiTeapot size={20} style={{ transform: "scale(1.15)", transformOrigin: "center" }} />
     </div>
   ),
-}));
+  };
+});
+
+/**
+ * 把 DeckMeido 的虚拟手柄换到 1P（Steam 的 0 号槽位）。
+ *
+ * 为什么只能在到这里来做：控制器排序只存在 Steam 进程的内存里（配置里没有，
+ * Steam 的「为控制器重新排序」走的就是这条 IPC），插件后端和主程序都够不着，
+ * 只有跑在 Steam 页面里的这段 JS 能调 SteamClient.Input。
+ *
+ * 后端在虚拟手柄建好 / 销毁时广播 pad_order，这里收到就照办：
+ *   to1p   新插上的手柄排在物理手柄后面（就是 2P），不挪到 1P 游戏根本不看它
+ *   revert 虚拟手柄没了，确认物理手柄回到 1P，免得下次开机游戏收不到输入
+ *
+ * 两条路依次试：
+ *   1. SteamClient.Input.SwapControllerOrder —— 官方 IPC，最稳
+ *   2. WebSocket.RegisterForControllerList + SwapControllerOrderByIndex ——
+ *      老一点的 Steam 客户端里前面那组 API 不全，这条是给「控制器设置」页用的
+ * 拿不到 SteamClient（桌面模式下没有游戏模式界面）就静默作罢：
+ * 换序失败不能影响按键注入本身。
+ */
+type SteamController = {
+  nControllerIndex?: number;
+  nXInputIndex?: number;
+  nAIndex?: number;
+  strName?: string;
+  strType?: string;
+};
+
+type SteamInputApi = {
+  GetControllers?: () => SteamController[];
+  GetControllersSorted?: () => SteamController[];
+  SwapControllerOrder?: (from: number, to: number) => void;
+};
+
+type SteamWsApi = {
+  RegisterForControllerList?: (cb: (list: SteamController[]) => void) => unknown;
+  SwapControllerOrderByIndex?: (from: number, to: number) => void;
+};
+
+function steamClient(): any {
+  const w = window as any;
+  return w.SteamClient || w.SP?.SteamClient || null;
+}
+
+// 虚拟手柄：名字认 DeckMeido（内核上报的设备名）；认不出就退回
+// 「不是 Valve 自家手柄」那一个 —— Steam Deck 本体手柄的 strType 带 Steam/Valve
+function isVirtualPad(c: SteamController): boolean {
+  return (
+    /deckmeido/i.test(String(c?.strName || "")) ||
+    !/steam|valve/i.test(String(c?.strType || ""))
+  );
+}
+
+// 槽位下标：新老客户端字段名不一样，挨个试
+function padSlot(c: SteamController): number | undefined {
+  for (const v of [c?.nXInputIndex, c?.nAIndex]) {
+    if (typeof v === "number" && v >= 0) return v;
+  }
+  return undefined;
+}
+
+function swapBy(client: any, api: SteamWsApi, from: SteamController, to: number): boolean {
+  const byIndex = api.SwapControllerOrderByIndex;
+  if (typeof byIndex === "function" && typeof from.nControllerIndex === "number") {
+    byIndex.call(api, from.nControllerIndex, to);
+    return true;
+  }
+  // 注意：SteamClient.Input.SwapControllerOrder 的两个参数都是「槽位」
+  // （nXInputIndex），不是 nControllerIndex —— 这是 Steam 自己的
+  // 「为控制器重新排序」面板里的用法：
+  //   SwapControllerOrder(items[from].index, items[to].index)
+  const slot = padSlot(from);
+  const input: SteamInputApi | undefined = client?.Input;
+  if (typeof input?.SwapControllerOrder === "function" && typeof slot === "number") {
+    input.SwapControllerOrder(slot, to);
+    return true;
+  }
+  return false;
+}
+
+/** 当前 Steam 认识的控制器列表（新客户端有 GetControllers，老的只能靠事件回调） */
+async function fetchControllers(client: any): Promise<SteamController[]> {
+  const input: SteamInputApi | undefined = client?.Input;
+  for (const fn of [input?.GetControllers, input?.GetControllersSorted]) {
+    if (typeof fn === "function") {
+      try {
+        const list = fn.call(input);
+        if (Array.isArray(list)) return list;
+      } catch {
+        /* 老客户端里可能只是占位，走下面的 WebSocket 版本 */
+      }
+    }
+  }
+  const ws: SteamWsApi | undefined = client?.WebSocket;
+  if (typeof ws?.RegisterForControllerList === "function") {
+    return await new Promise<SteamController[]>((resolve) => {
+      let done = false;
+      try {
+        ws.RegisterForControllerList!((list) => {
+          if (done || !Array.isArray(list)) return;
+          done = true;
+          resolve(list);
+        });
+      } catch {
+        resolve([]);
+      } finally {
+        // 回调没来时别一直挂着
+        setTimeout(() => {
+          if (!done) {
+            done = true;
+            resolve([]);
+          }
+        }, 1200);
+      }
+    });
+  }
+  return [];
+}
+
+/** 换序结果同时写进插件日志：QAM 里看不到 console，出问题只能靠日志 */
+function logPadOrder(msg: string) {
+  console.log("[DeckMeido]", msg);
+  call("_probe_log", "[padOrder] " + msg).catch(() => undefined);
+}
+
+async function applyPadOrder(action: "to1p" | "revert"): Promise<void> {
+  // 防重入：面板重挂载会重新注册监听，同一个请求可能来两次；
+  // 两路同时正在换会把顺序搅乱
+  if (padOrderBusy) return;
+  if (action === "revert" && !padOrderWanted1P) return; // 没换过就不用还原
+  padOrderBusy = true;
+  try {
+    await doPadOrder(action);
+  } finally {
+    padOrderBusy = false;
+    if (action === "to1p") padOrderWanted1P = true;
+  }
+}
+
+// 本次装的是不是刚把虚拟手柄挪到 1P（决定销毁时要不要还原）
+let padOrderWanted1P = false;
+let padOrderBusy = false;
+
+async function doPadOrder(action: "to1p" | "revert"): Promise<void> {
+  const client = steamClient();
+  if (!client) {
+    logPadOrder(`没有 SteamClient，跳过换序（${action}）`);
+    return;
+  }
+  const api: SteamWsApi | undefined = client.WebSocket;
+
+  // 设备刚创建时 Steam 还没枚举到它，所以有耐心地重试几轮
+  const tries = action === "to1p" ? 12 : 2;
+  for (let i = 0; i < tries; i++) {
+    // 留出时间让 Steam 把手柄枚举进去，再问它现在有几只手柄
+    if (i > 0) await new Promise((r) => setTimeout(r, 300));
+    const list = (await fetchControllers(client)).filter(
+      (c) => c && typeof c.nControllerIndex === "number"
+    );
+    const withSlot = list
+      .map((c) => ({ c, slot: padSlot(c) }))
+      .filter((x) => typeof x.slot === "number");
+
+    if (action === "to1p") {
+      const pad = withSlot.find((x) => isVirtualPad(x.c));
+      if (!pad) continue;
+      if (pad.slot === 0) return; // 已经是 1P
+      const ok = swapBy(client, api || {}, pad.c, 0);
+      logPadOrder(`换到 1P ${ok ? "已发出" : "失败"}：${JSON.stringify(list)}`);
+      return;
+    }
+
+    // revert：虚拟手柄已销毁，槽位会自动前移；只有 1P 还被「非 Valve 手柄」占着才动手
+    const first = withSlot.find((x) => x.slot === 0);
+    if (!first || !isVirtualPad(first.c)) return;
+    const deck = withSlot.find((x) => !isVirtualPad(x.c));
+    if (!deck) return;
+    const ok = swapBy(client, api || {}, deck.c, 0);
+    logPadOrder(`还原 ${ok ? "已发出" : "失败"}：${JSON.stringify(list)}`);
+    return;
+  }
+  logPadOrder(`换序未完成（${action}）：Steam 一直没枚举到虚拟手柄`);
+}
 
 function Content() {
   const [status, setStatus] = useState<Status | null>(null);
@@ -325,8 +512,6 @@ function Content() {
   // 「截屏询问」用的提示词模板，存在后端配置里（网页设置页改的也是这一份）
   const [askTpl, setAskTpl] = useState("");
   const [askTplEdit, setAskTplEdit] = useState("");
-  // 本端最近一次抓到的画面（data: URL），只用于在面板里确认「刚才截到的是什么」
-  const [shot, setShot] = useState<string>("");
   // 解锁：令牌输入框 + 后端给的票据（之后每次调用都要带上）
   const [tokenInput, setTokenInput] = useState("");
   const [ticket, setTicket] = useState("");
@@ -334,6 +519,11 @@ function Content() {
   const [probing, setProbing] = useState(true);
   // 重启核心进行中：按钮置灰，等后端起来再刷新状态
   const [restarting, setRestarting] = useState(false);
+  // 画面静止导致抓帧没拿到时，把这轮本来要问的话存下来，等用户动了再重试。
+  // 非空就表示要显示那张「请动一下画面」的卡片
+  const [pendingPoke, setPendingPoke] = useState<
+    { text: string; brief: string; hideQam: boolean } | null
+  >(null);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   // 流式正文先在 ref 里攒，避免每个 token 都触发一次全量状态重排
@@ -420,6 +610,13 @@ function Content() {
     const onDelta = (msg: Delta) => {
       if (msg.kind === "thread") {
         setItems(msg.items);
+        return;
+      }
+      if (msg.kind === "pad_order") {
+        // 虚拟手柄来了/走了：去改 Steam 的控制器排序。这条和对话流无关，
+        // 所以放在 busy 判断之前，也不占用界面状态
+        logPadOrder(`前端收到 pad_order/${msg.action}，SteamClient=${steamClient() ? "有" : "无"}`);
+        if (msg.action === "to1p" || msg.action === "revert") applyPadOrder(msg.action);
         return;
       }
       if (msg.kind === "status") {
@@ -551,11 +748,12 @@ function Content() {
     if (busyRef.current) return;
     setError("");
     setActivity("");
+    // 重新走这一轮时把「请动一下画面」的卡片收掉，免得重试成功后它还挂在那
+    setPendingPoke(null);
     // 用户那条由后端广播回来（带来源、带 ts），这里不抢先插一条，
     // 否则同一句话会先本地显示一次、再被所有端同步的消息覆盖
     curRef.current = "";
     setStreaming("");
-    setShot("");
     setBusyBoth(true);
 
     try {
@@ -581,7 +779,14 @@ function Content() {
         // 面板预览用插件另存的小缩略图（几十 KB），原图只在插件进程内部读
         const snap = (await call<
           [string, boolean],
-          { ok: boolean; shot?: string; thumb?: string; error?: string; game?: { appid?: string; name?: string } }
+          {
+            ok: boolean;
+            shot?: string;
+            thumb?: string;
+            error?: string;
+            needPoke?: boolean;
+            game?: { appid?: string; name?: string };
+          }
         >("screenshot", tk, hideQam).catch((e: any) => ({
           // 调用本身也可能抛（插件侧异常 / IPC 断掉）：不接住的话会一路跳到
           // 最外层 catch，把面板留在关着的状态
@@ -592,15 +797,22 @@ function Content() {
           shot?: string;
           thumb?: string;
           error?: string;
+          needPoke?: boolean;
           game?: { appid?: string; name?: string };
         };
         // 抓完立刻把面板连同预览一起摆出来：后面还有几十秒生成时间，
         // 用户应该能在这段时间里确认「发给 AI 的到底是哪一帧」。
         // 这一步不看抓帧成败 —— 失败了更要开回来，错误是要显示在面板里的
         if (hideQam) await restoreQamSafe(tk);
+        if (snap.needPoke) {
+          // 画面静止：不是故障，是等用户动一下。先把话存下来，卡片点「重试」
+          // 时原样再走一遍 runTurn，用户不用重新打字
+          setPendingPoke({ text, brief, hideQam });
+          setBusyBoth(false);
+          return;
+        }
         if (snap.ok && snap.shot) {
           shotPath = snap.shot;
-          setShot(snap.thumb ? `data:image/jpeg;base64,${snap.thumb}` : "");
         } else {
           // 截图失败不阻断提问：这一轮退回纯文字，并在界面上说清楚原因
           setError(`截图失败，这轮只发文字：${snap.error ?? "未知原因"}`);
@@ -713,9 +925,8 @@ function Content() {
   };
 
   /**
-   * 重启核心：后端先回 ok，再等半秒退出、一秒后重新拉起。
-   * 插件这边只管等它回来（main.py 里最多轮询 12 秒），回来后刷新一次状态，
-   * 让顶部「核心已连接」和版本号都换成重启后的值。
+   * 重启核心：插件自己收掉旧进程再用启动时那套命令重放（main.py 的 restart_core），
+   * 等它应答后刷新一次状态，让顶部「核心已连接」和版本号都换成重启后的值。
    */
   const restartCore = async () => {
     if (restarting) return;
@@ -762,13 +973,12 @@ function Content() {
       // 后端在「当前会话本来就一句没说」时不会新建（防止连点刷出一排空会话）。
       // 这时不广播 history，本地也别清 —— 空着还是空着，清了反而像出错
       if (r.unchanged) {
-        setError("当前就是个空会话，直接问吧");
+        setError("当前已经是新会话，可以开始聊天了~");
         return;
       }
       // 不依赖广播的到达时机：本地先把列表和临时状态清干净，
       // 否则按下的瞬间下面还挂着上一段对话，看起来像「没清掉」
       setItems([]);
-      setShot("");
       setStreaming("");
       setActivity("");
       curRef.current = "";
@@ -876,16 +1086,27 @@ function Content() {
         </PanelSectionRow>
       )}
 
-      {shot && (
+      {/* 画面静止时 gamescope 一帧都不吐，只有真人动一下摇杆才会重绘。
+          这里不做成报错（红色）：它不是故障，是等用户配合一下 */}
+      {pendingPoke && (
         <PanelSectionRow>
-          {/* 抓到的画面直接摆出来：抓错帧、抓到黑屏、抓到菜单，一眼就能看出来 */}
-          <div style={{ ...CARD, padding: 0, overflow: "hidden", border: "1px solid rgba(255,255,255,.12)" }}>
-            <img
-              src={shot}
-              alt="本轮截到的画面"
-              style={{ display: "block", width: "100%", height: "auto" }}
-            />
-            <div style={{ padding: "4px 8px", fontSize: 10, color: DIM }}>本轮发给 AI 的画面</div>
+          <div style={{ ...CARD, display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ color: DIM }}>
+              画面静止，截不到图。随便动一下摇杆或触摸板，再点下面重新截。
+            </div>
+            <div
+              role="button"
+              onClick={() => {
+                if (busyRef.current) return;
+                const p = pendingPoke;
+                setPendingPoke(null);
+                // 原样再走一遍：话没变，用户不用重新打
+                void runTurn(p.text, true, p.hideQam, p.brief);
+              }}
+              style={{ width: "100%", ...FAKE_BTN }}
+            >
+              动好了，重新截图
+            </div>
           </div>
         </PanelSectionRow>
       )}

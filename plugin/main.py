@@ -23,6 +23,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -142,6 +143,33 @@ def _session_path() -> Path:
         pass
     _SESSION_PATH = p / "qam_session.json"
     return _SESSION_PATH
+
+
+def _qam_device_id() -> str:
+    """本面板的设备标识，和网页端的 DEVICE_ID 是同一个用途
+
+    后端用 (client, device) 判断「这条待确认操作是不是你自己提的」，
+    插件端原先只发了 client=qam 不带 device，于是 pending_action 永远
+    匹配不上：在面板上回「确认」，模型会把确认提示语再问一遍。
+    这里和票据放同一个目录，装在这个 Deck 上就一直是同一个值。
+    """
+    path = _session_path().parent / "device_id"
+    try:
+        val = path.read_text(encoding="utf-8").strip()
+        if val:
+            return val
+    except OSError:
+        pass
+    val = f"qam-{secrets.token_hex(8)}"
+    try:
+        path.write_text(val, encoding="utf-8")
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return val
+
+
+_QAM_DEVICE = _qam_device_id()
 
 
 def _load_ticket() -> str:
@@ -753,6 +781,77 @@ async def _start_backend(port: int) -> tuple[bool, str]:
     return False, f"后端 40 秒内没有应答，日志：{log}"
 
 
+async def _stop_backend(port: int) -> None:
+    """收掉正在跑的后端，连外层 runuser 一起（重启用）
+
+    不能 `pkill -f 'uvicorn server.main:app'`：那份后端是
+    `runuser -u deck -- <venv>/bin/python -m uvicorn ...` 起的，
+    runuser 自己的命令行里也带着这串字，pkill 会把它一并杀了，
+    或者反过来留下一个没人管的 runuser。这里按 /proc 里的 cmdline
+    精确挑出「python -m uvicorn server.main:app」本身，再往上找它的
+    runuser 父进程，一起送 SIGTERM，等它退干净。
+    """
+    try:
+        victims: set[int] = set()
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    parts = [p.decode(errors="replace") for p in f.read().split(b"\0") if p]
+            except OSError:
+                continue
+            # 只认真正跑后端的那个 python 进程，不认 runuser 包装（它只是抄了一遍参数）
+            if not parts or "uvicorn" not in parts or "server.main:app" not in parts:
+                continue
+            if "runuser" in parts[0] or "sudo" in parts[0]:
+                continue
+            # 同一个进程组里的 runuser 也要收掉，否则它会在子进程死后留着
+            try:
+                os.kill(pid, signal.SIGTERM)
+                victims.add(pid)
+            except OSError:
+                pass
+        # 外层 runuser 是 root 身份，只能由插件（root）来杀
+        for pid in victims:
+            try:
+                with open(f"/proc/{pid}/status") as f:
+                    ppid = next(
+                        int(line.split()[1]) for line in f if line.startswith("PPid:")
+                    )
+                with open(f"/proc/{ppid}/cmdline", "rb") as f:
+                    parent = f.read().decode(errors="replace")
+                if "runuser" in parent or "sudo" in parent:
+                    os.kill(ppid, signal.SIGTERM)
+            except (OSError, StopIteration, ValueError):
+                pass
+        # 等端口真正空出来：uvicorn 收到 SIGTERM 会先关监听再退
+        for _ in range(20):
+            if not await _port_busy(port):
+                return
+            await asyncio.sleep(0.25)
+        decky.logger.warning(f"等了 5 秒端口 {port} 还占着，重启可能抢不到端口")
+    except Exception as exc:
+        decky.logger.error(f"停止后端出错：{exc}")
+
+
+async def _port_busy(port: int) -> bool:
+    """端口上是否还有服务在应答（只做 TCP 连接，不发请求）"""
+    try:
+        _, w = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", port), timeout=0.5
+        )
+        w.close()
+        try:
+            await w.wait_closed()
+        except Exception:
+            pass
+        return True
+    except (OSError, asyncio.TimeoutError):
+        return False
+
+
 async def _gamescope_pw_node() -> tuple[str | None, str]:
     """找 gamescope 的 PipeWire 视频源节点 id，第二个返回值是失败原因"""
     if not shutil.which("pw-dump"):
@@ -823,8 +922,13 @@ async def _capture_once(node: str, gst: str, timeout: int = 12,
     # 1600 万字符。LLM 网关对请求体有上限，这么大的图会被上游截断
     # （unexpected EOF → 503 no_healthy_account），看着就像「LLM 调用失败」，
     # 而同样配置下发纯文字是正常的。JPEG q90 大约 200KB，画质对看图问答绰绰有余。
+    #
+    # num-buffers=1：只要一帧。以前写 2 是想「连抓两帧取最后一帧」避开切场景的
+    # 黑帧，但 gamescope 每次画面变化只投 1 帧 —— 凑不满第 2 帧进程就一直挂着，
+    # 等到超时被 kill，抓到的那一帧也被当失败丢掉。实测画面静止时试抓已经写出
+    # 291KB 的图，却因为超时被判成没抓到。
     cmd = _run_as() + [
-        gst, "-q", "pipewiresrc", f"path={node}", "num-buffers=2",
+        gst, "-q", "pipewiresrc", f"path={node}", "num-buffers=1",
         "do-timestamp=true", "!", "videoconvert", "!", "jpegenc", "quality=90", "!",
         "filesink", f"location={tmp}",
     ]
@@ -877,10 +981,8 @@ _SHOT_LOCK = asyncio.Lock()
 # 停在游戏列表、或者玩家不动）时，pipewiresrc 连上去会一直空等到超时——
 # 实测挂 60 秒一个 buffer 都没有，journal 里只有 streaming → paused。
 # 用户那边看到的「按一下摇杆就能截图了」就是这个原因。
+# 试抓等这么久就够判断：画面在动的话一帧只要 0.2 秒。
 _POKE_WAIT = 1.5
-# 幅度压到 3%（约千分之一量程），拨 40ms 就回中：模拟器菜单里不会误触，
-# 3D 游戏里也就是视角极轻微地动一下。_poke_redraw 在虚拟手柄那段里定义。
-_POKE_AMT = 0.03
 
 
 async def _node_state_note() -> str:
@@ -904,43 +1006,44 @@ async def _node_state_note() -> str:
     return f"节点 {node}"
 
 
-async def grab_screenshot() -> tuple[bool, str]:
-    """抓一帧游戏画面，返回 (成功, base64 或错误说明)
+async def grab_screenshot() -> tuple[bool, str, bool]:
+    """抓一帧游戏画面，返回 (成功, base64 或错误说明, 是不是「画面静止」)
 
     写法和 server/tools.py 的 _screenshot_gamescope 保持一致。
-    场景静止时 gamescope 不吐帧（见 _poke_redraw 的说明），所以流程是：
-      先试抓 1.5 秒 → 没等到就轻推一下摇杆 → 正式抓；
-    之后再失败就重探节点重试一次 —— 节点 id 在游戏重启/切场景后可能变，
-    拿着旧 id 重试只会再空等一轮。
+    场景静止时 gamescope 不吐帧（见 _POKE_WAIT 的说明），所以先试抓 1.5 秒。
+    试抓没等到就**不再自己动手**：实测 uinput 注入的输入 gamescope 根本不认
+    （xdotool / ydotool / 自建虚拟手柄全试过，只有真摇杆能触发重绘），
+    推摇杆那一步注定失败，只会白等一轮 12 秒。改成把这个状态交回给前端，
+    由面板弹卡片请用户自己动一下。
     """
     node, why = await _gamescope_pw_node()
     if not node:
-        return False, why
+        return False, why, False
 
     gst = _find_gst()
     if not gst:
-        return False, "机器上没有 gst-launch-1.0（gst-plugins-base 未安装）"
+        return False, "机器上没有 gst-launch-1.0（gst-plugins-base 未安装）", False
 
     # 同一时刻只允许一个抓帧进程，否则前端连点会把 /tmp 搅乱
     async with _SHOT_LOCK:
         ok, payload = await _capture_once(node, gst, quick=_POKE_WAIT)
+        if ok:
+            return True, payload, False
+        if payload == "没等到新帧":
+            # 节点在、gst 也在，就是没画面变化 —— 需要用户动一下
+            decky.logger.info("抓帧试抓没等到新帧，请用户动一下画面")
+            return False, "画面静止，动一下摇杆或触摸板", True
+        # 其他失败（节点消失、gst 报错）：重探一次节点再试
+        first = payload
+        await asyncio.sleep(0.5)
+        node2, why2 = await _gamescope_pw_node()
+        if not node2:
+            return False, why2, False
+        ok, payload = await _capture_once(node2, gst)
         if not ok:
-            # 试抓没等到帧：画面静止，推一下摇杆逼它重绘再正式抓
-            await _poke_redraw()
-            ok, payload = await _capture_once(node, gst)
-        if not ok:
-            first = payload
-            await asyncio.sleep(0.5)
-            node2, why2 = await _gamescope_pw_node()
-            if not node2:
-                return False, why2
-            ok, payload = await _capture_once(node2, gst)
-            if not ok:
-                # 两次都失败：把节点状态一起带回去，否则只看到「超时」不知道
-                # 是节点没了、还是不吐帧
-                decky.logger.error(f"抓帧两次失败：{first} / {payload}（节点 {node}->{node2}）")
-                return False, f"{payload}（连试两次；节点 {node2}，第一次：{first}）"
-    return ok, payload
+            decky.logger.error(f"抓帧两次失败：{first} / {payload}（节点 {node}->{node2}）")
+            return False, f"{payload}（连试两次；节点 {node2}，第一次：{first}）", False
+    return True, payload, False
 
 
 # ---------- 虚拟手柄（uinput） ----------
@@ -1015,6 +1118,12 @@ class _Gamepad:
 
     _IDLE_CLOSE = 60.0
 
+    # 设备刚创建到游戏能收到事件之间有一段空窗：内核要等 uinput 的事件循环
+    # 把新设备注册完（/dev/input/eventXX 出现）才会把事件分发出去。这期间
+    # 写进去的按下事件会被丢掉 —— 表现就是「第一次按键没反应，第二次才好」。
+    # 等这一小段再发第一帧，实测 200ms 足够让内核创建设备节点。
+    _ENUM_WAIT = 0.2
+
     def __init__(self):
         self._fd: int | None = None
         self._lock = asyncio.Lock()
@@ -1064,9 +1173,12 @@ class _Gamepad:
                     struct.pack("HHiiiiii", code, 0, 0, lo, hi, 0, 0, 0),
                 )
             # uinput_setup：id{bustype,vendor,product,version}(4*2) + name(80) + ff_effects_max(4)
+            # ID 用标准 Xbox 360 手柄（与后端 tools.py 一致）：换成库里没有的
+            # 28DE:1205 实测游戏完全不认手柄，兼容性优先于显示名。
             fcntl.ioctl(
                 fd, _UI_DEV_SETUP,
-                struct.pack("HHHH80sI", 0x03, 0x045E, 0x02FD, 0x0001, b"DeckMeido Gamepad", 0),
+                struct.pack("HHHH80sI", 0x03, 0x045E, 0x02FD, 0x0001,
+                            b"DeckMeido Gamepad", 0),
             )
             fcntl.ioctl(fd, _UI_DEV_CREATE)
         except Exception:
@@ -1074,7 +1186,25 @@ class _Gamepad:
             raise
         self._fd = fd
         decky.logger.info("虚拟手柄已创建")
-        # 设备刚出现时内核还没有它的节点，先给一小段时间让游戏侧枚举到
+        # 注意不能写 _emit(...)：在类里 _emit 是往 uinput 写事件的同名方法，
+        # 会把一个 dict 当成 input_event 塞进设备。推给前端的是模块级 broadcast
+        broadcast({"kind": "pad_order", "action": "to1p"})
+
+    async def _ensure_ready(self):
+        """确保设备存在、且已经注册到输入子系统（可被游戏收到事件）
+
+        首次创建后要等内核把 /dev/input/eventXX 建出来，再补发一帧
+        「全部按住键抬起、摇杆居中」的初始状态：游戏侧接上设备时先看到
+        这个干净状态，后面真正要按的键才不会被当成「设备初值」吞掉。
+        """
+        if self._fd is not None:
+            return
+        self._create()
+        await asyncio.sleep(self._ENUM_WAIT)
+        for code in _GAMEPAD_KEYS.values():
+            self._emit(_EV_KEY, code, 0)
+        for code in (_ABS_X, _ABS_Y, _ABS_RX, _ABS_RY, _ABS_Z, _ABS_RZ):
+            self._emit(_EV_ABS, code, 0)
         self._syn()
 
     def _destroy(self):
@@ -1092,6 +1222,8 @@ class _Gamepad:
             pass
         self._fd = None
         decky.logger.info("虚拟手柄已销毁")
+        # 虚拟手柄没了：让前端确认物理手柄回到 1P，别留着空出来的槽位顺序
+        broadcast({"kind": "pad_order", "action": "revert"})
 
     def _touch_idle(self):
         """空闲计时：一段时间没人按就把设备收掉"""
@@ -1117,8 +1249,7 @@ class _Gamepad:
         ms = max(30, min(int(ms or 80), 2000))
         async with self._lock:
             try:
-                if self._fd is None:
-                    self._create()
+                await self._ensure_ready()
                 self._emit(_EV_KEY, code, 1)
                 self._syn()
                 await asyncio.sleep(ms / 1000)
@@ -1143,8 +1274,7 @@ class _Gamepad:
             return {"ok": False, "error": "摇杆值要是 -1..1 的数字"}
         async with self._lock:
             try:
-                if self._fd is None:
-                    self._create()
+                await self._ensure_ready()
                 self._emit(_EV_ABS, axes[0], vx)
                 self._emit(_EV_ABS, axes[1], vy)
                 self._syn()
@@ -1169,8 +1299,7 @@ class _Gamepad:
             return {"ok": False, "error": "扳机力度要是 0..1 的数字"}
         async with self._lock:
             try:
-                if self._fd is None:
-                    self._create()
+                await self._ensure_ready()
                 self._emit(_EV_ABS, code, level)
                 self._syn()
             except FileNotFoundError:
@@ -1191,17 +1320,6 @@ class _Gamepad:
 
 
 _GAMEPAD = _Gamepad()
-
-
-async def _poke_redraw() -> None:
-    """轻推一下右摇杆再回中，逼 gamescope 重绘一帧（抓帧用，见 _POKE_WAIT）"""
-    try:
-        await _GAMEPAD.stick(_POKE_AMT, _POKE_AMT, side="right")
-        await asyncio.sleep(0.04)
-        await _GAMEPAD.stick(0.0, 0.0, side="right")
-        decky.logger.info("抓帧没等到画面，已轻推摇杆触发重绘")
-    except Exception as exc:
-        decky.logger.warning(f"摇杆触发重绘失败：{exc}")
 
 
 # ---------- 与后端 :18765 的通话 ----------
@@ -1527,6 +1645,12 @@ def _backend_url(port: int, token: str) -> str:
     return f"ws://127.0.0.1:{port}/ws?token={token}"
 
 
+def _backend_addr() -> tuple[int, str]:
+    """从配置读 (port, token)：重连循环自己重建连接时要用"""
+    cfg = _load_server_cfg()
+    return int(cfg.get("port", 18765)), str(cfg.get("token", "") or "").strip().lower()
+
+
 def _emit(msg: dict):
     """把一条消息推给 QAM（前端 addEventListener("deckmeido_delta")）
 
@@ -1564,6 +1688,12 @@ def _emit_done(task: asyncio.Task):
     exc = task.exception()
     if exc:
         decky.logger.warning(f"推送前端失败：{exc}")
+
+
+def broadcast(msg: dict):
+    """模块级别名：给类方法里用（类里的 _emit 是往 uinput 写事件的同名方法）
+    """
+    _emit(msg)
 
 
 def _finalize(cancelled: bool = False):
@@ -1619,9 +1749,14 @@ async def _read_loop(bk: _Backend):
                 return
             _BACKEND = None
             _STREAM_RUNNING = False
+            decky.logger.info(f"准备重连后端（{delay:.0f}s 后）")
             new = await _reconnect(delay)
             if new is None:
                 delay = min(delay * 2, 30.0)
+                # 重连没成功，bk 还是那条断掉的连接：必须换一条新的去试，
+                # 否则下一轮 while 又拿旧对象 recv，只会一路 "NoneType ... recv"
+                # 死循环，日志里也就停在第一次失败那一行，之后再没动静
+                bk = _Backend(_backend_url(*_backend_addr()))
                 continue
             delay = 1.0
             bk = new
@@ -1643,6 +1778,12 @@ async def _read_loop(bk: _Backend):
             # 记下来：重连/换到别的端开会话时，前端靠它决定要不要弹「正在思考」
             _STREAM_RUNNING = run
             _emit({"kind": "status", "running": run})
+            continue
+        if typ == "pad_order":
+            # 虚拟手柄的换序请求：全局广播、不属于某一轮，所以也要放在 sid 过滤前。
+            # 排序状态只在 Steam 进程里，后端改不了，只能交给前端去调
+            # SteamClient.Input.SwapControllerOrder（详见前端 swapPadOrder）
+            _emit({"kind": "pad_order", "action": str(msg.get("action") or "")})
             continue
         if typ == "user_message":
             item = {
@@ -1728,8 +1869,11 @@ async def _reconnect(delay: float) -> _Backend | None:
     """
     global _BACKEND
     await asyncio.sleep(delay)
+    # 每次尝试都用新建的连接：上一条已经被 close 了，复用它只会立刻抛错
+    port, token = _backend_addr()
+    bk = _Backend(_backend_url(port, token))
     try:
-        bk = await _connect_backend()
+        await bk.open()
     except Exception as exc:
         decky.logger.info(f"重连后端失败：{exc}")
         return None
@@ -2079,26 +2223,28 @@ class Plugin:
         return {"ok": True, "text": str((r.get("data") or {}).get("text") or "")}
 
     async def restart_core(self, ticket: str = "") -> dict:
-        """重启女仆核心：后端自己拉一个独立进程把自己换掉
+        """重启女仆核心：由插件自己收掉旧进程，再用启动时那套命令拉起
 
-        请求发出后后端会先返回 ok，再等半秒才真的退出重启，所以这里
-        等一小会儿再确认它活着——立刻去问必然是连不上的。
+        不能让后端自己重启（见 server/main.py 的 /api/restart）：
+        后端是被这里用 `runuser -u deck -- <venv>/bin/python ...` 降权拉起的，
+        它自己 `pkill -f 'uvicorn server.main:app'` 会把外层 runuser 一起带走，
+        再用 nohup 就地起一份——那份既没有 runuser 包装、又和插件失去联系，
+        实测结果就是旧进程没了、新的没起来，重启变成「把后端关掉」。
+        插件这边握着完整的启动命令（_start_backend），所以由它来重放。
         """
         _require(ticket, "restart_core")
         cfg = _load_server_cfg()
         port = int(cfg.get("port", 18765))
         token = str(cfg.get("token", "") or "").strip()
-        r = await _core_http(port, token, "POST", "/api/restart", timeout=10.0)
-        if not r["ok"]:
-            return {"ok": False, "error": r.get("error") or "后端没有接受重启请求"}
-        # 给它时间退干净再起来（脚本里是 0.5s 后 kill、1s 后拉起）
-        for _ in range(12):
-            await asyncio.sleep(1.0)
-            back = await _core_http(port, token, "GET", "/api/version", timeout=3.0)
-            if back["ok"]:
-                ver = str((back.get("data") or {}).get("version") or "")
-                return {"ok": True, "version": ver}
-        return {"ok": False, "error": "重启指令已发出，但 12 秒内没等到核心回来"} 
+
+        # 收掉旧进程（含外层 runuser 包装），再按启动时那套命令重放
+        await _stop_backend(port)
+        ok, why = await _start_backend(port)
+        if not ok:
+            return {"ok": False, "error": f"重启失败：{why}"}
+        back = await _core_http(port, token, "GET", "/api/version", timeout=3.0)
+        ver = str((back.get("data") or {}).get("version") or "") if back["ok"] else ""
+        return {"ok": True, "version": ver}
 
     async def screenshot(self, ticket: str = "", hide: bool = False) -> dict:
         """抓当前游戏画面
@@ -2115,8 +2261,12 @@ class Plugin:
         game = await asyncio.to_thread(_current_game)
         if hide:
             await asyncio.sleep(1.2)
-        ok, payload = await grab_screenshot()
+        ok, payload, need_poke = await grab_screenshot()
         if not ok:
+            if need_poke:
+                # 画面静止：这是「请用户配合一下」，不是故障，用 info 记
+                decky.logger.info(f"screenshot 需要用户动一下画面：{payload}")
+                return {"ok": False, "error": payload, "needPoke": True, "game": game}
             # 失败时顺手把节点状态记一笔：gamescope 节点在 idle 时是 suspended，
             # 「节点在但状态不对」和「节点没了」要分得开，否则只能反复猜
             state = await _node_state_note()
@@ -2138,7 +2288,11 @@ class Plugin:
     async def gamepad_press(self, key: str, ms: int = 80, ticket: str = "") -> dict:
         """模拟按一下手柄键：a/b/x/y/lb/rb/up/down/left/right/start/select/guide/l3/r3/share"""
         _require(ticket, "gamepad_press")
-        return await _GAMEPAD.press(key, ms)
+        # 面板按键是换序的唯一触发点，日志里必须能看见它到底有没有被调到
+        decky.logger.info(f"面板按键 {key}（{ms}ms），设备{'已存在' if _GAMEPAD._fd else '将新建'}")
+        r = await _GAMEPAD.press(key, ms)
+        decky.logger.info(f"面板按键结果 {r}")
+        return r
 
     async def gamepad_stick(self, x: float, y: float, ticket: str = "",
                             side: str = "left") -> dict:
@@ -2205,6 +2359,10 @@ class Plugin:
         # 同一时刻只允许一轮，所以发之前先把它记在连接上
         bk.turn = f"qam-{os.urandom(6).hex()}"
         payload = {"type": "chat", "text": text, "client": "qam",
+                   # device 必须带上：后端靠 (client, device) 认领「挂起的高危操作」，
+                   # 少了它 pending_action 永远匹配不上，用户在面板上说「确认」
+                   # 会被当成普通提问再问一遍要不要执行
+                   "device": _QAM_DEVICE,
                    "turn_id": bk.turn}
         if brief:
             payload["brief"] = str(brief).strip()
@@ -2292,6 +2450,21 @@ class Plugin:
             decky.logger.warning(f"/api/cancel 失败：{err}")
             _finalize(cancelled=True)
         return {"ok": not err, "error": err}
+
+    async def _probe_log(self, text: str) -> bool:
+        """临时探针：把前端探测到的结果写进插件日志（查完连同前端调用一起删）"""
+        decky.logger.info(f"[probe] {text}")
+        return True
+
+    async def pad_order(self, action: str, ticket: str = "") -> dict:
+        """让前端去换 Steam 的控制器排序（后端管不到，排序只在 Steam 进程内存里）
+
+        调完不 waiting 结果 —— 前端那边异步做完只写 console，这里返回的
+        {"ok": True} 表示「请求已经发出去」。
+        """
+        _require(ticket, "pad_order")
+        _emit({"kind": "pad_order", "action": str(action or "")})
+        return {"ok": True}
 
     async def _main(self):
         decky.logger.info(f"DeckMeido 插件已加载，安装目录 {INSTALL_DIR}")

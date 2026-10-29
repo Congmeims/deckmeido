@@ -1568,8 +1568,13 @@ async def _gst_grab(node: str, raw: Path, uid: int, user: str,
     env["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
     # gst-launch 把每个 argv 当成一个独立 token，元素名和属性必须分开传，
     # 写成 "pipewiresrc path=78" 会被判成语法错误
+    #
+    # num-buffers=1：只要一帧。以前写 2 是想「连抓两帧取最后一帧」避开切场景的
+    # 黑帧，但 gamescope 每次画面变化只投 1 帧 —— 凑不满第 2 帧，进程就一直挂在
+    # 那里，等到超时被 kill，抓到的那一帧也被当失败丢掉。实测 Eden 静止时
+    # 试抓已经写出 291KB 的图，却因为 TIMEOUT 被判没抓到。
     cmd = [
-        "gst-launch-1.0", "-q", "pipewiresrc", f"path={node}", "num-buffers=2",
+        "gst-launch-1.0", "-q", "pipewiresrc", f"path={node}", "num-buffers=1",
         "do-timestamp=true", "!", "videoconvert", "!", "pngenc", "!",
         "filesink", f"location={raw}",
     ]
@@ -1636,13 +1641,12 @@ async def _screenshot_gamescope(path: Path) -> str:
         return "找不到 gamescope 所在的用户会话（/run/user/* 下没有活的图形会话）"
     uid, user = sess
     raw = path.with_suffix(".raw.png")
-    # 先试抓 1.5 秒：画面在动就立刻拿到，静止才走下面的「戳一下重绘」
+    # 只试抓 1.5 秒。以前会再「推一下摇杆」等 12 秒，但实测 uinput 注入的输入
+    # gamescope 根本不认（只有真人动摇杆/触摸板才会重绘），那 12 秒是白等。
+    # 画面静止就直接报出来，让用户动一下——插件那边也会据此弹重试卡片。
     ok, err_text = await _gst_grab(node, raw, uid, user, timeout=1.5)
     if not ok and not err_text:
-        await _poke_redraw()
-        ok, err_text = await _gst_grab(node, raw, uid, user, timeout=12)
-        if not ok and not err_text:
-            return "抓帧超时（画面一直没有变化，推了一下画面也没等到新帧）"
+        return "画面静止，gamescope 没有输出新帧（随便动一下摇杆或触摸板再试）"
     if not ok:
         return "抓帧没拿到有效图像" + (f"：{err_text}" if err_text else "")
     # pngenc 连续多帧会覆盖同一文件，取到的就是最后一帧，直接搬过来
@@ -1696,6 +1700,37 @@ _PAD_STICK = [0, 0]
 _PAD_STICK_R = [0, 0]
 _PAD_TRIG = {"lt": 0, "rt": 0}
 
+# 虚拟手柄的厂商/产品号：微软 Xbox 360 有线手柄（0x045E/0x02FD）。
+# 曾试过换成库里没有的 28DE:1205 让 Steam 显示自定义名，结果游戏完全不认，
+# 所以退回标准 Xbox ID —— 兼容性优先于显示名。
+_PAD_VID = 0x045E
+_PAD_PID = 0x02FD
+
+# 换序回调：后端 main.py 启动时接上（广播一条 pad_order 给 QAM 插件）。
+# 排序状态只存在 Steam 进程内存里，没有配置文件可写，只能在 Steam 页面
+# 上下文里调 SteamClient.Input.SwapControllerOrder —— 那条路只有插件前端有，
+# 所以这里只能把「刚建好 / 刚销毁」这件事喊出去，由前端去换。
+# 没接上（例如直接跑 tools 的单元测试）就什么都不做。
+_PAD_ORDER_HOOK = None
+
+
+def set_pad_order_hook(fn) -> None:
+    """注册换序回调：fn(action) -> awaitable，action 是 "to1p" / "revert"""
+    global _PAD_ORDER_HOOK
+    _PAD_ORDER_HOOK = fn
+
+
+def _notify_pad_order(action: str) -> None:
+    """喊一声「虚拟手柄来了 / 走了」，换序失败不能影响按键注入"""
+    if _PAD_ORDER_HOOK is None:
+        return
+    try:
+        res = _PAD_ORDER_HOOK(action)
+        if asyncio.iscoroutine(res):
+            asyncio.create_task(res)
+    except Exception as exc:
+        print(f"[DeckMeido] 手柄换序通知失败：{exc!r}", file=sys.stderr)
+
 
 class _VirtualPad:
     """一个懒创建、闲置自动销毁的虚拟手柄。
@@ -1748,15 +1783,26 @@ class _VirtualPad:
                     struct.pack("HHiiiiii", code, 0, 0, lo, hi, 0, 0, 0),
                 )
             # uinput_setup：id{bus,vendor,product,version} + name(80) + ff_effects_max
+            # ID 用标准 Xbox 360 手柄，Steam / SDL / 游戏三方都按 Xbox 认。
+            # Steam 提示里显示的是 SDL 内置库里的名字（「Xbox One S 手柄已连接」），
+            # 内核这行名字只在 SDL 不认识该 ID 时才生效，而换个不认识的 ID
+            # 游戏会连手柄都认不到 —— 试过 28DE:1205，实测完全不认。
             fcntl.ioctl(
                 fd, _UI_DEV_SETUP,
-                struct.pack("HHHH80sI", 0x03, 0x045E, 0x02FD, 0x0001, b"DeckMeido Gamepad", 0),
+                struct.pack("HHHH80sI", 0x03, _PAD_VID, _PAD_PID, 0x0001,
+                            b"DeckMeido Gamepad", 0),
             )
             fcntl.ioctl(fd, _UI_DEV_CREATE)
         except Exception:
             os.close(fd)
             raise
         self._fd = fd
+        # AI 操纵游戏时，日志里必须能看出设备是这一刻才建出来的：
+        # 新建的设备游戏要重新枚举，紧接着按下去的键往往收不到
+        print(f"[DeckMeido] 虚拟手柄已创建（fd {fd}）")
+        # 新插上的手柄在 Steam 里排在物理手柄后面（就是 2P），
+        # 不换到 1P 的话游戏根本不看它的输入
+        _notify_pad_order("to1p")
 
     def _destroy(self):
         if self._fd is None:
@@ -1775,6 +1821,10 @@ class _VirtualPad:
         _PAD_STICK[0] = _PAD_STICK[1] = 0
         _PAD_STICK_R[0] = _PAD_STICK_R[1] = 0
         _PAD_TRIG["lt"] = _PAD_TRIG["rt"] = 0
+        print("[DeckMeido] 虚拟手柄已闲置销毁")
+        # 虚拟手柄没了，槽位会自动前移，但 Steam 的排序不一定跟着回；
+        # 让前端确认一遍物理手柄仍在 1P，免得下次开机游戏认不到手柄
+        _notify_pad_order("revert")
 
     def _touch(self):
         if self._idle is not None:
@@ -1796,10 +1846,26 @@ class _VirtualPad:
             self._destroy()
 
     async def _ensure(self):
-        if self._fd is None:
-            self._create()
-            # 设备刚创建时内核还没生成节点，游戏侧要一点时间才枚举到
-            await asyncio.sleep(0.15)
+        """确保设备已建好、且内核已经注册完成（游戏收得到后面的按键）
+
+        设备刚创建到游戏能收到事件之间有一段空窗：内核要等 uinput 的事件
+        循环把 /dev/input/eventXX 建出来才会分发。这期间写进去的按下事件
+        会被丢掉——表现就是「第一次按键没反应」。等这一小段再补发一帧
+        「按键全抬起、摇杆居中」的初始状态，游戏接上时先看到干净的值。
+        """
+        if self._fd is not None:
+            return
+        self._create()
+        await asyncio.sleep(0.2)
+        for code in _PAD_KEYS.values():
+            self._emit(_EV_KEY, code, 0)
+        for code in (_ABS_X, _ABS_Y, _ABS_RX, _ABS_RY, _ABS_Z, _ABS_RZ):
+            self._emit(_EV_ABS, code, 0)
+        self._syn()
+        # 设备刚出现时 Steam 才把它枚举进去，换序要再等一会儿才有东西可换
+        # （前端那边也有重试，这里只是别让它第一次必然扑空）
+        await asyncio.sleep(0.3)
+        _notify_pad_order("to1p")
 
     async def key(self, name: str, hold_ms: int = 80) -> str:
         code = _PAD_KEYS.get(name)
@@ -1814,11 +1880,15 @@ class _VirtualPad:
                 self._emit(_EV_KEY, code, 0)
                 self._syn()
             except FileNotFoundError:
+                print("[DeckMeido] 手柄注入失败：没有 /dev/uinput", file=sys.stderr)
                 return "手柄注入失败：没有 /dev/uinput，uinput 内核模块未加载"
             except PermissionError:
+                print("[DeckMeido] 手柄注入失败：没权限写 /dev/uinput", file=sys.stderr)
                 return "手柄注入失败：没有写 /dev/uinput 的权限（需要 root）"
             self._touch()
-        return f"已按下手柄键 {name}（{max(30, min(hold_ms, 5000))}ms）"
+        hold = max(30, min(hold_ms, 5000))
+        print(f"[DeckMeido] 手柄按键 {name}（{hold}ms）")
+        return f"已按下手柄键 {name}（{hold}ms）"
 
     async def stick(self, x: float, y: float, side: str = "left") -> str:
         right = str(side or "left").strip().lower() == "right"
@@ -1832,12 +1902,15 @@ class _VirtualPad:
                 self._emit(_EV_ABS, axes[1], vy)
                 self._syn()
             except FileNotFoundError:
+                print("[DeckMeido] 摇杆注入失败：没有 /dev/uinput", file=sys.stderr)
                 return "摇杆注入失败：没有 /dev/uinput，uinput 内核模块未加载"
             except PermissionError:
+                print("[DeckMeido] 摇杆注入失败：没权限写 /dev/uinput", file=sys.stderr)
                 return "摇杆注入失败：没有写 /dev/uinput 的权限（需要 root）"
             state = _PAD_STICK_R if right else _PAD_STICK
             state[0], state[1] = vx, vy
             self._touch()
+        print(f"[DeckMeido] 手柄{'右' if right else '左'}摇杆 ({x:.2f}, {y:.2f})")
         return f"{'右' if right else '左'}摇杆已推到 ({x:.2f}, {y:.2f})"
 
     async def trigger(self, which: str, value: float) -> str:
@@ -1852,11 +1925,14 @@ class _VirtualPad:
                 self._emit(_EV_ABS, code, level)
                 self._syn()
             except FileNotFoundError:
+                print("[DeckMeido] 扳机注入失败：没有 /dev/uinput", file=sys.stderr)
                 return "扳机注入失败：没有 /dev/uinput，uinput 内核模块未加载"
             except PermissionError:
+                print("[DeckMeido] 扳机注入失败：没权限写 /dev/uinput", file=sys.stderr)
                 return "扳机注入失败：没有写 /dev/uinput 的权限（需要 root）"
             _PAD_TRIG[name] = level
             self._touch()
+        print(f"[DeckMeido] 手柄{name.upper()} 扳机 {value:.2f}")
         return f"{name.upper()} 扳机力度 {value:.2f}"
 
 
@@ -1931,12 +2007,16 @@ async def _screenshot() -> str:
 
     # 游戏模式：桌面会话已经结束，只能从 gamescope 抓
     if await _gamescope_pw_node():
+        print("[DeckMeido] 截图走游戏模式（gamescope PipeWire）")
         err = await _screenshot_gamescope(path)
         if not err:
             return await _finish_shot(path, name, shots_dir, time)
         holder["error"] = err
+        print(f"[DeckMeido] 游戏模式截图失败：{err}", file=sys.stderr)
         return (f"截图失败：{err}。现在没有当前画面可用，"
                 "请直接告诉用户这次没截到图、以及原因，不要凭空描述屏幕内容。")
+
+    print("[DeckMeido] 截图走桌面模式（spectacle/mss）")
 
     env = dict(os.environ)
     _fix_display_env(env)
@@ -1963,6 +2043,7 @@ async def _screenshot() -> str:
         await _set_overlay_lift(False)
     if not path.exists() or path.stat().st_size < 10000:
         holder["error"] = "spectacle 与 mss 都不可用（或截到的是黑色画面）"
+        print(f"[DeckMeido] 桌面模式截图失败：{holder['error']}", file=sys.stderr)
         # 黑屏也会留下几十字节的残片，不删掉下次会被当成「已有截图」
         path.unlink(missing_ok=True)
         return (f"截图失败：{holder['error']}。现在没有当前画面可用，"
@@ -2451,8 +2532,16 @@ _NO_KEEP_AWAKE = {
 async def execute(name: str, args: dict) -> str:
     fn = EXECUTORS.get(name)
     if not fn:
+        print(f"[DeckMeido] 工具调用失败：未知工具 {name}", file=sys.stderr)
         return f"未知工具：{name}"
     args = dict(args)
+    # 统一在这里记一笔：模型的每次工具调用、参数、耗时、结果长短都留在
+    # backend.log 里。之前只有个别工具自己打日志，出问题（比如「AI 说按了
+    # 但没按」）时分不清是模型没调、工具报错、还是调了但没效果。
+    # 只记摘要不记全文：run_command 的输出可能有几千行。
+    t0 = time.monotonic()
+    print(f"[DeckMeido] 工具调用 {name}：{summarize_tool(name, args) or '（无参数）'}"
+          f"  args={json.dumps(args, ensure_ascii=False)[:400]}")
     # 执行期间别让屏幕黑掉/机器睡着：run_command 可能跑几分钟，
     # 用户回来看到的应该是进度，而不是一个锁屏界面。
     # 桌面模式判断和非空原因计数都在 power 里，游戏模式/纯查询工具会自动跳过。
@@ -2465,14 +2554,21 @@ async def execute(name: str, args: dict) -> str:
         if name == "run_command" and _is_launcher(str(args.get("command", ""))) \
                 and not args.get("stdin"):
             args["detach"] = True
-        return await fn(**args)
+        result = await fn(**args)
+        text = result if isinstance(result, str) else str(result)
+        print(f"[DeckMeido] 工具完成 {name}（{time.monotonic() - t0:.2f}s，"
+              f"{len(text)} 字）：{text[:300]}")
+        return result
     except OutsideWorkspace as e:
         # 单独给一句能看懂的：越界是权限策略而不是文件坏了，
         # 模型该停下来问用户，而不是换个路径继续试
+        print(f"[DeckMeido] 工具被拒 {name}：越出工作区 {e}", file=sys.stderr)
         return (f"拒绝访问：{e} 在工作区 {WORKSPACE} 之外。"
                 f"当前权限模式只允许操作工作区内的文件；"
                 f"确实需要访问这里，请让用户去设置里切到「完全访问」")
     except Exception as e:
+        print(f"[DeckMeido] 工具异常 {name}（{time.monotonic() - t0:.2f}s）：{e!r}",
+              file=sys.stderr)
         return f"工具 {name} 执行失败：{e}"
     finally:
         if keep:

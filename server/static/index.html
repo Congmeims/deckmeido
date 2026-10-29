@@ -89,8 +89,6 @@
     display: flex; align-items: center; justify-content: flex-end;
     gap: 8px; flex-wrap: wrap;
   }
-  /* 实时画面入口：只在游戏模式下出现（见 mode 处理），和旁边的徽章同一套胶囊样式 */
-  #btnLive { flex: 0 0 auto; white-space: nowrap; }
 
   /* 通用胶囊按钮（分享弹窗等） */
   .menu-btn {
@@ -444,8 +442,12 @@
   .typing i:nth-child(2) { animation-delay: .2s; }
   .typing i:nth-child(3) { animation-delay: .4s; }
   @keyframes blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
-  /* 工具动态提示：文字在前，动态点跟在文字后面 */
+  /* 工具动态提示：文字在前，动态点跟在文字后面。
+     它同时带 .msg，所以会继承 margin-bottom:20px（那是给气泡悬停操作行留的空隙）。
+     作为列表最后一项时，这 20px 会和 #messages 的 padding 叠在一起，落得比左右
+     边距宽一大截。抵消掉，让它只留 padding，和左右留白对齐 */
   .typing-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  #messages > .typing-row:last-child { margin-bottom: 0; }
   .typing-label { color: var(--muted); font-size: 12.5px; line-height: 1.5; word-break: break-word; }
 
   /* 底部输入区（两行：输入框 + 工具栏） */
@@ -622,9 +624,22 @@
     margin-bottom: 4px;
   }
   .qchip .q-wait {
-    border: none; background: none; color: var(--muted);
-    font-size: 12.5px; cursor: pointer; padding: 2px 0;
+    /* 这行是「等待发送」的展开开关，以前只给 muted 灰、12.5px，和正文几乎一个色，
+       看不出能点。改成品牌色 + 加粗，箭头跟着一起明显 */
+    border: none; background: none; color: var(--brand);
+    font-size: 12.5px; font-weight: 600; cursor: pointer; padding: 2px 0;
+    display: inline-flex; align-items: center; gap: 4px;
   }
+  .qchip .q-wait .caret {
+    font-size: 11px; line-height: 1;
+    /* ⌄ 这类字形在 SteamOS 的字体里常常缺字，用 CSS 三角自己画 */
+    width: 0; height: 0;
+    border-left: 4.5px solid transparent;
+    border-right: 4.5px solid transparent;
+    border-top: 5px solid currentColor;
+    transition: transform .15s ease;
+  }
+  .qchip .q-wait.open .caret { transform: rotate(180deg); }
   .qchip .q-menu { display: none; flex-direction: column; gap: 2px; margin-top: 4px; }
   .qchip .q-menu.show { display: flex; }
   .qchip .q-menu button {
@@ -1142,8 +1157,6 @@
        模式徽章本身要留——在游戏模式里刷 QAM 以外的网页时，它就靠这个
        认出「当前是游戏模式」，藏掉反而让人以为回桌面了 */
     #ctxBadge { display: none !important; }
-    /* 画面入口必须留着（游戏模式下就靠它开画面），不许被 nowrap 挤没 */
-    #btnLive { flex: 0 0 auto; }
     /* 极窄屏（<360px）：模式徽章也收窄，但必须留着 */
     #modeBadge { padding: 3px 7px; font-size: 10.5px; }
     .hdr-right:empty { display: none; }
@@ -1229,26 +1242,6 @@
   #codePre { flex: 1; overflow: auto; padding: 14px; color: var(--code-text); font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; word-break: break-word; margin: 0; }
   .msg pre { cursor: pointer; }
 
-  /* 实时画面：可拖动、可缩放，默认缩在右下角 */
-  #liveView {
-    display: none; position: fixed; right: 16px; bottom: 96px; z-index: 44;
-    width: min(480px, 52vw); background: var(--surface);
-    border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
-    box-shadow: 0 10px 30px rgba(0,0,0,.35);
-  }
-  #liveView.show { display: block; }
-  #liveView .lv-bar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: var(--surface-2); cursor: move; }
-  #liveView .lv-title { flex: 1; font-size: 12.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  #liveView .lv-btn { border: 0; background: transparent; color: var(--muted); font-size: 13px; padding: 4px 8px; border-radius: 8px; cursor: pointer; }
-  #liveView .lv-btn:hover { background: var(--hover); color: var(--text); }
-  #liveView .lv-stage { position: relative; background: #000; aspect-ratio: 16 / 10; display: flex; align-items: center; justify-content: center; }
-  #liveView .lv-stage video { width: 100%; height: 100%; object-fit: contain; display: block; }
-  #liveView .lv-msg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-    text-align: center; padding: 18px; font-size: 12.5px; color: #cfd4e0;
-    background: rgba(0,0,0,.62); line-height: 1.7; }
-  #liveView .lv-msg[hidden] { display: none; }
-  #liveView .lv-grip { position: absolute; right: 0; bottom: 0; width: 18px; height: 18px; cursor: nwse-resize;
-    background: linear-gradient(135deg, transparent 50%, var(--muted) 50%); opacity: .45; }
 </style>
 </head>
 <body>
@@ -1298,7 +1291,6 @@
   <span class="spacer"></span>
   <div class="hdr-right">
     <span class="badge" id="ctxBadge" hidden></span>
-    <button class="badge" id="btnLive" title="实时画面（游戏模式）" hidden>画面</button>
     <span class="badge ctrl" id="ctrlBadge" hidden></span>
     <span class="badge" id="modeBadge" hidden></span>
   </div>
@@ -1462,23 +1454,23 @@
             </div>
           </div>
           <div class="card">
+            <div class="card-title">已记住的内容</div>
+            <div class="mem-list" id="memList"></div>
+            <div class="mem-foot">
+              <span id="memCount" class="field-hint"></span>
+              <button id="memClear" class="mini-btn" type="button">清空全部</button>
+            </div>
+          </div>
+          <div class="card">
             <div class="card-title">备份</div>
             <p class="pane-desc" style="margin-top:0">
-              人设和下面的记忆就是「她这个人」的全部，导出一个 JSON 就能换机器、重装后恢复。
+              人设和上面的记忆就是「她这个人」的全部，导出一个 JSON 就能换机器、重装后恢复。
             </p>
             <div class="mem-foot">
               <span class="field-hint">不含 API Key 与对话记录</span>
               <button id="soulExport" class="mini-btn" type="button">导出备份</button>
               <button id="soulImport" class="mini-btn" type="button">导入备份</button>
               <input id="soulFile" type="file" accept=".json,application/json" hidden>
-            </div>
-          </div>
-          <div class="card">
-            <div class="card-title">已记住的内容</div>
-            <div class="mem-list" id="memList"></div>
-            <div class="mem-foot">
-              <span id="memCount" class="field-hint"></span>
-              <button id="memClear" class="mini-btn" type="button">清空全部</button>
             </div>
           </div>
         </section>
@@ -1564,19 +1556,6 @@
   </div>
 </div>
 
-<div id="liveView">
-  <div class="lv-bar">
-    <span class="lv-title" id="lvTitle">实时画面</span>
-    <button class="lv-btn" id="lvReload" title="重连画面">重连</button>
-    <button class="lv-btn" id="lvClose" title="关闭">关闭</button>
-  </div>
-  <div class="lv-stage">
-    <video id="lvVideo" muted autoplay playsinline hidden></video>
-    <div class="lv-msg" id="lvMsg">正在连接画面…</div>
-    <div class="lv-grip" id="lvGrip"></div>
-  </div>
-</div>
-
 <div id="codeView">
   <div id="codeBox">
     <div class="cv-bar">
@@ -1633,9 +1612,6 @@
   var ctrlBadge = document.getElementById('ctrlBadge');
   var modeBadge = document.getElementById('modeBadge');
   var ctxBadge = document.getElementById('ctxBadge');
-  var btnLive = document.getElementById('btnLive');
-  var liveOn = false;      // 实时画面面板是否打开（=是否应该在看画面）
-  var liveClose = function () {};  // 真正的实现见「实时画面」一节，status 先于它到达时会用到
   var authOverlay = document.getElementById('authOverlay');
   var tokenInput = document.getElementById('tokenInput');
   var tokenBtn = document.getElementById('tokenBtn');
@@ -1805,6 +1781,10 @@
     return s;
   }
 
+  // 原生客户端标记：URL 带 native=1 时由 Deck 桌面版打开，图片等交互走系统工具。
+  // 必须定义在 DEVICE_ID 之前 —— 后者要靠它决定用固定身份还是 localStorage
+  var IS_NATIVE = new URLSearchParams(location.search).get('native') === '1';
+
   // 本端来源标识：优先用后端在 history 里回传的 my_client（那是它实际看到的
   // UA），没收到之前先按 UA 自己猜。桌面客户端内嵌的也是这个页面，
   // 光看 UA 分不出「电脑浏览器」和「客户端」，所以客户端要自己声明
@@ -1820,7 +1800,13 @@
   // 想判断「这条是不是我这台设备发的」，必须有一个每台设备各自唯一的 id。
   // 存在 localStorage 里，同一浏览器长期不变；隐私模式或无痕每次会换新 id，
   // 那只影响「本端」角标是否显示，不影响对话
+  //
+  // 原生客户端（Deck 桌面版）例外：它内嵌的 QtWebEngine 有独立 profile，
+  // localStorage 从空开始，生成的 id 和同一台机器上普通浏览器的完全不同，
+  // 结果自己在客户端里发的消息也会被标成「掌机」。所以客户端固定用一个值 ——
+  // 它的身份就是这台 Deck，不该随 profile 变化。
   var DEVICE_ID = (function () {
+    if (IS_NATIVE) return 'native-client';
     try {
       var k = 'deckmeido_device_id';
       var v = localStorage.getItem(k);
@@ -2667,9 +2653,17 @@
           var promoted = false;   // 最终正文是否已原地补进时间线
           // 这一轮的正文就是那句问题、屏幕上已经以气泡形式出现过了（见 case 'ask'），
           // 收尾时别再补一条一模一样的
-          var askOnly = askShown > 0 && !!(msg.events && msg.events.some(function (e) {
-            return e.type === 'ask';
-          }));
+          // 判据只看「这一轮有没有 ask」和「正文是不是就是那句问题」，
+          // 不看 askShown 计数：面板重挂载 / 重连 / 终止都会把计数清零，
+          // 计数一归零 askOnly 就失效，收尾时又补一条一模一样的正文，
+          // 屏幕上于是出现两组「思考 + 同一句话」
+          var askEv = null;
+          (msg.events || []).forEach(function (e) {
+            if (e && e.type === 'ask' && !askEv) askEv = e;
+          });
+          var askText = askEv ? String(askEv.question || '').trim() : '';
+          var askOnly = !!askEv && (!String(msg.text || '').trim()
+                                    || String(msg.text).trim() === askText);
           if (streamEl && streamEl.parentNode) {
             if (msg.text) {
               var fb = streamEl.querySelector('.stream-body');
@@ -2702,11 +2696,15 @@
           if (msg.events && msg.events.length) {
             if (liveBox) {
               // 补渲染未实时显示的事件：已实时展示过的工具块/思维链按数量跳过，
-              // 过渡正文（text）在流式阶段已经显示过了，一并跳过，避免段落重复
-              var skip = liveToolCount, skipT = liveThoughtShown, skipA = askShown;
+              // 过渡正文（text）在流式阶段已经显示过了，一并跳过，避免段落重复。
+              // ask 不看计数：重连/重挂载会把 askShown 清零，清零后再按计数跳过
+              // 就会漏判，把 events 里的 ask 重画一遍（屏幕上两组「思考+同一句问题」）。
+              // 这里直接看 liveBox 里是不是已经有问答卡片了
+              var hasAsk = !!liveBox.querySelector('.ask-card');
+              var skip = liveToolCount, skipT = liveThoughtShown;
               msg.events.forEach(function (e) {
                 if (e.type === 'text') return;
-                if (e.type === 'ask' && skipA > 0) { skipA--; return; }
+                if (e.type === 'ask' && hasAsk) return;
                 if (e.type === 'tool' && skip > 0) { skip--; return; }
                 if (e.type === 'thought' && skipT > 0) { skipT--; return; }
                 renderEvent(e, liveBox);
@@ -2997,12 +2995,6 @@
     if (s.mode) {
       modeBadge.hidden = false;
       modeBadge.textContent = s.mode === 'gaming' ? '游戏模式' : '桌面模式';
-      // 画面入口只在游戏模式出现：桌面模式下没有 gamescope 节点可抓，
-      // 摆一个点不动的按钮既占地方又和旁边的徽章不是同一个风格
-      var gaming = s.mode === 'gaming';
-      btnLive.hidden = !gaming;
-      btnLive.title = '实时画面';
-      if (!gaming && liveOn) liveClose();
     }
     if (s.context) {
       var c = s.context;
@@ -3089,7 +3081,10 @@
       chip.appendChild(t);
       var wait = document.createElement('button');
       wait.className = 'q-wait';
-      wait.textContent = '⏳ 等待发送… ⌄';
+      wait.textContent = '等待发送';
+      var caret = document.createElement('span');
+      caret.className = 'caret';
+      wait.appendChild(caret);
       chip.appendChild(wait);
       var menu = document.createElement('div');
       menu.className = 'q-menu';
@@ -3103,7 +3098,10 @@
       menu.appendChild(now);
       menu.appendChild(drop);
       chip.appendChild(menu);
-      wait.addEventListener('click', function () { menu.classList.toggle('show'); });
+      wait.addEventListener('click', function () {
+        menu.classList.toggle('show');
+        wait.classList.toggle('open', menu.classList.contains('show'));
+      });
       queueBox.appendChild(chip);
     });
   }
@@ -3173,7 +3171,7 @@
       lbl.className = 'typing-label';
       typingEl.insertBefore(lbl, typingEl.firstChild);
     }
-    lbl.textContent = '正在处理… ' + waitBase + ' 秒'
+    lbl.textContent = '已执行 ' + waitBase + ' 秒'
       + (waitBase >= 45 ? '（还在跑，可以按终止停下）' : '');
   }
   function startWaitTimer(since) {
@@ -4638,164 +4636,12 @@
         if (!r.ok) { addSystem('新建会话失败（HTTP ' + r.status + '）'); return null; }
         return r.json();
       })
-      .then(function (d) { if (d && d.unchanged) addSystem('当前就是个空会话，直接聊吧'); })
+      .then(function (d) { if (d && d.unchanged) addSystem('当前已经是新会话，可以开始聊天了~'); })
       .catch(function () { addSystem('新建会话失败：连不上后端'); });
   });
   loadSessions();
 
-  // ---------- 实时画面（H.264 / fragmented MP4） ----------
-  // 后端只在游戏模式下拿得到 gamescope 的 PipeWire 节点，桌面模式直接 503；
-  // 前端据此把入口藏起来，不要让主人点开一个永远黑着的框。
-  // 播放器用 <video> 而不是 <img>：H.264 是压缩的帧间编码，只有 video 能解；
-  // 后端用 mp4mux 分片输出，所以可以直接把流地址塞给 src，边下边播。
-  var liveView = document.getElementById('liveView');
-  var liveVideo = document.getElementById('lvVideo');
-  var liveMsg = document.getElementById('lvMsg');
-  var liveTitle = document.getElementById('lvTitle');
-  var liveTries = 0;       // 首帧超时后的自动重连次数
-  var liveTimer = null;
-  var liveReported = false;
-
-  function liveUrl() {
-    // 加时间戳避开浏览器缓存：重连时 URL 必须变化，否则会拿到缓存的旧连接
-    return '/api/stream?token=' + encodeURIComponent(token) + '&t=' + Date.now();
-  }
-  function liveSetMsg(text) {
-    if (text) { liveMsg.textContent = text; liveMsg.hidden = false; }
-    else { liveMsg.hidden = true; }
-  }
-  function liveStop() {
-    if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
-    // 必须先 pause + 清 src + load()，否则浏览器会保持这条 HTTP 连接不断开，
-    // 后端就以为还有人看，一直编码下去
-    try { liveVideo.pause(); } catch (e) {}
-    liveVideo.removeAttribute('src');
-    try { liveVideo.load(); } catch (e) {}
-    liveVideo.hidden = true;
-    liveReported = false;
-  }
-  function liveStart() {
-    liveStop();
-    liveVideo.hidden = true;
-    liveSetMsg('正在连接画面…');
-    liveVideo.src = liveUrl();
-    // 分片 MP4 没有总时长，浏览器不会触发 load；能出画面的标志是
-    // loadedmetadata（moov 解析完）并且尺寸不为 0
-    var p = liveVideo.play();
-    if (p && p.catch) p.catch(function () {});  // 自动播放被拦时静默，muted 一般不会被拦
-    liveTimer = setTimeout(function () {
-      liveTimer = null;
-      if (!liveOn || liveVideo.videoWidth) return;
-      liveTries += 1;
-      if (liveTries <= 3) {
-        liveSetMsg('还没收到画面，正在重试（' + liveTries + '/3）…');
-        liveStart();
-      } else {
-        liveStop();
-        liveSetMsg('画面连接失败。确认已在游戏模式下，然后点「重连」。');
-      }
-    }, 8000);
-  }
-  liveVideo.addEventListener('loadedmetadata', function () {
-    if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
-    liveVideo.hidden = false;
-    liveSetMsg('');
-    liveTries = 0;
-    var w = liveVideo.videoWidth, h = liveVideo.videoHeight;
-    if (w && h) {
-      liveTitle.textContent = '实时画面 · ' + w + '×' + h;
-      // 分辨率由播放器报给后端一次，供 /api/stream/status 的角标使用
-      if (!liveReported) {
-        liveReported = true;
-        fetch('/api/stream/report?width=' + w + '&height=' + h
-              + '&token=' + encodeURIComponent(token), { method: 'POST' })
-          .catch(function () {});
-      }
-    }
-  });
-  // 断流：H.264 流断了 video 不一定会 error，表现为卡在最后一帧不再前进
-  liveVideo.addEventListener('stalled', function () {
-    if (liveOn) liveSetMsg('画面卡住了，可能游戏已退出。点「重连」再试。');
-  });
-  liveVideo.addEventListener('error', function () {
-    if (!liveOn) return;
-    liveStop();
-    liveSetMsg('这条画面流断了（游戏可能已退出）。点「重连」再试。');
-  });
-  function liveOpen() {
-    liveOn = true;
-    liveTries = 0;
-    liveView.classList.add('show');
-    liveStart();
-  }
-  liveClose = function () {
-    liveOn = false;
-    liveView.classList.remove('show');
-    liveStop();
-  };
-  btnLive.addEventListener('click', function () {
-    if (liveOn) { liveClose(); return; }
-    liveOpen();
-  });
-  document.getElementById('lvClose').addEventListener('click', function () { liveClose(); });
-  document.getElementById('lvReload').addEventListener('click', function () {
-    liveTries = 0;
-    liveStart();
-  });
-
-  // 拖动标题栏移动、拖右下角改大小（位置与尺寸记在 localStorage 里）
-  (function () {
-    var bar = liveView.querySelector('.lv-bar');
-    var grip = document.getElementById('lvGrip');
-    try {
-      var g = JSON.parse(localStorage.getItem('deckmeido_live_geom') || 'null');
-      if (g) {
-        if (g.left != null) { liveView.style.left = g.left + 'px'; liveView.style.right = 'auto'; }
-        if (g.top != null) { liveView.style.top = g.top + 'px'; liveView.style.bottom = 'auto'; }
-        if (g.width) liveView.style.width = g.width + 'px';
-      }
-    } catch (e) {}
-    function saveGeom() {
-      var r = liveView.getBoundingClientRect();
-      try {
-        localStorage.setItem('deckmeido_live_geom', JSON.stringify({
-          left: Math.round(r.left), top: Math.round(r.top), width: Math.round(r.width)
-        }));
-      } catch (e) {}
-    }
-    // mode: 'move' 挪位置 / 'resize' 改宽度（高度由 16:10 的宽高比跟着算）
-    function bindDrag(el, mode) {
-      el.addEventListener('pointerdown', function (e) {
-        if (e.target.closest('button')) return;
-        e.preventDefault();
-        var sx = e.clientX, sy = e.clientY;
-        var r = liveView.getBoundingClientRect();
-        function move(ev) {
-          if (mode === 'move') {
-            liveView.style.left = Math.max(0, r.left + ev.clientX - sx) + 'px';
-            liveView.style.top = Math.max(0, r.top + ev.clientY - sy) + 'px';
-            liveView.style.right = 'auto';
-            liveView.style.bottom = 'auto';
-          } else {
-            var w = Math.max(220, Math.min(r.width + ev.clientX - sx, window.innerWidth - 24));
-            liveView.style.width = w + 'px';
-          }
-        }
-        function up() {
-          document.removeEventListener('pointermove', move);
-          document.removeEventListener('pointerup', up);
-          saveGeom();
-        }
-        document.addEventListener('pointermove', move);
-        document.addEventListener('pointerup', up);
-      });
-    }
-    bindDrag(bar, 'move');
-    bindDrag(grip, 'resize');
-  })();
-
   // ---------- 图片 / 代码块 点开展示 ----------
-  var IS_NATIVE = new URLSearchParams(location.search).get('native') === '1';
   function openImage(url) {
     if (IS_NATIVE) {
       // 原生客户端：用系统默认工具打开（xdg-open → Gwenview 等）

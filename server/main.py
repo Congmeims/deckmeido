@@ -20,12 +20,12 @@ from pathlib import Path
 
 import tomllib
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Header, HTTPException, Depends, UploadFile, Response
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .llm import LLMClient
-from . import depcheck, memory, persona, power, singleton, stream, tools, updater
+from . import depcheck, memory, persona, power, singleton, tools, updater
 from .session_store import set_title as _set_title
 from .session_store import store
 from .session_store import SESSIONS_DIR as _sessions_dir
@@ -1137,6 +1137,19 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+
+async def _broadcast_pad_order(action: str):
+    """虚拟手柄建好/销毁时喊 QAM 插件去换 Steam 的控制器排序
+
+    排序状态只在 Steam 进程内存里，只能在 Steam 页面上下文里调
+    SteamClient.Input.SwapControllerOrder，所以真正干活的是插件前端；
+    这里只要把消息广播出去（插件后端收到后再转给它自己的前端）。
+    """
+    await manager.broadcast({"type": "pad_order", "action": action})
+
+
+tools.set_pad_order_hook(_broadcast_pad_order)
+
 # 设置页保存新令牌时的一次性通行证：允许旧令牌再完成这一次保存
 _pending_token: str | None = None
 
@@ -2053,44 +2066,18 @@ async def api_update_apply():
 async def api_restart():
     """重启核心（后端服务自身）
 
-    自己杀不掉自己又原地拉起来：进程一退，这条请求的连接就断了，
-    没人负责把它再启动一次。所以交给一个独立会话的 shell 去做：
-    等 0.5s 让接口先把 {"ok": true} 吐出去 → 杀掉当前进程 → 用同样的
-    启动参数重新拉起。前端收到响应后轮询 /api/version 等它回来。
-    日志继续追加到同一个文件，重启前后能连起来看。
+    这里**不能自己杀自己**。后端多半是被 Decky 插件用
+    `runuser -u deck -- <venv>/bin/python -m uvicorn ...` 降权拉起来的，
+    自己 `pkill -f 'uvicorn server.main:app'` 会把外层的 runuser 一起带走，
+    再用 nohup 就地拉起的那份既没有 runuser 包装、又跟插件失去联系，
+    结果就是旧进程没了、新进程没起来，重启变成「把后端关掉」。
+    而且插件是唯一知道完整启动命令的一方。
+
+    所以这里只表明「需要重启」，由调用方（插件）去执行。插件拿到的
+    `delegate: true` 就是让它走自己的 runuser 命令重放一遍。
+    直接 curl 这个接口不会真的重启，这也避免了误调用把服务弄挂。
     """
-    py = sys.executable or "python3"
-    # 沿用配置里的监听地址与端口，不写死：改了 config.toml 也能重启到正确位置
-    host = str(CFG["server"].get("host") or "0.0.0.0")
-    port = int(CFG["server"].get("port", 18765))
-    cmdline = [py, "-m", "uvicorn", "server.main:app",
-               "--host", host, "--port", str(port)]
-    log_file = str(INSTALL_DIR / "backend.log")
-    # 用 sh 拼命令行而不是传数组：这套东西要在 start_new_session 的子进程里跑，
-    # 中间要先 sleep 再 kill，必须是个 shell 才能串起来
-    script = (
-        "sleep 0.5; "
-        # 先按端口/命令行找到正在跑的那一份，整个进程组收掉，
-        # 否则 uvicorn 的 reload 子进程会变成孤儿继续占着端口
-        f"pkill -f 'uvicorn server.main:app' || true; "
-        "sleep 1; "
-        f"cd {INSTALL_DIR} && setsid nohup {' '.join(cmdline)} "
-        f">> {log_file} 2>&1 &"
-    )
-    sh = shutil.which("bash") or shutil.which("sh")
-    if not sh:
-        raise HTTPException(status_code=500, detail="找不到 sh/bash，无法重启")
-    try:
-        subprocess.Popen(
-            [sh, "-c", script],
-            cwd=str(INSTALL_DIR), stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"重启失败：{exc}")
-    print("[DeckMeido] 收到重启请求，0.5 秒后重启核心", file=sys.stderr)
-    return {"ok": True, "version": VERSION}
+    return {"ok": True, "version": VERSION, "delegate": True}
 
 
 # 后台自动检查升级：启动时查一次，之后每天一次；只提示，不自动安装
@@ -3256,40 +3243,6 @@ async def api_overlay_state(ack: int = 0, hidden: int = 1):
     return _overlay_state
 
 
-# ---------- 实时画面 ----------
-
-@app.get("/api/stream/status", dependencies=[Depends(check_token)])
-async def api_stream_status():
-    return stream.STREAM.status()
-
-
-@app.get("/api/stream")
-async def api_stream(token: str | None = Query(default=None),
-                     x_token: str | None = Header(default=None)):
-    """实时画面（H.264 / fragmented MP4）。
-
-    前端用 `<video src="/api/stream?token=…">` 边下边播：mp4mux 以分片模式输出，
-    moov 在最前面，浏览器拿到就能解。这条流必须挂令牌校验——否则等于
-    新开一个免密看屏入口。最后一条流断开时自动停掉 gst 管线，不空烧 CPU。
-    """
-    check_token(token, x_token)
-    # 起点失败（没有 gamescope 节点 / 缺编码器）要让前端知道原因，而不是挂一个黑框
-    if not stream.STREAM.running and not (await stream._gamescope_pw_node()):
-        raise HTTPException(status_code=503, detail="实时画面仅游戏模式可用（未找到 gamescope 节点）")
-    return StreamingResponse(
-        stream.STREAM.mp4(),
-        media_type="video/mp4",
-        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
-    )
-
-
-@app.post("/api/stream/report", dependencies=[Depends(check_token)])
-async def api_stream_report(width: int = Query(...), height: int = Query(...)):
-    """前端播放器解出实际分辨率后回报一次，供角标显示"""
-    stream.STREAM.set_size(width, height)
-    return {"ok": True}
-
-
 @app.on_event("startup")
 async def _boot_overlay():
     ensure_overlay()
@@ -3565,6 +3518,13 @@ async def run_agent(events: list[dict], extra_system: str = "",
                 events.append({"type": "thought", "text": reasoning})
 
             tool_calls = msg.get("tool_calls") or []
+            # 每轮模型返回都记一笔：这一步到底动没动手、动了什么。
+            # 「AI 说按了但游戏没反应」时，这条能立刻区分是模型没调工具
+            # （纯嘴上说），还是调了但注入没生效
+            print(f"[DeckMeido] 模型第 {round_no} 轮：工具 {len(tool_calls)} 个"
+                  + (f"（{'、'.join(c['function']['name'] for c in tool_calls)}）"
+                     if tool_calls else "，没有动手，直接作答")
+                  + f"，正文 {len(msg.get('content') or '')} 字")
             if not tool_calls:
                 # 续写后仍被截断：内容已经流式显示给用户了，别丢，末尾加一句说明
                 if msg.get("finish_reason") == "length":
@@ -3572,6 +3532,7 @@ async def run_agent(events: list[dict], extra_system: str = "",
                     note = ("\n\n（以上内容到了输出上限，续写也没能收尾；"
                             "要我接着写就说「继续」。）")
                     return (body + note) if body else note.strip()
+                print("[DeckMeido] 本轮收尾：模型没有再调用工具")
                 return msg.get("content") or "（没有回复内容）"
 
             # 带图这轮只答一次：模型拿到工具结果后常常再截一张确认，
@@ -3631,7 +3592,10 @@ async def run_agent(events: list[dict], extra_system: str = "",
                                              **ask, **_turn_tag()})
                     return q or "（想跟你确认一件事，但问题没写出来）"
 
-                needs_approval = name in tools.DANGEROUS
+                # 完全访问：用户已预先授权一切操作，连 gamepad / install_game 这些
+                # 往常必须点头的也不拦。只有升级例外 —— 它会让服务重启、对话中断，
+                # 属于「做完就跟当前这轮没关系了」的操作，无论什么模式都要确认
+                needs_approval = False if PERMISSION_MODE == "full" else name in tools.DANGEROUS
                 # 升级会让服务重启、对话中断，无论什么权限模式都要用户点头
                 if name == "self_update" and args.get("action") == "upgrade":
                     needs_approval = True
@@ -3653,6 +3617,8 @@ async def run_agent(events: list[dict], extra_system: str = "",
                                       "turn_id": store.turn.get("turn_id") or "",
                                       "client": store.turn.get("client") or "",
                                       "device": store.turn.get("device") or ""}
+                    print(f"[DeckMeido] 工具待确认 {name}（模式 {PERMISSION_MODE}）："
+                          f"{pending_action['description']}")
                     return f"我需要执行一个会影响设备的操作：\n\n**{pending_action['description']}**\n\n回复「确认」我就执行，说别的就当作取消。"
 
                 # 文件改动识别（run_command）

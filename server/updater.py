@@ -22,11 +22,14 @@ import json
 import os
 import re
 import shutil
+import socket
+import ssl
 import subprocess
 import tarfile
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -47,6 +50,57 @@ _KEEP_REL = (
     "RELEASE-NOTES.md",
 )
 _KEEP_PREFIX = ("server/sessions/", "server/uploads/", "server/static/shots/")
+
+
+# ---------- TLS ----------
+#
+# 镜像站是纯静态的发布目录，内容还带 sha256 校验，所以它的证书校验可以放宽：
+# 设备上常挂着代理（DeckyClash 之类）的 TUN 模式，DNS 被劫持到 198.18.0.0/15
+# 的 fake-ip 段，规则没匹配上的域名会被送进错误节点，回一张自签名的假证书
+# （实测 Subject/Issuer 全空、签名算法还是 MD5），校验必然失败。
+# 那种情况下与其让「检查更新」永久报错，不如连上去——包里内容仍按 sha256 验。
+#
+# GitHub 那条路不放宽：它的规则走真实节点，证书是好的，而且走 git 操作，
+# 没有 sha256 兜底，放宽了等于把代码来源的可靠性交出去。
+
+def _is_fake_ip(host: str) -> bool:
+    """解析结果落在 198.18.0.0/15：几乎可以确定是本机代理的 fake-ip 段"""
+    try:
+        addrs = {ai[4][0] for ai in socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)}
+    except (socket.gaierror, OSError):
+        return False
+    return any(a.startswith(("198.18.", "198.19.")) for a in addrs)
+
+
+def _mirror_ssl_context(host: str) -> ssl.SSLContext | None:
+    """镜像站用的 SSL 上下文：返回 None 表示走系统默认（严格校验）
+
+    只有确认出口是本机代理的 fake-ip 时才放宽，其它情况保持校验，
+    免得把正常的证书错误也一起吞掉。
+    """
+    if _is_fake_ip(host):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    return None
+
+
+def _brief(exc: Exception) -> str:
+    """异常压成一行，别把整串 traceback 塞进界面"""
+    text = str(exc) or exc.__class__.__name__
+    return text.replace("\n", " ")[:200]
+
+
+def _special_cert_note(exc: Exception, host: str) -> str:
+    """证书校验失败时给一句能看懂的说明，别把 OpenSSL 原文抛给用户"""
+    raw = _brief(exc)
+    if not isinstance(exc, ssl.SSLError) and "CERTIFICATE_VERIFY_FAILED" not in raw:
+        return raw
+    if "self-signed" in raw or "self signed" in raw:
+        return (f"{host} 返回了自签名证书，多半是本机代理（DeckyClash 之类）"
+                f"把这个域名送进了错误节点。在代理里给 {host} 加一条直连规则即可")
+    return f"{host} 证书校验失败（{raw}）"
 
 
 # ---------- 更新源配置 ----------
@@ -123,12 +177,13 @@ def ver_tuple(ver: str) -> tuple:
 
 # ---------- 查最新版本 ----------
 
-def _http_json(url: str, timeout: float = 10.0) -> dict:
+def _http_json(url: str, timeout: float = 10.0,
+               context: ssl.SSLContext | None = None) -> dict:
     req = urllib.request.Request(url, headers={
         "Accept": "application/json", "User-Agent": "DeckMeido",
         "Cache-Control": "no-cache",
     })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -141,13 +196,20 @@ def mirror_release(mirror: str | None = None) -> dict:
        "files": {"tarball": "deckmeido-0.2.0.tar.gz", "sha256": "..."}}
     """
     base = (mirror or update_cfg()["mirror"]).rstrip("/")
+    host = urllib.parse.urlsplit(base).hostname or ""
+    ctx = _mirror_ssl_context(host)
     try:
-        data = _http_json(f"{base}/latest.json")
+        data = _http_json(f"{base}/latest.json", context=ctx)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return {"tag": "", "name": "", "notes": "", "url": "", "published_at": ""}
         raise RuntimeError(f"镜像站查询失败（HTTP {exc.code}）")
+    except ssl.SSLError as exc:
+        raise RuntimeError(f"连不上镜像站：{_special_cert_note(exc, host)}")
     except (urllib.error.URLError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, ssl.SSLError):
+            raise RuntimeError(f"连不上镜像站：{_special_cert_note(reason, host)}")
         raise RuntimeError(f"连不上镜像站：{_brief(exc)}")
     except ValueError as exc:
         raise RuntimeError(f"镜像站返回的 latest.json 格式不对：{exc}")
@@ -190,12 +252,6 @@ def github_release(repo: str | None = None) -> dict:
         "published_at": data.get("published_at") or "",
         "source": "github",
     }
-
-
-def _brief(exc: Exception) -> str:
-    """异常压成一行，别把整串 traceback 塞进界面"""
-    text = str(exc) or exc.__class__.__name__
-    return text.replace("\n", " ")[:200]
 
 
 def latest_release() -> dict:
@@ -255,13 +311,19 @@ def _apply_mirror(info: dict, log_path: Path) -> str:
     if not url:
         raise RuntimeError("镜像站没有给出安装包地址（latest.json 缺 files.tarball）")
     _append_log(log_path, f"从镜像站下载：{url}\n")
+    host = urllib.parse.urlsplit(url).hostname or ""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "DeckMeido"})
-        with urllib.request.urlopen(req, timeout=180) as resp:
+        with urllib.request.urlopen(
+            req, timeout=180, context=_mirror_ssl_context(host)
+        ) as resp:
             blob = resp.read()
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"下载安装包失败（HTTP {exc.code}）：{url}")
     except (urllib.error.URLError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, ssl.SSLError):
+            raise RuntimeError(f"下载安装包失败：{_special_cert_note(reason, host)}")
         raise RuntimeError(f"下载安装包失败：{_brief(exc)}")
 
     expect = (info.get("sha256") or "").lower()

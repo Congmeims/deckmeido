@@ -55,7 +55,7 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 | 文件 | 目录浏览、按行读取、整体写入、精确替换（改代码优先用 `edit_file`） |
 | 网络 | 联网搜索、天气查询（联网搜索默认安装，`ddgs` 未装时会返回报错而不是静默失败） |
 | 主动提问 | `ask_user` 工具：模型拿不准时直接抛一个问题（可带最多 6 个选项）给界面，网页渲染成选项卡片，点一项就作为下一条消息发回去。这一轮随即收工，不需要另立「挂起」状态 |
-| 重启核心 | 网页设置页与 QAM 面板的「重启核心」走 `POST /api/restart`：接口先回 `{"ok": true}`，再由独立 shell 会话杀掉当前进程并按原监听地址/端口重新拉起，前端轮询 `/api/version` 等它回来 |
+| 重启核心 | QAM 面板的「重启核心」由插件自己执行：先按 `/proc` 里的 cmdline 精确杀掉后端进程（含外层 `runuser` 包装），等端口空出来，再用启动时那套 `runuser -u deck -- <venv>/bin/python -m uvicorn ...`（`cwd` 为安装目录）重新拉起，最后探一次 `/api/version` 确认回来了。`POST /api/restart` 只回 `{"ok": true, "delegate": true}`，不自杀——后端自己 `pkill` 会连外层 `runuser` 一起带走，就地拉起的那份又缺 `cwd`，结果就是「把后端关掉」 |
 
 ### 交互细节
 
@@ -67,7 +67,6 @@ DeckMeido 是一个跑在 Steam Deck 本机上的 AI 代理。它不是"另一�
 - **控件自检三态**：绿灯可用 / 红灯故障 / 灰灯「当前环境不适用」（如游戏模式下没有 KWin，`kdotool` 不再误报红灯）。灯色只统计真正需要工作的控件，游戏模式下显示为 `x/5` 而非 `x/6`
 - **权限三档**（作用于 `run_command`）：`manual` 每条命令都审批 / `auto` 只读自动、命中危险特征才确认 / `full` 完全放行。`write_file` / `edit_file` 不受此开关约束，任何模式下都直接落盘；`install_game` 与 `self_update upgrade` 无论模式如何都强制确认
 - **语音播报**：调用 Deck 内置 TTS，在掌机扬声器上念出回复；网页设置页与 QAM 面板的开关同步（`POST /api/tts` 热更新，不用重启）
-- **实时画面**：游戏模式下网页端可边下边播当前画面（gamescope 抓帧 → H.264 硬编 → 分片 MP4），面板可拖动缩放
 - **图片上传**：拖拽或点击上传，服务端按类型分类存储
 - **文件下载卡片**：回复里的工作区文件路径渲染成带大小与下载按钮的卡片（`/files/<相对路径>`，带令牌校验，只能下载工作区内的文件）
 - **分享为图片**：多选任意回合，勾选后生成长图，自动剔除思维链
@@ -349,7 +348,6 @@ deckmeido/
 │   ├── persona.py             人设存储（meidosoul.json：名字、称呼、语气、禁用词）
 │   ├── tools.py               工具定义与执行实现
 │   ├── overlay.py             半透明操作遮罩（PySide6）
-│   ├── stream.py              实时画面（gst 管线 + 分片 MP4）
 │   ├── tts.py                 espeak-ng 语音播报
 │   ├── power.py               任务期间抑制息屏与休眠
 │   ├── depcheck.py            系统控件自检（ydotool / kdotool / espeak-ng 等）
@@ -390,7 +388,6 @@ deckmeido/
 
 - **镜像覆盖升级** — 从 `latest.json` 下载 → sha256 → 解压覆盖 → 后台 `install.sh upgrade` 的整条链路，以及中途失败时 `update-backup-*.tar.gz` 的还原能力
 - **pip 测速选源** — `pick_pip_index()` 在 Deck 网络下的排序是否合理，某个源超时后能否顺利换到下一个
-- **实时画面编码器探测** — `_probe_encoder` 走 `vah264enc` 还是回落 `x264enc`，需要实际跑一次确认（`stream.py`）
 - **QAM 面板对话同步** — `ready()` 补发能否覆盖 Decky 重挂监听的时机；助手回复的来源在新旧会话混排时是否标对
 - **非 Steam 游戏名** — `compatdata` 目录名在 SteamOS 上是无符号还是带符号写法（已双向兜底）；网页游戏、原生 Linux 程序不走 Proton、没有 `STEAM_COMPAT_DATA_PATH` 时会拿不到名字
 
@@ -400,7 +397,6 @@ deckmeido/
   - 前置：**先做网络鉴权**。`:18765` 若不设令牌就监听 `0.0.0.0`，等于把「可执行命令」的入口开放给整个局域网
   - 已实测：切到 gamescope 后后端存活、`:18765` 正常监听、`ydotoold` 未断、QAM 的 WebSocket 连通
   - 定位：LLM 推理一来一回 1~3 秒，不适合动作游戏，适合「帮我跑日常 / 挂机刷素材」
-- **桌面模式实时画面** — 目前只支持游戏模式（gamescope PipeWire 节点），桌面模式还需走 portal ScreenCast
 - **QAM 的全局热键 / 独立截图按钮** — 全局热键会和 Steam 输入争抢，暂缓
 
 ### 待真机验证（补充）
