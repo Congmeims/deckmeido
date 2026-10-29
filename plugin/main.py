@@ -807,10 +807,12 @@ def _find_gst() -> str | None:
     return None
 
 
-async def _capture_once(node: str, gst: str, timeout: int = 12) -> tuple[bool, str]:
+async def _capture_once(node: str, gst: str, timeout: int = 12,
+                        quick: float = 0.0) -> tuple[bool, str]:
     """抓一帧，返回 (成功, base64 或错误说明)
 
     超时收在 12 秒：正常一帧只要 0.2 秒，真卡住时用户不该对着「思考中…」干等 25 秒。
+    quick > 0 时只等这么久就放弃，用来快速判断「画面是不是根本没在更新」。
     """
     tmp = Path("/tmp") / f"deckmeido_shot_{os.getpid()}_{next(_SHOT_SEQ)}.jpg"
     # 注意：pipewiresrc 的 path=... 不能和 num-buffers 塞进同一个 argv。
@@ -834,7 +836,9 @@ async def _capture_once(node: str, gst: str, timeout: int = 12) -> tuple[bool, s
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "XDG_RUNTIME_DIR": _runtime_dir()},
         )
-        _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        _, err = await asyncio.wait_for(
+            proc.communicate(), timeout=(quick if quick > 0 else timeout)
+        )
         if not tmp.exists() or tmp.stat().st_size < 10000:
             detail = (err or b"").decode("utf-8", "replace").strip()[-300:]
             decky.logger.warning(f"抓帧没拿到有效画面：{detail or '文件为空'}")
@@ -845,6 +849,9 @@ async def _capture_once(node: str, gst: str, timeout: int = 12) -> tuple[bool, s
         decky.logger.info(f"抓帧成功：{size} 字节")
         return True, data
     except asyncio.TimeoutError:
+        if quick > 0:
+            # 试抓没等到：多半是画面静止，交给上层推一下摇杆
+            return False, "没等到新帧"
         return False, f"抓帧超时（{timeout}s）"
     except Exception as exc:
         return False, f"抓帧出错：{exc}"
@@ -865,6 +872,15 @@ async def _capture_once(node: str, gst: str, timeout: int = 12) -> tuple[bool, s
 
 _SHOT_SEQ = itertools.count()
 _SHOT_LOCK = asyncio.Lock()
+
+# gamescope 只在画面内容变化时才往 PipeWire 投一帧。游戏画面静止（比如模拟器
+# 停在游戏列表、或者玩家不动）时，pipewiresrc 连上去会一直空等到超时——
+# 实测挂 60 秒一个 buffer 都没有，journal 里只有 streaming → paused。
+# 用户那边看到的「按一下摇杆就能截图了」就是这个原因。
+_POKE_WAIT = 1.5
+# 幅度压到 3%（约千分之一量程），拨 40ms 就回中：模拟器菜单里不会误触，
+# 3D 游戏里也就是视角极轻微地动一下。_poke_redraw 在虚拟手柄那段里定义。
+_POKE_AMT = 0.03
 
 
 async def _node_state_note() -> str:
@@ -891,10 +907,11 @@ async def _node_state_note() -> str:
 async def grab_screenshot() -> tuple[bool, str]:
     """抓一帧游戏画面，返回 (成功, base64 或错误说明)
 
-    写法和 server/tools.py 的 _screenshot_gamescope 保持一致：连抓两帧覆盖
-    同一个文件，拿到的是最后一帧（避免拿到刚切场景时的黑帧）。
-    第一次失败就重探一次节点再试 —— 节点 id 在游戏重启/切场景后可能变，
-    拿着旧 id 重试只会再超时一次，白白多等十几秒。
+    写法和 server/tools.py 的 _screenshot_gamescope 保持一致。
+    场景静止时 gamescope 不吐帧（见 _poke_redraw 的说明），所以流程是：
+      先试抓 1.5 秒 → 没等到就轻推一下摇杆 → 正式抓；
+    之后再失败就重探节点重试一次 —— 节点 id 在游戏重启/切场景后可能变，
+    拿着旧 id 重试只会再空等一轮。
     """
     node, why = await _gamescope_pw_node()
     if not node:
@@ -906,7 +923,11 @@ async def grab_screenshot() -> tuple[bool, str]:
 
     # 同一时刻只允许一个抓帧进程，否则前端连点会把 /tmp 搅乱
     async with _SHOT_LOCK:
-        ok, payload = await _capture_once(node, gst)
+        ok, payload = await _capture_once(node, gst, quick=_POKE_WAIT)
+        if not ok:
+            # 试抓没等到帧：画面静止，推一下摇杆逼它重绘再正式抓
+            await _poke_redraw()
+            ok, payload = await _capture_once(node, gst)
         if not ok:
             first = payload
             await asyncio.sleep(0.5)
@@ -1170,6 +1191,17 @@ class _Gamepad:
 
 
 _GAMEPAD = _Gamepad()
+
+
+async def _poke_redraw() -> None:
+    """轻推一下右摇杆再回中，逼 gamescope 重绘一帧（抓帧用，见 _POKE_WAIT）"""
+    try:
+        await _GAMEPAD.stick(_POKE_AMT, _POKE_AMT, side="right")
+        await asyncio.sleep(0.04)
+        await _GAMEPAD.stick(0.0, 0.0, side="right")
+        decky.logger.info("抓帧没等到画面，已轻推摇杆触发重绘")
+    except Exception as exc:
+        decky.logger.warning(f"摇杆触发重绘失败：{exc}")
 
 
 # ---------- 与后端 :18765 的通话 ----------

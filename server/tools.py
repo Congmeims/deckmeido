@@ -1560,6 +1560,65 @@ def _mode_probe_sync() -> bool:
     return _gamescope_pw_node_sync() is not None
 
 
+async def _gst_grab(node: str, raw: Path, uid: int, user: str,
+                    timeout: float) -> tuple[bool, str]:
+    """跑一次 gst-launch 把一帧写进 raw。返回 (成功, 错误文字)"""
+    env = dict(os.environ)
+    # 必须指向 gamescope 所属会话，不能是后端自己的 uid（root 时是 /run/user/0）
+    env["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
+    # gst-launch 把每个 argv 当成一个独立 token，元素名和属性必须分开传，
+    # 写成 "pipewiresrc path=78" 会被判成语法错误
+    cmd = [
+        "gst-launch-1.0", "-q", "pipewiresrc", f"path={node}", "num-buffers=2",
+        "do-timestamp=true", "!", "videoconvert", "!", "pngenc", "!",
+        "filesink", f"location={raw}",
+    ]
+    # root 跑时降权到会话用户：PipeWire 的 socket 权限按用户隔离，root 直连会被拒
+    if os.getuid() == 0 and uid != 0:
+        cmd = ["runuser", "-u", user, "--", *cmd]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=env,
+        )
+        try:
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            err_text = (err or b"").decode(errors="replace").strip()
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return False, ""  # 空字符串表示「就是没等到帧」，跟真正的报错区分开
+        if not _raw_ok(raw):
+            # gst 的具体报错比「失败了」有用得多，取最后一行
+            line = err_text.splitlines()[-1] if err_text else ""
+            return False, line or "（gst 没有输出错误信息）"
+        return True, ""
+    except Exception as exc:
+        return False, f"抓帧进程启动失败：{exc}"
+
+
+# 抓帧时「戳一下重绘」的摇杆幅度：3% 量程，拨 40ms 回中
+_POKE_AMT = 0.03
+
+
+async def _poke_redraw() -> None:
+    """让画面动一下，逼 gamescope 吐帧
+
+    gamescope 只在画面内容变化时才往 PipeWire 投帧。游戏静止时（模拟器停在
+    列表页、玩家没在操作）pipewiresrc 连上去会一直空等到超时——实测挂 60 秒
+    一帧都没有，journal 里只有 streaming → paused。
+
+    这里轻推一下右摇杆再回中（幅度 3%，拨 40ms）：模拟器菜单里相当于没动，
+    3D 游戏里就是视角极轻微晃一下。用后端自己那套 uinput 虚拟手柄，不依赖
+    xdotool 和 DISPLAY。
+    """
+    try:
+        await _PAD.stick(_POKE_AMT, _POKE_AMT, "right")
+        await asyncio.sleep(0.04)
+        await _PAD.stick(0.0, 0.0, "right")
+    except Exception:
+        pass
+
+
 async def _screenshot_gamescope(path: Path) -> str:
     """游戏模式：从 gamescope 的 PipeWire 视频节点抓一帧，成功返回空串，失败返回原因
 
@@ -1576,43 +1635,19 @@ async def _screenshot_gamescope(path: Path) -> str:
     if not sess:
         return "找不到 gamescope 所在的用户会话（/run/user/* 下没有活的图形会话）"
     uid, user = sess
-    env = dict(os.environ)
-    # 必须指向 gamescope 所属会话，不能是后端自己的 uid（root 时是 /run/user/0）
-    env["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
     raw = path.with_suffix(".raw.png")
-    # gst-launch 把每个 argv 当成一个独立 token，元素名和属性必须分开传，
-    # 写成 "pipewiresrc path=78" 会被判成语法错误
-    cmd = [
-        "gst-launch-1.0", "-q", "pipewiresrc", f"path={node}", "num-buffers=2",
-        "do-timestamp=true", "!", "videoconvert", "!", "pngenc", "!",
-        "filesink", f"location={raw}",
-    ]
-    # root 跑时降权到会话用户：PipeWire 的 socket 权限按用户隔离，root 直连会被拒
-    if os.getuid() == 0 and uid != 0:
-        cmd = ["runuser", "-u", user, "--", *cmd]
-    err_text = ""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=env,
-        )
-        try:
-            _, err = await asyncio.wait_for(proc.communicate(), timeout=12)
-            err_text = (err or b"").decode(errors="replace").strip()
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            return "抓帧超时（12 秒内 gamescope 没吐出画面，游戏可能正在切场景或已挂起）"
-        if not _raw_ok(raw):
-            # gst 的具体报错比「失败了」有用得多，取最后一行
-            line = err_text.splitlines()[-1] if err_text else ""
-            return "抓帧没拿到有效图像" + (f"：{line}" if line else "（gst 没有输出错误信息）")
-        # pngenc 连续 6 帧会覆盖同一文件，取到的就是最后一帧，直接搬过来
-        raw.replace(path)
-        return ""
-    except Exception as exc:
-        return f"抓帧进程启动失败：{exc}"
-    finally:
-        raw.unlink(missing_ok=True)
+    # 先试抓 1.5 秒：画面在动就立刻拿到，静止才走下面的「戳一下重绘」
+    ok, err_text = await _gst_grab(node, raw, uid, user, timeout=1.5)
+    if not ok and not err_text:
+        await _poke_redraw()
+        ok, err_text = await _gst_grab(node, raw, uid, user, timeout=12)
+        if not ok and not err_text:
+            return "抓帧超时（画面一直没有变化，推了一下画面也没等到新帧）"
+    if not ok:
+        return "抓帧没拿到有效图像" + (f"：{err_text}" if err_text else "")
+    # pngenc 连续多帧会覆盖同一文件，取到的就是最后一帧，直接搬过来
+    raw.replace(path)
+    return ""
 
 
 # ---------- 虚拟手柄（uinput） ----------
@@ -1872,11 +1907,19 @@ async def _screenshot() -> str:
     """截取当前画面（游戏模式走 gamescope 的 PipeWire 节点，桌面模式用 spectacle/mss）"""
     shots_dir = Path(__file__).resolve().parent / "static" / "shots"
     shots_dir.mkdir(exist_ok=True)
-    # 只保留最近 20 张截图
+    # 历史里只留 [SHOT:文件名] 标记，发给模型时才按文件名回读（_shot_ref_content），
+    # 所以这里删掉的文件不只是「看不到了」，模型也读不到那张图了。
+    # 以前只留 20 张，模型连截几十张就会把较早的那张删掉，历史里那条提问
+    # 静默变成「界面破图 + 模型少看一张」。门槛提到和随附画面一致。
     old = sorted(shots_dir.glob("shot_*.png"), key=lambda p: p.stat().st_mtime)
-    for p in old[:-20]:
+    for p in old[:-900]:
         p.unlink(missing_ok=True)
-    name = f"shot_{int(time.time())}.png"
+    # vision_*.jpg 每截一张生成一份，以前从没清过，跑久了 shots/ 会被它们塞满
+    old_v = sorted(shots_dir.glob("vision_*.jpg"), key=lambda p: p.stat().st_mtime)
+    for p in old_v[:-900]:
+        p.unlink(missing_ok=True)
+    # 微秒级：同一秒内连截两张会互相覆盖
+    name = f"shot_{int(time.time() * 1_000_000)}.png"
     path = shots_dir / name
 
     # 每次截图先把上一次的状态清干净，否则「上一张成功、这一张失败」时
@@ -1935,11 +1978,16 @@ async def _finish_shot(path: Path, name: str, shots_dir: Path, time_mod) -> str:
         from PIL import Image
         img = Image.open(path)
         img.thumbnail((1280, 1280))
-        vpath = shots_dir / f"vision_{int(time_mod.time())}.jpg"
+        vpath = shots_dir / f"vision_{int(time_mod.time() * 1_000_000)}.jpg"
         img.convert("RGB").save(vpath, "JPEG", quality=70)
         holder["vision"] = vpath
-    except Exception:
-        pass
+    except Exception as e:
+        # 以前这里是静默 pass：PIL 没装或图坏了，模型就收不到画面，
+        # 但工具结果照样说「当前画面已附上」，排查时无从下手
+        holder["error"] = f"画面压缩失败（{e!r}）"
+        return (f"截图完成：/shots/{name}，但压缩给模型看的那份失败了"
+                f"（{holder['error']}）。这次你收不到画面，"
+                "请直接告诉用户没看到图，不要凭空描述屏幕内容。")
     return f"截图完成：/shots/{name}。当前画面已附上，你可以直接根据画面内容回答用户的问题。"
 
 
