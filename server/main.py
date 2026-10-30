@@ -1145,6 +1145,8 @@ async def _broadcast_pad_order(action: str):
     SteamClient.Input.SwapControllerOrder，所以真正干活的是插件前端；
     这里只要把消息广播出去（插件后端收到后再转给它自己的前端）。
     """
+    n = len(manager.active)
+    print(f"[DeckMeido] 广播手柄换序 {action} → {n} 个客户端")
     await manager.broadcast({"type": "pad_order", "action": action})
 
 
@@ -1517,6 +1519,206 @@ async def api_files():
     except OSError:
         pass
     return {"workspace": str(tools.WORKSPACE), "files": out}
+
+
+# 文件浏览器预览用的分类。只影响面板里显示什么图标、用哪种方式预览，
+# 和「能不能读」无关，所以放成白名单也无所谓
+_KIND_MAP = {
+    "image": {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".avif", ".ico"},
+    "video": {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi", ".ogv"},
+    "audio": {".mp3", ".flac", ".wav", ".ogg", ".m4a", ".aac", ".opus", ".oga"},
+    "pdf": {".pdf"},
+    "text": {".txt", ".md", ".log", ".csv", ".json", ".toml", ".ini", ".cfg", ".yml",
+             ".yaml", ".xml", ".html", ".css", ".js", ".ts", ".py", ".sh", ".c", ".h",
+             ".cpp", ".rs", ".go", ".java", ".sql", ".conf", ".srt", ".desktop"},
+}
+
+
+def _file_kind(name: str) -> str:
+    ext = os.path.splitext(name)[1].lower()
+    for kind, exts in _KIND_MAP.items():
+        if ext in exts:
+            return kind
+    return "other"
+
+
+@app.get("/api/preview", dependencies=[Depends(check_token)])
+async def api_preview(path: str, raw: int = 0):
+    """给文件浏览器预览用：吐任意路径的文件
+
+    和 /files/{path} 不一样：那个锁死在工作区里，只给对话附件用；
+    面板要能预览 AI 正在看的任何目录，所以这里认绝对路径。
+    默认回 JSON（元信息 + 文本前 64KB，前端一次拿齐）；
+    raw=1 时直接回文件本体，给 <img>/<video>/<audio>/<iframe> 用——
+    视频/音频要能拖进度条就得支持 Range，所以走 FileResponse。
+    """
+    try:
+        target = Path(path).expanduser().resolve()
+    except OSError:
+        raise HTTPException(status_code=404, detail="file not found")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    if raw:
+        # FileResponse 自带 Range / ETag 处理，浏览器可以边下边播
+        return FileResponse(target)
+    kind = _file_kind(target.name)
+    try:
+        stat = target.stat()
+    except OSError:
+        raise HTTPException(status_code=404, detail="file not found")
+    info = {"path": str(target), "name": target.name, "kind": kind,
+            "size": stat.st_size, "mtime": stat.st_mtime}
+    if kind == "text":
+        try:
+            info["text"] = target.read_bytes()[:65536].decode("utf-8", "replace")
+        except OSError as e:
+            info["error"] = f"读取失败：{e}"
+    return info
+
+
+@app.get("/api/browse", dependencies=[Depends(check_token)])
+async def api_browse(path: str = ""):
+    """列单层目录内容（右侧文件浏览器用）
+
+    与 /api/files 的区别：那个只吐工作区里的文件、一次全量；这里要能浏览
+    任意目录（AI 可能在看 /home/deck/xxx），所以只列一层、按需展开。
+    路径不存在或没权限时返回 error，前端显示成一行提示而不是整块报错。
+    """
+    raw = (path or "").strip()
+    # 不传 path 就回到工作区，用户第一次打开面板看到的是自己的工作区
+    target = Path(raw).expanduser() if raw else tools.WORKSPACE
+    if not target.is_absolute():
+        # 相对路径一律相对工作区解释，避免 cwd 变化导致行为漂移
+        target = tools.WORKSPACE / target
+    # AI 给的是文件路径时列它所在的目录并把它标出来，面板据此高亮；
+    # 联动事件里不带 is_dir 也能靠这个兜住
+    select = ""
+    try:
+        target = target.resolve()
+        if target.is_file():
+            select = target.name
+            target = target.parent
+    except OSError:
+        return {"path": raw, "parent": None, "entries": [], "error": "路径无效"}
+    if not target.is_dir():
+        return {"path": str(target), "parent": None, "entries": [],
+                "error": "目录不存在或不是文件夹"}
+    entries = []
+    try:
+        with os.scandir(target) as it:
+            for e in it:
+                try:
+                    is_dir = e.is_dir(follow_symlinks=False)
+                except OSError:
+                    is_dir = False
+                item = {"name": e.name, "dir": is_dir}
+                if not is_dir:
+                    # kind 给前端挑图标和预览方式用（image/video/audio/pdf/text/other）
+                    item["kind"] = _file_kind(e.name)
+                    try:
+                        item["size"] = e.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        pass
+                entries.append(item)
+    except PermissionError:
+        return {"path": str(target), "parent": None, "entries": [],
+                "error": "没有权限读取这个目录"}
+    except OSError as e:
+        return {"path": str(target), "parent": None, "entries": [],
+                "error": f"读取失败：{e}"}
+    # 文件夹在前、同类按名字排，隐藏文件照样列出（用户可能就是要看 .config）
+    entries.sort(key=lambda x: (not x["dir"], x["name"].lower()))
+    parent = str(target.parent) if str(target.parent) != str(target) else None
+    return {"path": str(target), "parent": parent, "entries": entries, "select": select}
+
+
+@app.get("/api/terminal", dependencies=[Depends(check_token)])
+async def api_terminal():
+    """当前正在跑（或刚跑完）的那条命令，给右侧终端面板轮询
+
+    只返回最近一条：历史在面板本地攒。没有命令时 state 为 null。
+    """
+    return {"state": tools.CURRENT_CMD}
+
+
+@app.post("/api/terminal/stop", dependencies=[Depends(check_token)])
+async def api_terminal_stop():
+    """终止面板里正在跑的那条命令（小窗上的终止按钮）
+
+    先砍进程树（按登记表），再取消正在等它的对话轮次。不 cancel 的话，
+    /api/terminal/run 那个请求会一直挂在里面等子进程，前端按钮永远转圈；
+    但它可能是用户自己敲的，没有对话轮次可取消，所以这一步允许为空。
+    """
+    killed = await tools.abort_all_procs()
+    if current_task and not current_task.done():
+        current_task.cancel()
+        set_overlay(False)
+    return {"ok": True, "killed": killed}
+
+
+# 面板自己敲的命令：和白名单无关，但同样要过危险判定，
+# 用户手动敲的也按当前权限模式审批，避免网页端变成绕过审批的后门
+_term_lock: asyncio.Lock | None = None
+
+
+def _term_lock_get() -> asyncio.Lock:
+    """惰性建锁：模块导入时还没有事件循环，提前 new 出来会绑到错的循环上"""
+    global _term_lock
+    if _term_lock is None:
+        _term_lock = asyncio.Lock()
+    return _term_lock
+
+
+@app.post("/api/terminal/input", dependencies=[Depends(check_token)])
+async def api_terminal_input(payload: dict):
+    """把面板里敲的按键交给正在跑的那条 tty 命令（ncdu / top / vim 的键盘）
+
+    前端只负责把按键翻成终端转义序列（方向键是 ESC [ A 这种），这里原样写进
+    子进程的 stdin，不走审批：这是用户已经批准过的那条命令的运行时输入。
+    """
+    data = str(payload.get("data") or "")
+    if not data:
+        return {"ok": False, "written": False}
+    ok = await tools.feed_tty_input(data)
+    return {"ok": True, "written": ok}
+
+
+@app.post("/api/terminal/run", dependencies=[Depends(check_token)])
+async def api_terminal_run(payload: dict):
+    """面板里手动执行一条命令（终端 tab 的输入框）"""
+    cmd = str(payload.get("command") or "").strip()
+    if not cmd:
+        raise HTTPException(status_code=400, detail="命令为空")
+    # 和对话里同一个审批通道：手动模式一律先问，智能模式只拦危险命令，
+    # 完全访问直接跑。面板不能变成绕过审批的后门，但也不该自己发明一套规则
+    needs_approval = (PERMISSION_MODE == "manual"
+                      or (PERMISSION_MODE == "auto" and tools.is_dangerous(cmd)))
+    if needs_approval:
+        # 挂进和对话同一份 pending_action，之后由对话里那句「确认」放行
+        global pending_action
+        args = {"command": cmd, "reason": "终端面板手动执行"}
+        pending_action = {"name": "run_command", "args": args,
+                          "description": tools.describe("run_command", args),
+                          "sid": store.current_sid, "epoch": store.epoch,
+                          "turn_id": store.turn.get("turn_id") or "",
+                          "client": store.turn.get("client") or "",
+                          "device": store.turn.get("device") or ""}
+        return {"ok": False, "pending": True,
+                "description": pending_action["description"]}
+    # 串行执行：面板和后端共用一份 CURRENT_CMD，两条命令并行会互相覆盖状态
+    lock = _term_lock_get()
+    if lock.locked():
+        raise HTTPException(status_code=409, detail="上一条命令还在执行")
+    async with lock:
+        try:
+            # tty=True：面板里敲的命令起伪终端。不开的话 stdin 是 /dev/null，
+            # 编辑器、ssh、带确认的安装器都会报「stdin is not a TTY」直接退出
+            out = await tools.execute("run_command",
+                                      {"command": cmd, "reason": "面板手动执行", "tty": True})
+        except Exception as e:
+            return {"ok": False, "output": f"执行失败：{e}"}
+    # 面板靠轮询 /api/terminal 收尾，这里顺带把最终状态带回去，省一次往返
+    return {"ok": True, "output": out, "state": tools.CURRENT_CMD}
 
 
 @app.get("/files/{path:path}", dependencies=[Depends(check_token)])
@@ -3627,10 +3829,38 @@ async def run_agent(events: list[dict], extra_system: str = "",
                 summary = tools.summarize_tool(name, args)
                 event = {"type": "tool", "name": name, "label": label,
                          "summary": summary, "files": files}
+                # 路径一律给全：AI 给的常常是相对工作区的路径，面板直接拿去
+                # 跳目录会落到后端进程的 cwd 上（一般是家目录），跟 AI 看的地方对不上
                 if name in ("read_file", "write_file", "edit_file", "list_dir"):
-                    event["path"] = str(args.get("path", ""))
+                    raw_path = str(args.get("path", ""))
+                    if raw_path:
+                        # 相对路径按工作区解释（和文件工具一致），不按后端 cwd
+                        p = Path(raw_path).expanduser()
+                        event["path"] = str(p if p.is_absolute() else tools.WORKSPACE / p)
                 activity = f"正在{label}：{summary}" if summary else f"正在{label}"
                 await manager.broadcast({"type": "tool_activity", "text": activity, "ts": time.time(), **_turn_tag()})
+                # 终端联动：必须在执行之前推「开跑」，面板据此立刻挂一条执行中的记录
+                # 并开始轮询实时输出。放到执行后面就只剩「已结束」一条，
+                # 执行中的动画和进度全看不见了
+                if name == "run_command" and str(args.get("command") or "").strip():
+                    claim = tools.CURRENT_CMD
+                    await manager.broadcast({"type": "term_start",
+                                             "command": str(args.get("command")),
+                                             "reason": str(args.get("reason") or ""),
+                                             "cwd": (claim or {}).get("cwd", ""),
+                                             "track": bool(claim and claim.get("command") == args["command"]),
+                                             # 面板记下推送时刻，用来对齐轮询拿到的 started：
+                                             # 对不上说明这条命令已经跑完、CURRENT_CMD 换了，
+                                             # 别把它当成还在执行的那条一直转圈
+                                             "ts_sent": time.time(),
+                                             "ts": time.time(), **_turn_tag()})
+                # 文件浏览器联动：凡是带路径的工具都推一条，面板据此自动跳目录。
+                # 只推路径不推内容 —— 面板自己再走 /api/browse 取，权限和越界检查
+                # 都留在那一个接口里
+                if event.get("path"):
+                    await manager.broadcast({"type": "fs_follow", "path": event["path"],
+                                             "is_dir": name == "list_dir",
+                                             "ts": time.time(), **_turn_tag()})
                 # 遮罩只在真的要动屏幕的这一步亮起（见上面 handle_chat 里的说明）。
                 # 放在真正执行前才 set_overlay(True)：鼠标注入期间 tools 会让遮罩
                 # 穿透（set_overlay_passthrough），否则那一下点击会点在遮罩上

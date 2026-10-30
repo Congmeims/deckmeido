@@ -1750,14 +1750,15 @@ async def _read_loop(bk: _Backend):
             _BACKEND = None
             _STREAM_RUNNING = False
             decky.logger.info(f"准备重连后端（{delay:.0f}s 后）")
-            new = await _reconnect(delay)
-            if new is None:
+            # 退避重连：成功才换 bk，失败就继续退避再试。
+            # 以前失败时换了一个没连上的新对象，下一轮 recv 立刻抛
+            # 'NoneType' object has no attribute 'recv'，日志到这里就断了，
+            # 之后再也不会重连——插件从此永久掉线。
+            while True:
+                new = await _reconnect(delay)
+                if new is not None:
+                    break
                 delay = min(delay * 2, 30.0)
-                # 重连没成功，bk 还是那条断掉的连接：必须换一条新的去试，
-                # 否则下一轮 while 又拿旧对象 recv，只会一路 "NoneType ... recv"
-                # 死循环，日志里也就停在第一次失败那一行，之后再没动静
-                bk = _Backend(_backend_url(*_backend_addr()))
-                continue
             delay = 1.0
             bk = new
             continue
@@ -1783,7 +1784,9 @@ async def _read_loop(bk: _Backend):
             # 虚拟手柄的换序请求：全局广播、不属于某一轮，所以也要放在 sid 过滤前。
             # 排序状态只在 Steam 进程里，后端改不了，只能交给前端去调
             # SteamClient.Input.SwapControllerOrder（详见前端 swapPadOrder）
-            _emit({"kind": "pad_order", "action": str(msg.get("action") or "")})
+            act = str(msg.get("action") or "")
+            decky.logger.info(f"收到后端 pad_order/{act}，转给前端")
+            _emit({"kind": "pad_order", "action": act})
             continue
         if typ == "user_message":
             item = {
@@ -2054,6 +2057,10 @@ class Plugin:
         token = str(cfg.get("token", "") or "").strip()
         node, why = await _gamescope_pw_node()
         core = await _core_status(port, token)
+        # 后端在、但插件这边没连着（比如后端重启过）就顺手补一条：
+        # 换序这类全局广播全靠这条长连接，断了就静默丢消息
+        if core.get("ok") and _BACKEND is None:
+            await self._stay_connected()
         prefs = await _core_prefs(port, token) if core.get("ok") else {}
         # 查游戏名要扫进程表、读 Steam 日志，放线程里做：面板一刷新就调这个接口，
         # 同步跑会把 Decky 的事件循环卡住
@@ -2492,14 +2499,33 @@ class Plugin:
             core = await _core_http(port, token, "GET", "/api/status", timeout=2.0)
             if core.get("ok"):
                 decky.logger.info(f"后端已在运行 :{port}，无需自动启动")
+                await self._stay_connected()
                 return
             decky.logger.info(f"自动启动后端 :{port}（第 {attempt}/{retries} 次）")
             ok, why = await _start_backend(port)
             if ok:
                 decky.logger.info(f"后端已自动启动 :{port}")
+                await self._stay_connected()
                 return
             decky.logger.warning(f"自动启动后端失败（第 {attempt} 次）：{why}")
         decky.logger.error("自动启动后端多次失败，需要用户在面板上手动启动")
+
+    async def _stay_connected(self) -> None:
+        """插件加载后就把 WS 连上，并一直保持
+
+        以前只在面板打开会话 / 发消息时才连，于是「AI 调工具时没人连在后端」
+        很常见：后端广播的 pad_order 这类全局事件就全丢了（手柄换序一直不生效
+        就是这么来的）。这里主动连一条，断了由 _read_loop 自己重连。
+        """
+        try:
+            bk, why = await _ensure_backend()
+        except Exception as exc:
+            decky.logger.warning(f"插件加载后连接后端失败：{exc}")
+            return
+        if bk is None:
+            decky.logger.warning(f"插件加载后连接后端失败：{why}")
+        else:
+            decky.logger.info("插件加载后已连上后端，等待推送")
 
     async def _unload(self):
         await _drop_backend()

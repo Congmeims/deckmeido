@@ -262,6 +262,13 @@
   .msg pre { background: var(--code-bg); padding: 10px 12px; border-radius: 8px; overflow-x: auto; margin: 6px 0; font-size: 13px; }
   .msg code { background: var(--code-bg); padding: 2px 6px; border-radius: 5px; font-size: 13px; font-family: ui-monospace, monospace; }
   .msg pre code { background: none; padding: 0; }
+  /* 用户气泡是蓝底：里面的行内代码/代码块若还用主题的代码底色，
+     浅色主题下就是「浅灰块 + 继承来的白字」，整段看不见。
+     这里单独给一套半透明白底 + 白字，两个主题下都成立 */
+  .msg.user code { background: rgba(255, 255, 255, .22); color: #fff; }
+  .msg.user pre { background: rgba(255, 255, 255, .16); color: #fff; }
+  .msg.user pre code { background: none; color: #fff; }
+  .msg.user h3, .msg.user h4, .msg.user a { color: #fff; }
   .msg h3, .msg h4 { margin: 8px 0 4px; color: var(--brand); }
   .msg ul { padding-left: 20px; margin: 4px 0; }
   .msg a { color: var(--brand); }
@@ -523,7 +530,15 @@
     height: 34px; border: 1px solid var(--line); border-radius: 10px;
     background: var(--surface-2); color: var(--muted);
     font-size: 12.5px; padding: 0 8px; outline: none; max-width: 130px;
+    /* 不加 appearance 的话，浏览器会用原生控件外观自己画底，CSS 的
+       border-radius 会被盖掉，看起来就是方的 */
+    -webkit-appearance: none; -moz-appearance: none; appearance: none;
+    padding-right: 26px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%238b91a3'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 9px center;
+    cursor: pointer;
   }
+  .cb-select:hover { color: var(--text); }
   /* 模型名普遍较长，单独放宽；窄屏时由下面的媒体查询改成可收缩 */
   #modelSelect {
     max-width: none; width: 240px; min-width: 180px; flex: 0 1 auto;
@@ -924,6 +939,10 @@
     border: 1px solid var(--line); border-radius: 10px;
     background: var(--surface-2); color: var(--text);
     font-size: 15px; font-family: inherit; outline: none;
+    -webkit-appearance: none; -moz-appearance: none; appearance: none;
+    padding-right: 34px; cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%238b91a3'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 13px center;
   }
   .cfg-select:focus, .field input:focus, .field textarea:focus, .mem-add input:focus {
     border-color: var(--brand);
@@ -969,6 +988,10 @@
     border: 1px solid var(--line); border-radius: 10px;
     background: var(--surface-2); color: var(--text); font-size: 13px;
     font-family: inherit; outline: none;
+    -webkit-appearance: none; -moz-appearance: none; appearance: none;
+    padding-right: 28px; cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%238b91a3'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 10px center;
   }
   .mem-kind:focus { border-color: var(--brand); }
   /* 和输入框一样高：用 stretch 对齐，不再写死 44px */
@@ -1058,19 +1081,95 @@
   ::-webkit-scrollbar-thumb:hover { background: var(--sb-thumb-hover); background-clip: content-box; }
   ::-webkit-scrollbar-corner { background: transparent; }
   #app { display: flex; height: 100dvh; }
-  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; height: 100dvh; }
+  /* 三栏按 1.5:6.25:2.25 分宽度（左会话 / 中对话 / 右工具），合计 10 →
+     15% / 62.5% / 22.5%。
+     宽度写在 flex-basis 的百分比上、grow 只给中间栏：这样某一侧折叠后腾出来的
+     空间全归中间，另一侧纹丝不动。若三栏都用 basis:0 + grow 按比例分，
+     折叠右边会让左边跟着变宽——那不是我们要的 */
+  /* grow:1 —— 侧栏折叠腾出的空间全归它；未折叠时三栏 basis 合计正好 100%，
+     没有剩余可分，它就停在 62.5% 上 */
+  #main { flex: 1 1 62.5%; display: flex; flex-direction: column; min-width: 0; height: 100dvh; }
   /* 对话视图是 #main 里的一层包装（进设置时整块藏起来）。它必须自己撑满并继续
      纵向 flex，否则只是个普通块：消息区的 flex:1 失效塌成 0，输入框被顶到顶上 */
   #chatView { flex: 1; display: flex; flex-direction: column; min-height: 0; }
   #sidebar {
-    width: 240px; flex: 0 0 auto;
+    /* grow:0 —— 侧栏不参与剩余空间分配，宽度只由 basis 决定 */
+    flex: 0 0 15%; min-width: 0;
     background: var(--surface);
     border-right: 1px solid var(--line);
     display: flex; flex-direction: column;
+    transition: flex-basis .18s ease;
+    overflow: hidden;
   }
-  /* 系统状态卡 */
+  /* 桌面端折叠：只留一条 44px 的窄条，里面竖着放「会话」按钮。
+     改成 flex 比例后宽度由 flex-basis 说了算，这里要压的是 basis，
+     只写 width 会被 flex-basis 顶掉 */
+  body.sb-collapsed #sidebar { flex: 0 0 44px; }
+  body.sb-collapsed .sb-body { display: none; }
+  /* 顶栏（设备名那条）不在 .sb-body 里，折叠时要单独收掉，
+     否则窄条上方会残留一条 45px 的横条 */
+  body.sb-collapsed .sb-head { display: none; }
+  /* 折叠要包一层：.sb-body 自己也得是纵向 flex 并撑满，
+     否则里面的 .sb-sess-block(flex:1) 会退化成普通块，会话列表不再滚动。
+     折叠时正文整块 display:none，所以不会丢掉里面的滚动位置 */
+  .sb-body { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  /* 折叠态的那条：竖排的「会话」按钮，点一下展开。
+     左右内边距写死 8px（不用 align-items:center）：栏宽 44px 里有 1px 是
+     右边框，居中算出来是 9/10 不对称，和右栏那条（10/9）正好反着。
+     写死后两侧都是「离边缘 8px + 1px 边框」，互为镜像 */
+  #sbRail {
+    display: none; width: 100%; flex: 0 0 auto;
+    flex-direction: column; align-items: stretch; gap: 8px;
+    padding: 8px; box-sizing: border-box;
+    border-bottom: 1px solid var(--line);
+  }
+  body.sb-collapsed #sbRail { display: flex; }
+  #sbRail button, #sbRail .side-toggle { align-self: center; }
+  #sbRail .rail-txt { align-self: center; }
+  /* 不带 .side-toggle 的才走旧尺寸（历史按钮），统一过的新按钮由
+     .side-toggle 说了算，否则两边折叠态的按钮一大一小 */
+  #sbRail button:not(.side-toggle) {
+    border: none; background: var(--surface-2); color: var(--muted);
+    width: 28px; height: 28px; border-radius: 8px; cursor: pointer;
+    font-size: 13px; line-height: 1; padding: 0;
+  }
+  #sbRail button:not(.side-toggle):hover { background: var(--hover); color: var(--text); }
+  #sbRail .rail-txt {
+    writing-mode: vertical-rl; letter-spacing: .16em;
+    font-size: 12px; color: var(--muted);
+  }
+  #sidebar .sys-card { position: relative; }
+  /* 两侧折叠按钮共用一套：同尺寸同圆角同反馈，各自钉在栏顶那一行的
+     最外侧端，两边互为镜像。箭头字符由 JS 按状态换（◀ / ▶），
+     不用 rotate 翻转——那会和 :active 的缩放互相覆盖 */
+  .side-toggle {
+    flex: 0 0 auto;
+    width: 26px; height: 26px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border: 1px solid var(--line); background: var(--surface-2); color: var(--muted);
+    border-radius: 8px; cursor: pointer;
+    font-size: 11px; line-height: 1; padding: 0;
+    transition: background .15s ease, color .15s ease, transform .12s ease;
+  }
+  .side-toggle:hover { background: var(--hover); color: var(--text); }
+  .side-toggle:active { transform: scale(.9); }
+  #sbToggle:hover { background: var(--hover); color: var(--text); }
+  /* 左栏顶栏：45px 高，与中间 header、右栏 #rbHead 完全齐平。
+     原来设备名是 sys-card 内的第一行，被 14px 内边距压到 y=14，
+     比另外两栏矮一截；现在提成独立一条，三栏顶边在同一水平线上。
+     高度写死后内边距只管左右，内容靠 align-items:center 垂直居中 */
+  .sb-head {
+    flex: 0 0 auto; height: 45px; box-sizing: border-box;
+    display: flex; align-items: center; gap: 8px;
+    /* 左右内边距对称（与右栏 #rbHead 的 0 8px 一致），按钮才能贴到最左边缘 */
+    padding: 0 8px; border-bottom: 1px solid var(--line);
+    font-size: 14px; font-weight: 600;
+  }
+  .sb-head .sys-title { display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1; }
+  .sys-head .sys-title { display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1; }
+  /* 系统状态卡（设备名已提到 .sb-head，这里只剩 CPU / RAM / SSD 几行） */
   .sys-card { padding: 14px 14px 12px; border-bottom: 1px solid var(--line); }
-  .sys-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 14px; font-weight: 600; margin-bottom: 10px; }
+  .sys-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; margin-bottom: 10px; }
   .sys-ip { font-size: 11.5px; color: var(--muted); font-family: ui-monospace, monospace; font-weight: 400; }
   /* 三列网格：标签列与数值列等宽，进度槽就自动在卡片里水平居中；
      几条条的左右端点严格落在同一垂直线上。第三列给数值留 46px：
@@ -1132,11 +1231,23 @@
   #btnMenu { display: none; }
   @media (max-width: 760px) {
     #sidebar {
+      /* 抽屉是 position:fixed，已脱离 #app 的 flex 流，宽度回到写死的 310px；
+         flex:none 是为了不让它再参与 1.5:4.5:4 的比例分配 */
       position: fixed; z-index: 15; left: 0; top: 0; bottom: 0;
+      width: 310px; flex: none;
       transform: translateX(-105%); transition: transform .2s;
       box-shadow: 0 0 40px rgba(0,0,0,.4);
     }
+    /* 窄屏下侧栏本来就是抽屉，折叠态不生效：宽度交给抽屉，别留那 44px 窄条 */
     body.sb-open #sidebar { transform: none; }
+    body.sb-collapsed #sidebar { flex: none; width: 310px; }
+    /* 抽屉收起时 #main 独占整行（侧栏已脱离文档流），不必再给它留比例 */
+    #main { flex: 1 1 auto; }
+    body.sb-collapsed .sb-body { display: flex; }
+    /* 同上：抽屉模式下侧栏是浮层，顶栏要跟着正文一起显示 */
+    body.sb-collapsed .sb-head { display: flex; }
+    body.sb-collapsed #sbRail { display: none; }
+    #sbToggle { display: none; }
     #btnMenu { display: block; }
     /* 抽屉拉开时在设置页盖一层：点哪儿都会先收起导航，不会出现「导航挡住设置
        却怎么也关不掉」——PC 端窄窗口尤其容易踩到 */
@@ -1242,14 +1353,383 @@
   #codePre { flex: 1; overflow: auto; padding: 14px; color: var(--code-text); font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; word-break: break-word; margin: 0; }
   .msg pre { cursor: pointer; }
 
+  /* ---------- 右侧常用工具栏（文件 / 终端） ---------- */
+  #rightbar {
+    /* 同左栏：grow:0，不参与剩余空间分配，宽度只由 basis 决定 */
+    flex: 0 0 22.5%; min-width: 0;
+    background: var(--surface);
+    border-left: 1px solid var(--line);
+    display: flex; flex-direction: column; min-height: 0;
+    transition: flex-basis .18s ease;
+  }
+  /* 同上：折叠态压 flex-basis，不是 width */
+  body.rb-collapsed #rightbar { flex: 0 0 44px; }
+  #rbHead {
+    /* 高度锁成 45px，与中间顶栏 header 完全齐平（header 是 10px 上下内边距
+       + 25px 内容 + 1px 下边框）。原来这里用 14px 内边距撑出 59px，
+       比中间矮了一截，三栏顶边对不上。
+       高度写死后内边距只管左右，内容靠 align-items:center 垂直居中 */
+    flex: 0 0 auto; height: 45px; box-sizing: border-box;
+    display: flex; align-items: center; gap: 6px;
+    padding: 0 8px; border-bottom: 1px solid var(--line);
+  }
+  /* 折叠态：竖排窄条，不再受 45px 限制。
+     内边距与左栏 #sbRail 对称（8px），按钮同样居中——两栏各有 1px 内侧边框
+     （左栏 border-right / 右栏 border-left），居中后按钮离各自外缘都是 8.5px，
+     视觉上互为镜像；用 flex-end 反而会差出那 1px */
+  body.rb-collapsed #rbHead {
+    height: auto; flex-direction: column; align-items: center;
+    padding: 8px; box-sizing: border-box; gap: 8px;
+  }
+  /* 分段控件（segmented control）：两枚 tab 共享一个槽，选中的一枚亮起，
+     没选中的是透明的——比「两颗独立药丸」整体感强，也填满了这一行，
+     不会出现右侧一大段空白 */
+  .rb-seg {
+    flex: 1 1 auto; display: flex; gap: 2px;
+    background: var(--surface-2); border-radius: 8px; padding: 2px;
+  }
+  .rb-tab {
+    flex: 1 1 0; min-width: 0; height: 26px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border: none; background: transparent; color: var(--muted);
+    font-size: 12.5px; padding: 0 4px; border-radius: 6px; cursor: pointer;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    transition: background .15s ease, color .15s ease;
+  }
+  .rb-tab:hover { color: var(--text); }
+  .rb-tab.on { color: var(--text); background: var(--hover); font-weight: 600; }
+  body.rb-collapsed .rb-tab { display: none; }
+
+  .rb-pane { flex: 1 1 auto; min-height: 0; display: none; flex-direction: column; }
+  .rb-pane.on { display: flex; }
+  body.rb-collapsed .rb-pane { display: none; }
+
+  /* 文件浏览器 */
+  #fbFollow {
+    flex: 0 0 auto; display: none; align-items: center; gap: 6px;
+    padding: 6px 10px; font-size: 11.5px; color: #b8860b;
+    background: rgba(230, 180, 34, .1); border-bottom: 1px solid var(--line);
+    cursor: pointer;
+  }
+  #fbFollow.show { display: flex; }
+  #fbFollow .p { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    direction: rtl; text-align: left; }
+  #fbBar {
+    flex: 0 0 auto; display: flex; align-items: center; gap: 4px;
+    padding: 6px 8px; border-bottom: 1px solid var(--line);
+  }
+  #fbBar button {
+    flex: 0 0 auto; border: 1px solid var(--line); background: var(--surface-2);
+    color: var(--text); font-size: 12px; padding: 3px 7px; border-radius: 6px; cursor: pointer;
+  }
+  #fbPath {
+    flex: 1; min-width: 0; font-size: 11.5px; color: var(--muted);
+    font-family: ui-monospace, monospace;
+    overflow-x: auto; white-space: nowrap; scrollbar-width: none;
+  }
+  #fbPath::-webkit-scrollbar { display: none; }
+  #fbPath .seg { cursor: pointer; }
+  #fbPath .seg:hover { color: var(--brand); }
+  #fbList { flex: 1 1 auto; overflow-y: auto; padding: 4px 6px 10px; }
+  .fb-item {
+    display: flex; align-items: center; gap: 7px;
+    padding: 5px 8px; border-radius: 7px; cursor: pointer;
+    font-size: 12.5px; color: var(--text);
+  }
+  .fb-item:hover { background: var(--hover); }
+  .fb-item .ico { flex: 0 0 auto; width: 14px; text-align: center; color: var(--muted); font-size: 12px; }
+  .fb-item.dir .ico { color: var(--brand); }
+  /* 拖到一半的那一行：原位置留个虚影，指向「它会被拖进对话」 */
+  .fb-item.dragging { opacity: .45; }
+  .fb-item[draggable="true"] { cursor: grab; }
+  .fb-item .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fb-item .sz { flex: 0 0 auto; font-size: 10.5px; color: var(--muted); font-family: ui-monospace, monospace; }
+  /* AI 正在看的那个文件：黄一下再淡出，比直接变色更容易被注意到 */
+  .fb-item.sel { background: rgba(26,159,255,.18); box-shadow: inset 0 0 0 1px rgba(26,159,255,.55); }
+  .fb-item.flash { animation: fbFlash 1.2s ease-out 2; }
+  @keyframes fbFlash { 0%,100% { background: transparent; } 50% { background: rgba(26,159,255,.28); } }
+  #fbList .fb-note { padding: 10px; font-size: 12px; color: var(--muted); }
+  /* 终端面板的空状态：居中、带一枚大符号，比一行孤零零的灰字有视觉重心。
+     挂在 #termList 直接子级时生效（有真实命令条目后不再有 fb-note） */
+  #termList .fb-note {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; padding: 24px 16px; text-align: center;
+    color: var(--muted); font-size: 12.5px; line-height: 1.6;
+  }
+  #termList .fb-note::before {
+    content: '>_'; font-family: ui-monospace, monospace; font-size: 22px;
+    color: var(--text); opacity: .28; letter-spacing: 2px;
+  }
+  #termList .fb-note em { font-style: normal; color: var(--text); opacity: .75; }
+
+  /* 文件预览浮层：单击文件弹出，点任意处关掉 */
+  #fbViewer {
+    display: none; position: fixed; inset: 0; z-index: 300;
+    background: rgba(0,0,0,.82);
+    align-items: center; justify-content: center;
+    padding: 24px;
+  }
+  #fbViewer.show { display: flex; }
+  #fbViewer .fv-box {
+    display: flex; flex-direction: column;
+    max-width: min(92vw, 1100px); max-height: 90vh;
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 12px; overflow: hidden;
+    box-shadow: 0 18px 60px rgba(0,0,0,.6);
+  }
+  #fbViewer .fv-head {
+    flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
+    padding: 9px 12px; border-bottom: 1px solid var(--line); background: var(--surface-2);
+  }
+  #fbViewer .fv-name { flex: 1; min-width: 0; font-size: 13px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #fbViewer .fv-meta { flex: 0 0 auto; font-size: 11.5px; color: var(--muted);
+    font-family: ui-monospace, monospace; }
+  #fbViewer .fv-btn {
+    flex: 0 0 auto; border: 1px solid var(--line); background: var(--surface);
+    color: var(--text); font-size: 12px; padding: 3px 9px; border-radius: 6px; cursor: pointer;
+  }
+  #fbViewer .fv-btn:hover { background: var(--hover); }
+  /* 终端放大时的按键输入框：默认收起，只在 .term-mode 里出现 */
+  #fbViewer .fv-keys {
+    display: none; flex: 0 1 320px; min-width: 120px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text);
+    font-size: 12px; padding: 3px 8px; border-radius: 6px;
+    font-family: ui-monospace, monospace;
+  }
+  #fbViewer.term-mode .fv-keys { display: block; }
+  #fbViewer.term-mode .fv-keys:focus { outline: 1px solid var(--brand); }
+  /* 小窗里也要能点进去按键：光标落在画面上 */
+  .tm-term.tm-focus { outline: 1px solid var(--brand); outline-offset: -1px; }
+  #fbViewer .fv-body {
+    flex: 1 1 auto; min-height: 0; overflow: auto;
+    display: flex; align-items: center; justify-content: center;
+    padding: 12px; background: var(--bg);
+  }
+  #fbViewer .fv-body img, #fbViewer .fv-body video {
+    max-width: 100%; max-height: 74vh; border-radius: 8px; display: block;
+  }
+  #fbViewer .fv-body audio { width: min(520px, 80vw); }
+  #fbViewer .fv-body iframe { width: min(900px, 88vw); height: 76vh; border: 0; border-radius: 8px; background: #fff; }
+  #fbViewer .fv-body pre {
+    align-self: stretch; margin: 0; font-size: 12.5px; line-height: 1.5;
+    font-family: ui-monospace, monospace; white-space: pre; color: var(--text);
+    background: var(--code-bg); padding: 12px; border-radius: 8px;
+    max-width: 88vw; overflow: auto;
+  }
+  #fbViewer .fv-note { color: var(--muted); font-size: 13px; padding: 24px; text-align: center; }
+
+  /* 终端 */
+  #termList { flex: 1 1 auto; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+  .tm {
+    border: 1px solid var(--line); border-radius: 9px; overflow: hidden;
+    background: var(--surface-2);
+  }
+  .tm-head {
+    display: flex; align-items: center; gap: 6px;
+    padding: 6px 8px; font-size: 11.5px; color: var(--muted);
+    cursor: pointer;
+  }
+  .tm-head .who {
+    flex: 0 0 auto; font-size: 10.5px; padding: 1px 5px; border-radius: 4px;
+    background: rgba(26,159,255,.16); color: var(--brand);
+  }
+  .tm-head .who.me { background: rgba(46,204,113,.14); color: #2ecc71; }
+  .tm-head .cmd {
+    flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: ui-monospace, monospace; color: var(--text); font-size: 11.5px;
+  }
+  .tm-head .st { flex: 0 0 auto; font-size: 10.5px; }
+  .tm-head .st.run { color: var(--brand); }
+  .tm-head .st.ok { color: #2ecc71; }
+  .tm-head .st.bad { color: var(--danger); }
+  .tm-out {
+    margin: 0; padding: 0 8px 8px; max-height: 220px; overflow: auto;
+    font-family: ui-monospace, monospace; font-size: 11px; line-height: 1.45;
+    color: var(--code-text); white-space: pre-wrap; word-break: break-word;
+    background: var(--code-bg); padding-top: 6px;
+  }
+  .tm.collapsed .tm-out { display: none; }
+  /* 带 ANSI 控制序列的输出（ncdu / top / htop 这类全屏程序）：后端吐的是
+     「清屏 + 光标定位 + 着色」的原始字节流，直接塞进 <pre> 就是满屏乱码。
+     这里不渲染控制序列，而是由 termRenderAnsi 把它解释成一块字符网格，
+     每个非空格用绝对定位摆回原来的行列，等价于一张不会动的终端截图 */
+  .tm-term {
+    /* 侧栏只有 300px 宽，200 列塞不进去，横着能滚：画面本身是绝对定位的，
+       滚动区域靠内层撑宽。高度收在 150px：这是「缩略」，看个大概就该点放大，
+       占半屏会挤掉对话 */
+    position: relative; overflow: auto; max-height: 150px;
+    background: var(--code-bg); padding: 4px 6px; border-top: 1px solid var(--line);
+    font-family: ui-monospace, monospace; line-height: 1.25;
+    font-variant-ligatures: none;
+  }
+  .tm-term .ts {
+    position: absolute; white-space: pre; color: var(--code-text);
+  }
+  /* 网格的锚点层：宽度由 JS 按列数写死，子元素都是绝对定位 */
+  .tm-term-in { position: relative; }
+  /* 顶部的放大按钮：行为跟文件预览一致，点开是全屏浮层 */
+  .tm-head .zoom {
+    flex: 0 0 auto; border: none; background: none; color: var(--muted);
+    font-size: 12px; line-height: 1; padding: 2px 4px; border-radius: 5px;
+    cursor: pointer;
+  }
+  .tm-head .zoom:hover { background: var(--hover); color: var(--text); }
+  /* 执行中多出来的「终止」：只在这一条还在跑的时候出现，已经结束的没必要留个按钮 */
+  .tm-head .stop {
+    flex: 0 0 auto; border: 1px solid rgba(232,70,58,.45); background: rgba(232,70,58,.12);
+    color: var(--danger); font-size: 10.5px; line-height: 1; padding: 3px 7px;
+    border-radius: 5px; cursor: pointer; white-space: nowrap;
+  }
+  .tm-head .stop:hover { background: rgba(232,70,58,.24); }
+  .tm-head .stop:disabled { opacity: .5; cursor: default; }
+  /* 已退出命令的自动消散：先停留几秒让人看清结果，然后淡出并收起高度，
+     从列表里让位。重画每 800ms 会重建节点、动画从头重播，所以 JS 会按
+     「已消散时长」设置负的 animation-delay 把动画拨到正确的位置续播 */
+  .tm.dying {
+    pointer-events: none;
+    animation: tmVanish .9s ease forwards;
+  }
+  @keyframes tmVanish {
+    0%   { opacity: 1; max-height: 220vh; }
+    45%  { opacity: 0; }
+    100% { opacity: 0; max-height: 0; border-width: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .tm.dying { animation-duration: .01s; }
+  }
+  /* 放大后的终端：跟文件预览共用 #fbViewer，只是内容区换成撑满的终端屏。
+     终端是 200 列，文件预览那套 1100px 上限会把字号压到看不清，所以放大时
+     给浮层加 term-mode 类，撑满屏宽 */
+  #fbViewer.term-mode .fv-box {
+    /* 上限锁在 1280×800（Deck 原生分辨率）：再大也没有更多内容，
+       只会把字撑到晃眼；小屏按 96vw/86vh 收 */
+    max-width: min(96vw, 1280px); width: min(96vw, 1280px);
+    max-height: min(86vh, 800px); height: min(86vh, 800px);
+  }
+  #fbViewer .fv-body.term-body { display: block; padding: 0; }
+  .term-big {
+    position: relative; overflow: auto; height: 100%; width: 100%;
+    background: var(--code-bg); padding: 10px 12px;
+    /* 字号由 JS 按列数算出来写在 host 上（见 termPaintScreen），
+       每格 span 只继承，不再各自写字号 */
+    font-family: ui-monospace, monospace; line-height: 1.3;
+    font-variant-ligatures: none;
+  }
+  /* 每格 span 要把字号显式继承下来：span 自带字号会让自适应算出来的值落不到格子上 */
+  .term-big .ts, #fbViewer .fv-body.term-body .ts { font-size: inherit; }
+  .term-big .ts { position: absolute; white-space: pre; color: var(--code-text); }
+  /* 执行中的那道扫光：比转圈更明显，也不会因为每个块都转圈而晃眼 */
+  .tm.running { border-color: rgba(26,159,255,.5); }
+  .tm.running .tm-head { position: relative; overflow: hidden; }
+  .tm.running .tm-head::after {
+    content: ''; position: absolute; inset: 0;
+    background: linear-gradient(90deg, transparent, rgba(26,159,255,.28), transparent);
+    transform: translateX(-100%); animation: tmSweep 1.5s linear infinite;
+    pointer-events: none;
+  }
+  @keyframes tmSweep { to { transform: translateX(100%); } }
+  /* 三个点跳动的「她在干活」提示 */
+  .tm-dots { display: inline-flex; gap: 2px; align-items: center; }
+  .tm-dots i {
+    width: 3px; height: 3px; border-radius: 50%; background: currentColor;
+    animation: tmDot 1.1s infinite ease-in-out;
+  }
+  .tm-dots i:nth-child(2) { animation-delay: .16s; }
+  .tm-dots i:nth-child(3) { animation-delay: .32s; }
+  @keyframes tmDot { 0%,80%,100% { opacity: .25; } 40% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) {
+    .tm.running .tm-head::after, .tm-dots i, .fb-item.flash { animation: none !important; }
+  }
+  /* 输入框与运行按钮平级，各占各的圆角（与中间 #inputRow + #send 同构） */
+  #termBar {
+    flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+    margin: 8px; padding: 0;
+  }
+  #termInput {
+    flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px;
+    padding: 0 14px; min-height: 44px; box-sizing: border-box;
+    background: var(--surface-2); border: 1px solid var(--line); border-radius: 14px;
+    transition: border-color .15s ease;
+  }
+  #termInput:focus-within { border-color: var(--brand); }
+  #termInput > span {
+    flex: 0 0 auto;
+    color: var(--muted); font-family: ui-monospace, monospace; font-size: 13px; user-select: none;
+  }
+  #termCmd {
+    flex: 1; min-width: 0; background: transparent; color: var(--text);
+    border: none; padding: 10px 0;
+    font-family: ui-monospace, monospace; font-size: 13px; outline: none;
+  }
+  #termCmd::placeholder { color: var(--muted); opacity: .7; }
+  /* 与中间的「发送」按钮同一套：34px 高、圆角 10px、品牌蓝、字重 600 */
+  #termRun {
+    flex: 0 0 auto; min-width: 52px; height: 34px;
+    border: none; border-radius: 10px; background: var(--brand);
+    color: #fff; font-size: 13px; font-weight: 600; padding: 0 16px; cursor: pointer;
+    transition: opacity .15s ease, transform .12s ease;
+  }
+  #termRun:hover { opacity: .88; }
+  #termRun:active { transform: scale(.95); }
+  #termRun:disabled { opacity: .4; cursor: default; transform: none; }
+
+  /* 窄屏 / 设置页：工具栏停靠会挤掉对话，改成从右侧滑出的抽屉 */
+  @media (max-width: 1080px) {
+    #rightbar {
+      /* 抽屉是 position:fixed，已脱离 #app 的 flex 流；flex:none 让它
+         不再参与 1.5:4.5:4 的比例分配，宽度由这里的 310px 说了算 */
+      position: fixed; z-index: 16; right: 0; top: 0; bottom: 0;
+      width: 310px !important; flex: none;
+      transform: translateX(105%); transition: transform .2s;
+      box-shadow: 0 0 40px rgba(0,0,0,.4);
+    }
+    body.rb-open #rightbar { transform: none; }
+  
+    body.rb-collapsed #rbHead { flex-direction: row; padding: 14px; }
+    body.rb-collapsed .rb-tab { display: block; }
+    body.rb-collapsed .rb-pane.on { display: flex; }
+    #rbToggle { display: none; }
+  }
+  #btnRight { display: none; }
+  @media (max-width: 1080px) { #btnRight { display: block; } }
+  /* 设置页也保留右栏（文件 / 终端），收起 / 展开和对话页完全一样。
+     1080 那套收起样式本来写成 body.rb-collapsed，这里用同样的选择器在
+     设置模式下复用它；展开按钮在宽屏时默认不显示（要靠 1080 的媒体查询），
+     设置页里补一条显示 */
+  /* 同上：改成 flex 比例后要压的是 flex-basis */
+  body.settings-mode.rb-collapsed #rightbar { flex: 0 0 44px; }
+  body.settings-mode.rb-collapsed #rbHead { flex-direction: column; padding: 14px 0; }
+  body.settings-mode.rb-collapsed .rb-tab { display: none; }
+  body.settings-mode.rb-collapsed #rbToggle { display: block; }
+  body.settings-mode #rbToggle { display: block; }
+  body.settings-mode.rb-collapsed #rbPaneFile,
+  body.settings-mode.rb-collapsed #rbPaneTerm { display: none !important; }
+
 </style>
 </head>
 <body>
 
 <div id="app">
 <aside id="sidebar">
+  <!-- 折叠态只剩这条窄条：点「会话」或者箭头都能展开 -->
+  <div id="sbRail" title="展开会话栏">
+    <button id="sbExpand" class="side-toggle" title="展开会话栏">▶</button>
+    <button id="sbRailNew" class="side-toggle" title="新会话">＋</button>
+    <span class="rail-txt">会话</span>
+  </div>
+  <!-- 顶栏：和中间 header、右栏 #rbHead 同一条 45px 的水平线，
+       三栏顶边对齐。原来是 sys-card 里的第一行，被 14px 内边距压在
+       y=14，比另外两栏矮，现在提成独立一条 -->
+  <div class="sb-head">
+    <!-- 收起按钮钉在屏幕最左端，与右栏 #rbToggle（最右端）互为镜像。
+         原来它在这行末尾，结果两个按钮都朝右，看着不是镜像 -->
+    <button id="sbToggle" class="side-toggle" title="收起会话栏">◀</button>
+    <span class="sys-title"><span id="sysHost">Steam Deck</span></span>
+    <span class="sys-ip" id="sysIp">–</span>
+  </div>
+  <div class="sb-body">
   <div class="sys-card">
-    <div class="sys-head"><span id="sysHost">Steam Deck</span><span class="sys-ip" id="sysIp">–</span></div>
     <div class="sys-row"><span class="sys-name">CPU</span><div class="bar"><div class="fill" id="cpuFill"></div></div><span class="sys-val" id="cpuVal">–</span></div>
     <div class="sys-row"><span class="sys-name">RAM</span><div class="bar"><div class="fill" id="memFill"></div></div><span class="sys-val" id="memVal">–</span></div>
     <div class="sys-row"><span class="sys-name">SSD</span><div class="bar"><div class="fill" id="ssdFill"></div></div><span class="sys-val" id="ssdVal">–</span></div>
@@ -1277,7 +1757,9 @@
     <button id="btnTheme" title="切换主题">深色模式</button>
     <button id="settingsBtn" title="设置">设置</button>
   </div>
+  </div><!-- /.sb-body -->
 </aside>
+
 <main id="main">
 
 <!-- 顶栏只有这一条：对话和设置共用。切到设置时 #chatView 整个藏起来，
@@ -1285,6 +1767,7 @@
      在设置页里看到的和在对话里一模一样 -->
 <header>
   <button class="cb-btn" id="btnMenu" title="菜单">菜单</button>
+  <button class="cb-btn" id="btnRight" title="文件 / 终端">工具</button>
   <span class="dot" id="dot"></span>
   <span class="logo" id="hdrTitle" title="DeckMeido">DeckMeido</span>
   <span class="status-text" id="statusText">连接中…</span>
@@ -1585,6 +2068,62 @@
   </div>
 </div>
 </main>
+
+<!-- 右侧常用工具栏：文件浏览器 + 终端。两块都和对话联动——
+     AI 读写哪个路径，文件面板自动跳过去；AI 跑哪条命令，终端面板现场直播。
+     宽屏常驻一栏，窄屏收成抽屉（从右边滑出，靠顶栏的「工具」按钮开合）。
+     必须排在 #main 后面：#app 是普通 row，DOM 顺序就是从左到右的排布顺序，
+     放前面它会夹在会话列表和对话区中间 -->
+<aside id="rightbar">
+  <div id="rbHead">
+    <div class="rb-seg">
+      <button class="rb-tab on" id="rbTabFile" title="文件浏览器">文件</button>
+      <button class="rb-tab" id="rbTabTerm" title="终端">终端</button>
+    </div>
+    <button id="rbToggle" class="side-toggle" title="收起 / 展开">▶</button>
+  </div>
+
+  <div class="rb-pane on" id="rbPaneFile">
+    <!-- 用户手动点过别处后不再跟着 AI 跑，这条横幅就是「点此回到跟随」的入口 -->
+    <div id="fbFollow"><span>AI 正在看：</span><span class="p" id="fbFollowPath"></span><span>· 点此跟随</span></div>
+    <div id="fbBar">
+      <button id="fbUp" title="上一级">↑</button>
+      <button id="fbHome" title="回到工作区">⌂</button>
+      <div id="fbPath"></div>
+    </div>
+    <div id="fbList"><div class="fb-note">加载中…</div></div>
+  </div>
+
+  <div class="rb-pane" id="rbPaneTerm">
+    <div id="termList"><div class="fb-note">AI 执行的命令会实时出现在这里<br>也可以在下方输入框直接跑一条</div></div>
+    <!-- 输入框和运行按钮平级摆在一行里，与中间「输入区 + 发送按钮」同构。
+         原来按钮嵌在 #termInput 里面，视觉上像长在输入框上，也和中间不一致 -->
+    <div id="termBar">
+      <div id="termInput">
+        <span>$</span>
+        <input id="termCmd" type="text" placeholder="在这里直接敲命令" autocomplete="off" spellcheck="false">
+      </div>
+      <button id="termRun">运行</button>
+    </div>
+  </div>
+</aside>
+</div>
+
+<!-- 文件预览浮层：在文件面板里单击文件时弹出。放在 #app 外面，
+     它是 position:fixed 全屏遮罩，留在 row 布局里会占掉一列宽度 -->
+<div id="fbViewer">
+  <div class="fv-box">
+    <div class="fv-head">
+      <span class="fv-name" id="fvName"></span>
+      <span class="fv-meta" id="fvMeta"></span>
+      <!-- 终端放大时替代「引用到对话」：画面本身不接键盘，按键统一在这个框里收 -->
+      <input class="fv-keys" id="fvKeys" autocomplete="off" autocapitalize="off"
+             spellcheck="false" placeholder="点这里，然后按键操作（方向键 / q / Enter…）">
+      <button class="fv-btn" id="fvRef" title="把这个文件引用到对话输入框">引用到对话</button>
+      <button class="fv-btn" id="fvClose">关闭</button>
+    </div>
+    <div class="fv-body" id="fvBody"></div>
+  </div>
 </div>
 
 <div id="ctrlPanel">
@@ -2366,6 +2905,1380 @@
   var turnCache = { sid: null, segs: [], cur: '' };
   var turnCacheTimer = null;
 
+  // ---------- 右侧常用工具栏：文件浏览器 + 终端 ----------
+  // 两块都跟对话联动：fs_follow 事件让文件面板跳到 AI 正在看的地方，
+  // term_start 事件让终端面板挂一条「执行中」并开始轮询实时输出。
+  var RB = { tab: 'file', collapsed: false, open: false };
+  var SB = { collapsed: false };
+  var fb = { path: '', parent: null, select: '', follow: true, aiPath: '', token_at: 0 };
+  var term = {
+    items: [],       // {id, who, cmd, reason, out, running, exit, background, collapsed}
+    seq: 0,
+    trackIdx: -1,    // 正在被 /api/terminal 轮询跟进的那一条
+    pollTimer: null
+  };
+
+  function rbEl(id) { return document.getElementById(id); }
+
+  // 左侧会话栏的折叠：<=760 走抽屉（sb-open），更宽的窗口收成 44px 窄条
+  function sbApplyLayout() {
+    var narrow = window.matchMedia('(max-width: 760px)').matches;
+    document.body.classList.toggle('sb-collapsed', !narrow && SB.collapsed);
+    try {
+      localStorage.setItem('deckmeido_sb', JSON.stringify({ collapsed: SB.collapsed }));
+    } catch (e) {}
+  }
+
+  function sbSetCollapsed(v) {
+    SB.collapsed = !!v;
+    sbApplyLayout();
+  }
+
+  function rbApplyLayout() {
+    // 窄屏（<=1080）走抽屉：collapsed 那个状态没意义，用 rb-open 控制开合。
+    // 设置页里右栏也常驻，收起态和对话页共用同一份 RB.collapsed，
+    // 收起来就是 1080 那套带按钮的窄条，点 ▶ 再展开
+    var narrow = window.matchMedia('(max-width: 1080px)').matches;
+    document.body.classList.toggle('rb-collapsed', !narrow && RB.collapsed);
+    document.body.classList.toggle('rb-open', narrow && RB.open);
+    rbSyncToggle();
+    try {
+      localStorage.setItem('deckmeido_rb', JSON.stringify({
+        tab: RB.tab, collapsed: RB.collapsed, open: RB.open
+      }));
+    } catch (e) {}
+  }
+
+  function rbShowTab(tab) {
+    RB.tab = tab;
+    rbEl('rbTabFile').classList.toggle('on', tab === 'file');
+    rbEl('rbTabTerm').classList.toggle('on', tab === 'term');
+    rbEl('rbPaneFile').classList.toggle('on', tab === 'file');
+    rbEl('rbPaneTerm').classList.toggle('on', tab === 'term');
+    if (tab === 'file' && !fb.path) fbLoad();
+    if (tab === 'term') {
+      var l = rbEl('termList');
+      if (l) l.scrollTop = l.scrollHeight;
+    }
+    rbApplyLayout();
+  }
+
+  // ---- 文件浏览器 ----
+  function fbFmtSize(n) {
+    if (typeof n !== 'number') return '';
+    if (n < 1024) return n + 'B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(0) + 'K';
+    if (n < 1024 * 1024 * 1024) return (n / 1048576).toFixed(1) + 'M';
+    return (n / 1073741824).toFixed(1) + 'G';
+  }
+
+  // 文件类型图标：纯文本符号，不引外部资源
+  var FB_ICON = { dir: '▸', image: '▣', video: '▶', audio: '♪', pdf: '▤', text: '≡', other: '·' };
+
+  // 后端 /api/browse 会带 kind，这里只在它没给（比如旧缓存）时兜一下
+  var FB_KIND_EXT = {
+    image: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif', 'ico'],
+    video: ['mp4', 'webm', 'mkv', 'mov', 'm4v', 'avi', 'ogv'],
+    audio: ['mp3', 'flac', 'wav', 'ogg', 'm4a', 'aac', 'opus', 'oga'],
+    pdf: ['pdf'],
+    text: ['txt', 'md', 'log', 'csv', 'json', 'toml', 'ini', 'cfg', 'yml', 'yaml',
+           'xml', 'html', 'css', 'js', 'ts', 'py', 'sh', 'c', 'h', 'cpp', 'rs',
+           'go', 'java', 'sql', 'conf', 'srt', 'desktop']
+  };
+
+  function fbKindOf(name) {
+    var i = name.lastIndexOf('.');
+    var ext = i < 0 ? '' : name.slice(i + 1).toLowerCase();
+    for (var k in FB_KIND_EXT) {
+      if (FB_KIND_EXT[k].indexOf(ext) >= 0) return k;
+    }
+    return 'other';
+  }
+
+  // ---- 预览浮层 ----
+  var fvCur = null;   // {path, name} 当前预览的那个，供「引用到对话」用
+
+  function fbClosePreview() {
+    rbEl('fbViewer').classList.remove('show');
+    rbEl('fbViewer').classList.remove('term-mode');
+    // 清掉 body：视频/音频不销毁就会在后台继续播
+    rbEl('fvBody').innerHTML = '';
+    fvCur = null;
+  }
+
+  function fbPreview(path, name) {
+    rbEl('fbViewer').classList.add('show');
+    rbEl('fvName').textContent = name;
+    rbEl('fvMeta').textContent = '读取中…';
+    var body = rbEl('fvBody');
+    body.innerHTML = '';
+    var src = '/api/preview?token=' + encodeURIComponent(token) +
+              '&path=' + encodeURIComponent(path);
+    fetch(src).then(function (r) { return r.json(); }).then(function (d) {
+      if (!d || d.error || !d.kind) {
+        body.innerHTML = '<div class="fv-note">' + (d && d.error ? d.error : '预览失败') + '</div>';
+        rbEl('fvMeta').textContent = '';
+        return;
+      }
+      fvCur = { path: d.path || path, name: name, kind: d.kind };
+      rbEl('fvMeta').textContent = fbFmtSize(d.size) + (d.kind === 'other' ? '' : ' · ' + d.kind);
+      // 媒体和文本都走同一个地址，只是浏览器自己按类型解码。
+      // raw=1 让后端吐文件本体（带 Range 支持），视频/音频才能拖进度条
+      var url = src + '&raw=1&v=' + Math.round((d.mtime || 0) * 1000);
+      var el;
+      if (d.kind === 'image') {
+        el = document.createElement('img');
+        el.src = url;
+        el.alt = name;
+        el.addEventListener('error', function () {
+          body.innerHTML = '<div class="fv-note">这个图片格式浏览器解不了，可以直接把它拖进对话让 AI 看</div>';
+        });
+      } else if (d.kind === 'video') {
+        el = document.createElement('video');
+        el.src = url;
+        el.controls = true;
+        el.autoplay = false;
+      } else if (d.kind === 'audio') {
+        el = document.createElement('audio');
+        el.src = url;
+        el.controls = true;
+        el.autoplay = false;
+      } else if (d.kind === 'pdf') {
+        el = document.createElement('iframe');
+        el.src = url;
+        el.title = name;
+      } else if (d.kind === 'text') {
+        el = document.createElement('pre');
+        el.textContent = d.text || '（空文件）';
+      } else {
+        body.innerHTML = '<div class="fv-note">这种文件没有内置预览。<br>把它拖进聊天框，AI 会读出来。</div>';
+        return;
+      }
+      body.appendChild(el);
+    }).catch(function () {
+      body.innerHTML = '<div class="fv-note">预览失败</div>';
+      rbEl('fvMeta').textContent = '';
+    });
+  }
+
+  // 这个浮层两种用途：文件预览 和 终端放大。关闭要按当前是哪种分流，
+  // 统一走 fbClosePreview 会把终端的浮层状态（term-body 等）残留下来
+  function fbDismiss() {
+    if (typeof termBig !== 'undefined' && termBig) termCloseBig();
+    else fbClosePreview();
+  }
+
+  rbEl('fvClose').addEventListener('click', fbDismiss);
+  // 点遮罩空白处关掉，点内容区不关
+  rbEl('fbViewer').addEventListener('click', function (e) {
+    if (e.target === rbEl('fbViewer')) fbDismiss();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && rbEl('fbViewer').classList.contains('show')) fbDismiss();
+  });
+  rbEl('fvRef').addEventListener('click', function () {
+    if (!fvCur) return;
+    // 先把路径取出来：fbClosePreview 会把 fvCur 清空
+    var p = fvCur.path;
+    fbClosePreview();
+    fbQuote(p);
+  });
+
+  // 把文件引用进对话：@{相对工作区的路径}，工作区外的给提示（后端也读不了）
+  function fbQuote(full) {
+    var wsPrefix = window.__wsPath ? (window.__wsPath.replace(/\/$/, '') + '/') : '';
+    if (wsPrefix && full.indexOf(wsPrefix) !== 0) {
+      addSystem('工作区外的文件没法用 @ 引用。想在对话里用它，先切到「完全访问」，或让 AI 直接读这个路径。');
+      return;
+    }
+    input.value += (input.value && !/\s$/.test(input.value) ? ' ' : '') + '@{' + full.slice(wsPrefix.length) + '}';
+    input.focus();
+  }
+
+  // 拖拽：把行拖进聊天框 = 引用这个文件。dragstart 里写一份自定义类型，
+  // 让对话区能区分「面板拖来的文件」和「外面拖进来的文件」（后者要上传）
+  function fbMakeDraggable(row, full) {
+    row.draggable = true;
+    row.addEventListener('dragstart', function (e) {
+      e.dataTransfer.setData('application/x-deckmeido-file', full);
+      // text/plain 兜底：其他浏览器/客户端不支持自定义类型时不至于拖成空
+      e.dataTransfer.setData('text/plain', full);
+      e.dataTransfer.effectAllowed = 'copy';
+      row.classList.add('dragging');
+    });
+    row.addEventListener('dragend', function () {
+      row.classList.remove('dragging');
+    });
+  }
+
+  function fbRenderPath() {
+    var box = rbEl('fbPath');
+    box.innerHTML = '';
+    var p = fb.path || '';
+    if (!p) return;
+    // 按 / 拆成可点的段，点哪段跳哪层
+    var parts = p.split('/').filter(function (s) { return s !== ''; });
+    var acc = '';
+    var root = document.createElement('span');
+    root.className = 'seg';
+    root.textContent = '/';
+    root.title = '/';
+    root.addEventListener('click', function () { fb.select = ''; fbStopFollow(); fbLoad('/'); });
+    box.appendChild(root);
+    parts.forEach(function (seg) {
+      acc += '/' + seg;
+      var s = document.createElement('span');
+      s.className = 'seg';
+      s.textContent = seg + '/';
+      s.title = acc;
+      // 点面包屑也算「用户自己点的」：停下来别跟着 AI 跑，否则刚点过去就被拽走
+      s.addEventListener('click', function () { fb.select = ''; fbStopFollow(); fbLoad(acc); });
+      box.appendChild(s);
+    });
+    box.scrollLeft = box.scrollWidth;
+  }
+
+  function fbRenderList(data) {
+    var box = rbEl('fbList');
+    box.innerHTML = '';
+    if (data.error) {
+      var note = document.createElement('div');
+      note.className = 'fb-note';
+      note.textContent = data.error;
+      box.appendChild(note);
+      return;
+    }
+    var entries = data.entries || [];
+    if (!entries.length) {
+      var empty = document.createElement('div');
+      empty.className = 'fb-note';
+      empty.textContent = '（空目录）';
+      box.appendChild(empty);
+    }
+    entries.forEach(function (e) {
+      var full = data.path + (data.path.endsWith('/') ? '' : '/') + e.name;
+      var kind = e.dir ? 'dir' : (e.kind || fbKindOf(e.name));
+      var row = document.createElement('div');
+      row.className = 'fb-item' + (e.dir ? ' dir' : '');
+      // 悬停就告诉用户两种手势：单击看内容，拖到对话里等于引用
+      row.title = e.name + (e.dir ? '' : '\n单击预览 · 拖到聊天框引用');
+      var ico = document.createElement('span');
+      ico.className = 'ico';
+      ico.textContent = FB_ICON[kind] || '·';
+      var nm = document.createElement('span');
+      nm.className = 'nm';
+      nm.textContent = e.name;
+      row.appendChild(ico);
+      row.appendChild(nm);
+      if (!e.dir && typeof e.size === 'number') {
+        var sz = document.createElement('span');
+        sz.className = 'sz';
+        sz.textContent = fbFmtSize(e.size);
+        row.appendChild(sz);
+      }
+      if (fb.select && e.name === fb.select) {
+        // AI 刚看的就是它：标记 + 闪两下，帮用户在长列表里一眼找到
+        row.classList.add('sel', 'flash');
+        setTimeout(function () { row.classList.remove('flash'); }, 2500);
+      }
+      row.addEventListener('click', function () {
+        if (e.dir) {
+          fb.select = '';
+          fbStopFollow();
+          fbLoad(full);
+          return;
+        }
+        // 单击 = 预览。引用改成把这一行拖进聊天框，避免「只想看一眼」时
+        // 输入框里莫名多出一串 @{...}
+        fb.select = e.name;
+        Array.prototype.forEach.call(box.querySelectorAll('.fb-item.sel'), function (x) {
+          x.classList.remove('sel');
+        });
+        row.classList.add('sel');
+        fbPreview(full, e.name);
+      });
+      if (!e.dir) fbMakeDraggable(row, full);
+      box.appendChild(row);
+    });
+  }
+
+  function fbLoad(path, sel) {
+    var url = '/api/browse?token=' + encodeURIComponent(token);
+    if (path) url += '&path=' + encodeURIComponent(path);
+    rbEl('fbList').innerHTML = '<div class="fb-note">加载中…</div>';
+    return fetch(url).then(function (r) { return r.json(); }).then(function (data) {
+      if (!data || !data.path) {
+        // 后端只回 {"error": ...} 时不能继续往下走：fbRenderPath 里 p 为空直接
+        // return，列表那边也拿不到 entries，面板就永远停在「加载中…」
+        fbRenderList(data || { error: '读取失败' });
+        return data;
+      }
+      fb.path = data.path || '';
+      fb.parent = data.parent || null;
+      fb.select = sel || data.select || '';
+      fbRenderPath();
+      fbRenderList(data);
+      return data;
+    }).catch(function () {
+      rbEl('fbList').innerHTML = '<div class="fb-note">读取失败</div>';
+    });
+  }
+
+  function fbStopFollow() {
+    // 用户自己点过目录：暂停自动跟随，顶部摆出「AI 正在看：xxx · 点此跟随」
+    if (!fb.follow) return;
+    fb.follow = false;
+    rbEl('fbFollow').classList.toggle('show', !!fb.aiPath);
+  }
+
+  function fbFollowStart() {
+    fb.follow = true;
+    rbEl('fbFollow').classList.remove('show');
+    if (fb.aiPath) fbFocusAi(fb.aiPath, fb.aiIsDir);
+  }
+
+  function fbFocusAi(path, isDir) {
+    fb.aiPath = path;
+    fb.aiIsDir = !!isDir;
+    if (!fb.follow) {
+      // 不跟随的时候也要让横幅上的路径实时更新，用户才知道 AI 跑哪儿去了
+      rbEl('fbFollowPath').textContent = path;
+      rbEl('fbFollow').classList.add('show');
+      return;
+    }
+    // 折叠状态下不抢版面：只是记下来，展开/切到文件页时再跳
+    if (RB.collapsed && window.matchMedia('(max-width: 1080px)').matches) return;
+    fbLoad(path);
+  }
+
+  rbEl('rbTabFile').addEventListener('click', function () { rbShowTab('file'); });
+  rbEl('rbTabTerm').addEventListener('click', function () { rbShowTab('term'); });
+  rbEl('sbToggle').addEventListener('click', function () { sbSetCollapsed(true); });
+  rbEl('sbExpand').addEventListener('click', function () { sbSetCollapsed(false); });
+  // 「会话」这两个字也是展开按钮，整条窄条宽度都能点
+  rbEl('sbRail').addEventListener('click', function (e) {
+    if (e.target && e.target.id === 'sbRailNew') return;
+    sbSetCollapsed(false);
+  });
+  rbEl('sbRailNew').addEventListener('click', function () { rbEl('btnNewSess').click(); });
+  rbEl('rbToggle').addEventListener('click', function () {
+    RB.collapsed = !RB.collapsed;
+    rbApplyLayout();
+    if (!RB.collapsed) {
+      if (RB.tab === 'file') fbLoad(fb.path || (fb.follow ? fb.aiPath : ''));
+      else if (!term.pollTimer) termPoll();
+    }
+  });
+  // 箭头指着「点下去会往哪边收」：展开态指右（收起），收起态指左（展开）。
+  // 原来靠 CSS rotate(180deg) 翻转，那会和 :active 的 scale 互相覆盖
+  function rbSyncToggle() {
+    var b = rbEl('rbToggle');
+    if (b) b.textContent = RB.collapsed ? '◀' : '▶';
+  }
+  rbEl('btnRight').addEventListener('click', function () {
+    RB.open = !RB.open;
+    // 第一次从抽屉打开时补一次内容
+    if (RB.open) {
+      if (RB.tab === 'file' && !fb.path) fbLoad(fb.follow ? fb.aiPath : '');
+      if (RB.tab === 'term') termPoll();
+    }
+    rbApplyLayout();
+  });
+  rbEl('fbUp').addEventListener('click', function () {
+    if (!fb.parent) return;
+    fb.select = '';
+    fbStopFollow();
+    fbLoad(fb.parent);
+  });
+  rbEl('fbHome').addEventListener('click', function () {
+    fb.select = '';
+    fbStopFollow();
+    fbLoad('');
+  });
+  rbEl('fbFollow').addEventListener('click', fbFollowStart);
+
+  // ---- 终端 ----
+  // 全屏 TUI（ncdu / top / htop）的输出是一串控制序列：清屏、光标定位、着色，
+  // 直接当文本打出来就是乱码。这里做一个够用的 ANSI 屏幕解释器，把字节流
+  // 还原成字符网格再画出来。只处理这些程序实际会用到的那部分：
+  //   CSI H/f 定位、A/B/C/D 相对移动、G 列、d 行、J/K 擦除、m 颜色、
+  //   X 擦字符、P 删字符、@ 插空、S/T 滚屏、r 滚动区、s/u 保存光标、
+  //   ESC(0 制表符字符集（画框线用）、ESC 7/8、ESC =/>、
+  //   以及 \r \n \b \t \x08 这些基本控制字符
+  // 不认识的序列一律跳过——显示不全好过显示乱码
+
+  // DEC 制表符集：ncdu 画边框用的就是这一套（ESC(0 进入，ESC(B 退出）
+  var ACS = {
+    'j': '┘', 'k': '┐', 'l': '┌', 'm': '└', 'n': '┼', 'q': '─', 't': '├',
+    'u': '┤', 'v': '┴', 'w': '┬', 'x': '│', 'a': '▒', '`': '◆', '~': '·',
+    'o': '⎺', 'p': '⎻', 'r': '⎼', 's': '⎽', '0': '█', '1': '▓', '2': '▒', '3': '░'
+  };
+  // SGR 30-37 / 90-97 的近似色：偏亮的色板，深色主题下能看清，
+  // 浅色主题也不会糊成一片
+  var ANSI_FG = {
+    0: '#c9d1d9', 1: '#e8463a', 2: '#3fb950', 3: '#d29922', 4: '#58a6ff',
+    5: '#bc8cff', 6: '#39c5cf', 7: '#b1bac4'
+  };
+
+  function ansiNewScreen(rows, cols) {
+    var grid = [];
+    for (var r = 0; r < rows; r++) {
+      var line = [];
+      for (var c = 0; c < cols; c++) line.push({ ch: ' ', fg: '', bg: '', b: false });
+      grid.push(line);
+    }
+    return {
+      rows: rows, cols: cols, grid: grid, y: 0, x: 0,
+      fg: '', bg: '', b: false, acs: false, wrap: true,
+      // application cursor keys（?1h）：全屏程序开了它，方向键才按 ESC O 那套发
+      app: false,
+      scrollTop: 0, scrollBottom: rows - 1,
+      savedX: 0, savedY: 0
+    };
+  }
+
+  function ansiBlank(sc) {
+    return { ch: ' ', fg: sc.fg, bg: sc.bg, b: sc.b };
+  }
+
+  function ansiScrollUp(sc, n) {
+    n = Math.max(1, n || 1);
+    for (var i = 0; i < n; i++) {
+      sc.grid.splice(sc.scrollTop, 1);
+      var line = [];
+      for (var c = 0; c < sc.cols; c++) line.push({ ch: ' ', fg: '', bg: '', b: false });
+      sc.grid.splice(sc.scrollBottom, 0, line);
+    }
+  }
+
+  function ansiScrollDown(sc, n) {
+    n = Math.max(1, n || 1);
+    for (var i = 0; i < n; i++) {
+      sc.grid.splice(sc.scrollBottom, 1);
+      var line = [];
+      for (var c = 0; c < sc.cols; c++) line.push({ ch: ' ', fg: '', bg: '', b: false });
+      sc.grid.splice(sc.scrollTop, 0, line);
+    }
+  }
+
+  function ansiPut(sc, ch) {
+    if (ch === '\n') {
+      sc.x = 0;
+      ansiLineFeed(sc);
+      return;
+    }
+    if (ch === '\r') { sc.x = 0; return; }
+    if (ch === '\b') { if (sc.x > 0) sc.x--; return; }
+    if (ch === '\t') { sc.x = Math.min(sc.cols - 1, (Math.floor(sc.x / 8) + 1) * 8); return; }
+    var code = ch.charCodeAt(0);
+    if (code < 32 || code === 127) return;   // 其它不可打印字符直接丢
+    if (sc.acs && ACS[ch]) ch = ACS[ch];
+    // 宽字符占两格：第二格留空（不画），否则整行会往右错位
+    var wide = /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE6F\uFF00-\uFF60\uFFE0-\uFFE6]/.test(ch);
+    if (sc.x >= sc.cols) {
+      // 自动换行关掉（?7l）时停在最后一列原地覆盖，ncdu 补空格画底栏就靠这个；
+      // 开着就换到下一行
+      if (!sc.wrap) { sc.x = sc.cols - 1; }
+      else { sc.x = 0; ansiLineFeed(sc); }
+    }
+    sc.grid[sc.y][sc.x] = { ch: ch, fg: sc.fg, bg: sc.bg, b: sc.b };
+    sc.x++;
+    if (wide && sc.x < sc.cols) {
+      sc.grid[sc.y][sc.x] = { ch: '', fg: sc.fg, bg: sc.bg, b: sc.b };
+      sc.x++;
+    }
+  }
+
+  function ansiLineFeed(sc) {
+    if (sc.y === sc.scrollBottom) ansiScrollUp(sc, 1);
+    else if (sc.y < sc.rows - 1) sc.y++;
+  }
+
+  function ansiSgr(sc, params) {
+    if (!params.length) { sc.fg = ''; sc.bg = ''; sc.b = false; return; }
+    for (var i = 0; i < params.length; i++) {
+      var p = params[i];
+      if (p === 0) { sc.fg = ''; sc.bg = ''; sc.b = false; }
+      else if (p === 1) sc.b = true;
+      else if (p === 22) sc.b = false;
+      else if (p === 7) { var t = sc.fg; sc.fg = sc.bg || '#0f1117'; sc.bg = t || '#c9d1d9'; }
+      else if (p === 27) { /* 退出反显：忽略 */ }
+      else if (p === 39) sc.fg = '';
+      else if (p === 49) sc.bg = '';
+      else if (p >= 30 && p <= 37) sc.fg = ANSI_FG[p - 30];
+      else if (p >= 90 && p <= 97) sc.fg = ANSI_FG[p - 90];
+      else if (p >= 40 && p <= 47) sc.bg = ANSI_FG[p - 40];
+      else if (p === 38 || p === 48) {
+        // 38;5;n / 38;2;r;g;b：粗略取色，够区分就行
+        var slot = p === 38 ? 'fg' : 'bg';
+        if (params[i + 1] === 5) {
+          var n = params[i + 2] || 0;
+          if (n < 8) sc[slot] = ANSI_FG[n];
+          else if (n < 16) sc[slot] = ANSI_FG[n - 8];
+          else sc[slot] = 'rgb(' + ((n >> 4) & 15) * 16 + ',' + (n & 15) * 16 + ',0)';
+          i += 2;
+        } else if (params[i + 1] === 2) {
+          sc[slot] = 'rgb(' + (params[i + 2] || 0) + ',' + (params[i + 3] || 0) + ',' + (params[i + 4] || 0) + ')';
+          i += 4;
+        }
+      }
+      // 4 下划线 / 5 闪烁 / 8 隐藏之类：不影响可读性，忽略
+    }
+  }
+
+  function ansiCsi(sc, params, final) {
+    var p0 = params[0] || 0;
+    var n = function (i, d) { return Math.max(1, params[i] || d); };
+    if (final === 'H' || final === 'f') {
+      sc.y = Math.min(sc.rows - 1, Math.max(0, (params[0] || 1) - 1));
+      sc.x = Math.min(sc.cols - 1, Math.max(0, (params[1] || 1) - 1));
+    } else if (final === 'A') sc.y = Math.max(sc.scrollTop, sc.y - n(0, 1));
+    else if (final === 'B') sc.y = Math.min(sc.scrollBottom, sc.y + n(0, 1));
+    else if (final === 'C') sc.x = Math.min(sc.cols - 1, sc.x + n(0, 1));
+    else if (final === 'D') sc.x = Math.max(0, sc.x - n(0, 1));
+    else if (final === 'E') { sc.y = Math.min(sc.scrollBottom, sc.y + n(0, 1)); sc.x = 0; }
+    else if (final === 'F') { sc.y = Math.max(sc.scrollTop, sc.y - n(0, 1)); sc.x = 0; }
+    else if (final === 'G') sc.x = Math.min(sc.cols - 1, Math.max(0, (params[0] || 1) - 1));
+    else if (final === 'd') sc.y = Math.min(sc.rows - 1, Math.max(0, (params[0] || 1) - 1));
+    else if (final === 'J') {
+      if (p0 === 2 || p0 === 3) {
+        for (var r = 0; r < sc.rows; r++) for (var c = 0; c < sc.cols; c++) sc.grid[r][c] = ansiBlank(sc);
+      } else if (p0 === 0) {
+        for (var c1 = sc.x; c1 < sc.cols; c1++) sc.grid[sc.y][c1] = ansiBlank(sc);
+        for (var r1 = sc.y + 1; r1 < sc.rows; r1++) for (var c2 = 0; c2 < sc.cols; c2++) sc.grid[r1][c2] = ansiBlank(sc);
+      } else if (p0 === 1) {
+        for (var c3 = 0; c3 <= sc.x && c3 < sc.cols; c3++) sc.grid[sc.y][c3] = ansiBlank(sc);
+        for (var r2 = 0; r2 < sc.y; r2++) for (var c4 = 0; c4 < sc.cols; c4++) sc.grid[r2][c4] = ansiBlank(sc);
+      }
+    } else if (final === 'K') {
+      if (p0 === 0) for (var c5 = sc.x; c5 < sc.cols; c5++) sc.grid[sc.y][c5] = ansiBlank(sc);
+      else if (p0 === 1) for (var c6 = 0; c6 <= sc.x; c6++) sc.grid[sc.y][c6] = ansiBlank(sc);
+      else if (p0 === 2) for (var c7 = 0; c7 < sc.cols; c7++) sc.grid[sc.y][c7] = ansiBlank(sc);
+    } else if (final === 'X') {
+      for (var c8 = sc.x; c8 < Math.min(sc.cols, sc.x + n(0, 1)); c8++) sc.grid[sc.y][c8] = ansiBlank(sc);
+    } else if (final === 'P') {
+      for (var i2 = 0; i2 < n(0, 1); i2++) {
+        if (sc.x < sc.cols) { sc.grid[sc.y].splice(sc.x, 1); sc.grid[sc.y].push(ansiBlank(sc)); }
+      }
+    } else if (final === '@') {
+      for (var i3 = 0; i3 < n(0, 1); i3++) {
+        if (sc.x < sc.cols) { sc.grid[sc.y].splice(sc.x, 0, ansiBlank(sc)); sc.grid[sc.y].pop(); }
+      }
+    } else if (final === 'S') ansiScrollUp(sc, n(0, 1));
+    else if (final === 'T') ansiScrollDown(sc, n(0, 1));
+    else if (final === 'm') ansiSgr(sc, params);
+    else if (final === 'r') {
+      sc.scrollTop = Math.max(0, (params[0] || 1) - 1);
+      sc.scrollBottom = Math.min(sc.rows - 1, (params[1] || sc.rows) - 1);
+      sc.y = sc.scrollTop;
+      sc.x = 0;
+    } else if (final === 's') { sc.savedX = sc.x; sc.savedY = sc.y; }
+    else if (final === 'u') { sc.x = sc.savedX; sc.y = sc.savedY; }
+    else if (final === 'h' || final === 'l') {
+      // 私有模式（?1049 备用屏、?25 光标……）：显示上都不影响，忽略。
+      // 只有 ?7 自动换行要认：ncdu 画底栏时用 ?7l 关掉它再补满空格，
+      // 这时写到最后一列就该停住；照旧换行会把底栏多顶出一行。
+      // ?1 是方向键模式：ncdu / vim 开着它时只认 ESC O A，关掉才认 ESC [ A，
+      // 按键转发要据此换序列（见 termKeyToSeq）
+      if (p0 === 7) sc.wrap = (final === 'h');
+      else if (p0 === 1) sc.app = (final === 'h');
+    }
+  }
+
+  // 把整段原始输出喂进屏幕。返回 screen 本身，方便调用方接着用
+  function ansiFeed(sc, text) {
+    var i = 0, len = text.length;
+    while (i < len) {
+      var ch = text[i];
+      if (ch === '\x1b') {
+        var nx = text[i + 1];
+        if (nx === '[') {
+          // CSI：参数字节 0x30-0x3F，中间字节 0x20-0x2F，然后一个终止字节
+          var j = i + 2;
+          var params = [];
+          var cur = '';
+          while (j < len) {
+            var c = text[j];
+            if (c >= '0' && c <= '9') { cur += c; }
+            else if (c === ';' || c === ':') { params.push(parseInt(cur, 10) || 0); cur = ''; }
+            else if (c === '?' || c === '>' || c === '<' || c === '=') { cur = ''; }
+            else if (c >= '!' && c <= '/') { /* 中间字节，忽略 */ }
+            else break;
+            j++;
+          }
+          if (cur !== '') params.push(parseInt(cur, 10) || 0);
+          if (j < len) ansiCsi(sc, params, text[j]);
+          i = j + 1;
+          continue;
+        }
+        if (nx === '(' || nx === ')' || nx === '*' || nx === '+') {
+          // ESC ( 0 进 DEC 框线字符集，ESC ( B 回到普通 ASCII。
+          // 「)」是 G1 而不是 G0，ncdu 只用 G0，这里不跟着切
+          if (nx === '(') sc.acs = text[i + 2] === '0';
+          i += 3;
+          continue;
+        }
+        if (nx === ']') {
+          // OSC（改标题、设置颜色）：吃到 BEL 或 ST 为止
+          var k = i + 2;
+          while (k < len && text[k] !== '\x07' && !(text[k] === '\x1b' && text[k + 1] === '\\')) k++;
+          i = (text[k] === '\x1b') ? k + 2 : k + 1;
+          continue;
+        }
+        if (nx === '7') { sc.savedX = sc.x; sc.savedY = sc.y; i += 2; continue; }
+        if (nx === '8') { sc.x = sc.savedX; sc.y = sc.savedY; i += 2; continue; }
+        // ESC = / ESC > / ESC M / ESC D 之类：要么无所谓，要么很少见，跳过两个字节
+        i += 2;
+        continue;
+      }
+      ansiPut(sc, ch);
+      i++;
+    }
+    return sc;
+  }
+
+  function ansiHasEsc(s) {
+    return typeof s === 'string' && (s.indexOf('\x1b') >= 0 || s.indexOf('\x9b') >= 0);
+  }
+
+  // 屏幕 → DOM：把每行里样式相同的连续非空白字符合成一个 <span>。
+  // 逐字符一个 span 的话，ncdu 一屏两万个格子会让浏览器卡到不能动
+  function ansiPaint(sc, host, cellW, cellH, fontSize) {
+    host.innerHTML = '';
+    host.style.fontSize = fontSize + 'px';
+    // 记下实际用的字号：放大浮层重绘时照这个来，不用再重新量一遍
+    host._fs = fontSize;
+    host.style.height = (sc.rows * cellH + 12) + 'px';
+    // 宽度按列数撑开，不是 100%：侧栏只有 300px 宽，200 列在 11px 字号下要
+    // 1300px，写死 100% 会把右边一大截裁掉。撑开后由外层 .tm-term 横向滚动
+    host.style.width = (sc.cols * cellW + 16) + 'px';
+    var frag = document.createDocumentFragment();
+    for (var r = 0; r < sc.rows; r++) {
+      var line = sc.grid[r];
+      var c = 0;
+      while (c < sc.cols) {
+        // 找下一个有内容的格子
+        while (c < sc.cols && !line[c].ch.trim()) c++;
+        if (c >= sc.cols) break;
+        var start = c;
+        var style = line[c].fg + '|' + line[c].bg + '|' + (line[c].b ? 1 : 0);
+        var text = '';
+        while (c < sc.cols) {
+          var cell = line[c];
+          if (cell.ch === '') { c++; continue; }        // 宽字符的后半格，跟着上一段走
+          // 样式变了就断段（空白格也要断，否则相邻两段不同颜色会连在一起）
+          if (text && (cell.fg + '|' + cell.bg + '|' + (cell.b ? 1 : 0)) !== style) break;
+          text += cell.ch;
+          c++;
+        }
+        // 段尾空白裁掉：left 已经定好列位置，裁掉不影响后面的列
+        text = text.replace(/\s+$/, '');
+        var sp = document.createElement('span');
+        sp.className = 'ts';
+        sp.style.left = (start * cellW) + 'px';
+        sp.style.top = (r * cellH) + 'px';
+        var first = line[start];
+        if (first.fg) sp.style.color = first.fg;
+        if (first.bg) sp.style.background = first.bg;
+        if (first.b) sp.style.fontWeight = '700';
+        sp.textContent = text;
+        frag.appendChild(sp);
+      }
+    }
+    host.appendChild(frag);
+  }
+
+  // 等宽字体下量一个字符的宽度和行高：字号写在 host 上再测，换字号也能跟着变
+  function termMetrics(host, fontSize) {
+    var probe = document.createElement('span');
+    probe.className = 'ts';
+    probe.style.position = 'absolute';
+    probe.style.visibility = 'hidden';
+    probe.style.whiteSpace = 'pre';
+    probe.style.fontSize = fontSize + 'px';
+    probe.textContent = 'MMMMMMMMMMMMMMMMMMMM';
+    host.appendChild(probe);
+    var w = probe.getBoundingClientRect().width / 20;
+    var h = probe.getBoundingClientRect().height;
+    host.removeChild(probe);
+    return { w: w || fontSize * 0.6, h: h || fontSize * 1.3 };
+  }
+
+  function termAnsiSize(it) {
+    // 与后端 stty cols 120 rows 36 对齐：解析时按这个尺寸开网格，
+    // 程序画出来多少列就摆多少列，多出来的格子是空的，不影响观感
+    return { rows: it.rows || 36, cols: it.cols || 120 };
+  }
+
+  // 画面里真正有内容的行数（末尾连空行不算）。ncdu / top 按 50 行开屏，
+  // 实际只写前二十来行，按 50 行反推字号会被压小一截；xterm.js 这类网页
+  // 终端也是按可见内容自适应的，这里同样只让有内容的部分参与计算
+  function termContentRows(sc) {
+    var last = 0;
+    for (var r = 0; r < sc.rows; r++) {
+      var line = sc.grid[r];
+      for (var c = 0; c < sc.cols; c++) {
+        if (line[c].ch && line[c].ch.trim()) { last = r + 1; break; }
+      }
+    }
+    return Math.max(1, Math.min(sc.rows, last + 1));
+  }
+
+  // 按「整屏装进给定区域」反推字号：宽、高两个约束都算一遍取小的。
+  // 先量 10px 下的格子尺寸，再按比例换算（等宽字体的格宽格高跟字号成正比），
+  // 只量一次，不用二分试。网页终端（xterm.js 的 fit / ttyd）都是这个套路
+  function termFitFont(host, size, availW, availH, want, minFs, maxFs) {
+    var cols = size ? size.cols : 80;
+    var rows = size ? size.rows : 24;
+    var m = termMetrics(host, 10);
+    var byW = availW / Math.max(1, cols * m.w / 10);
+    var byH = availH / Math.max(1, rows * m.h / 10);
+    var fs = Math.floor(Math.min(byW, byH, want));
+    return Math.max(minFs, Math.min(maxFs, fs));
+  }
+
+  // 渲染一条的终端画面（小窗和大窗共用，只是字号不同）。
+  // plain=true 时按普通文本输出（没有控制序列的命令），就是原样打出来
+  function termPaintScreen(it, host, fontSize, size, plain) {
+    size = size || termAnsiSize(it);
+    var m = termMetrics(host, fontSize);
+    if (plain) {
+      var pre = document.createElement('pre');
+      pre.style.margin = '0';
+      pre.style.whiteSpace = 'pre-wrap';
+      pre.style.wordBreak = 'break-word';
+      pre.style.fontSize = fontSize + 'px';
+      pre.style.lineHeight = m.h + 'px';
+      pre.style.color = 'var(--code-text)';
+      pre.textContent = it.out || (it.running ? '' : '（无输出）');
+      host.appendChild(pre);
+      return null;
+    }
+    var sc = ansiNewScreen(size.rows, size.cols);
+    ansiFeed(sc, it.out || '');
+    // 记下这条程序要的是哪套方向键（见 termKeyToSeq）
+    it.appKeys = !!sc.app;
+    ansiPaint(sc, host, m.w, m.h, fontSize);
+    return sc;
+  }
+
+  // ---------- 终端键盘转发 ----------
+  // 面板里的网格画面不是真终端，浏览器不会替它把按键变成终端序列，
+  // 所以自己翻译一遍，POST 给 /api/terminal/input 写进那条 tty 命令的 stdin。
+  // 只做常用键：方向键 / Enter / Backspace / Esc / Tab / 翻页 / Home End /
+  // Ctrl+字母 / 可打印字符。中文输入法等不到 compositionend 再把整句发过去。
+  var TERM_KEYS = {
+    ArrowUp: '\x1b[A', ArrowDown: '\x1b[B', ArrowRight: '\x1b[C', ArrowLeft: '\x1b[D',
+    Enter: '\r', Backspace: '\x7f', Escape: '\x1b', Tab: '\t',
+    Home: '\x1b[H', End: '\x1b[F', Delete: '\x1b[3~',
+    PageUp: '\x1b[5~', PageDown: '\x1b[6~',
+    Insert: '\x1b[2~', F1: '\x1bOP', F2: '\x1bOQ', F3: '\x1bOR', F4: '\x1bOS',
+    F5: '\x1b[15~', F6: '\x1b[17~', F7: '\x1b[18~', F8: '\x1b[19~',
+    F9: '\x1b[20~', F10: '\x1b[21~'
+  };
+  // 全屏程序（ncdu / vim / less）启动时会发 ESC[?1h 把终端切到
+  // 「application cursor keys」模式，这时方向键要发 ESC O A 这一套，
+  // 发 ESC [ A 它根本不认，按下去画面纹丝不动。反过来普通 shell 里
+  // 必须发 ESC [ A，发 ESC O A 会打出乱字符。所以按这条命令的输出
+  // 里最后一次出现的 ?1h / ?1l 决定
+  var TERM_APP_KEYS = {
+    ArrowUp: '\x1bOA', ArrowDown: '\x1bOB', ArrowRight: '\x1bOC', ArrowLeft: '\x1bOD',
+    Home: '\x1bOH', End: '\x1bOF'
+  };
+
+  function termAppCursor(it) {
+    // termPaintScreen 每次按完整输出重建屏幕时把 ?1 记在 it.appKeys 上；
+    // 还没画过（比如刚起、画面为空）就退回按输出里的最后一条 ?1h/?1l 判断
+    if (it && typeof it.appKeys === 'boolean' && it.termscreen) return it.appKeys;
+    var s = (it && it.out) || '';
+    return s.lastIndexOf('\x1b[?1h') > s.lastIndexOf('\x1b[?1l');
+  }
+  // 关掉放大浮层时不能把这条按键一起送进去（用户按 Esc 想退出 ncdu 的话，
+  // 先送 Esc、再关浮层，结果 ncdu 在后台接着跑，面板上就成了一片乱）
+  function termSendKeys(data) {
+    if (!token || !data) return;
+    fetch('/api/terminal/input?token=' + encodeURIComponent(token), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: data })
+    }).catch(function () {});
+  }
+
+  // 返回按键对应的终端序列，不认识的键返回 null（页面自己处理）
+  function termKeyToSeq(e, it) {
+    if (e.ctrlKey && !e.altKey && !e.metaKey) {
+      var k = e.key.toLowerCase();
+      if (/^[a-z]$/.test(k)) return String.fromCharCode(k.charCodeAt(0) - 96);   // Ctrl+A = \x01
+      if (k === '[') return '\x1b';
+      if (k === '\\') return '\x1c';
+      if (k === ']') return '\x1d';
+    }
+    if (e.altKey && e.key.length === 1) return '\x1b' + e.key;
+    if (TERM_APP_KEYS[e.key] && termAppCursor(it)) return TERM_APP_KEYS[e.key];
+    if (TERM_KEYS[e.key]) return TERM_KEYS[e.key];
+    // 可打印字符交回去，由调用方用 e.key 原样发
+    if (e.key && e.key.length === 1) return e.key;
+    return null;
+  }
+
+  function termBindKeys(el) {
+    // el 上挂着它对应的那条命令：el._termIt
+    function onKey(e) {
+      if (!el._termIt) return;
+      var seq = termKeyToSeq(e, el._termIt);
+      if (seq === null) return;
+      // 网格和小窗都自己处理所有键；输入框里只拦终端序列，普通字符照常让
+      // 它进 value（否则输入法没法工作，中文根本打不进来）
+      var plain = el.tagName !== 'INPUT' && seq.length === 1;
+      if (plain || e.key === 'Tab' || e.key === 'Backspace'
+          || TERM_KEYS[e.key] || e.ctrlKey || e.altKey) e.preventDefault();
+      e.stopPropagation();   // 别触发页面的全局快捷键
+      if (el.tagName !== 'INPUT' && seq.length === 1) {
+        // 网格上敲普通字符：拦下默认行为，明着发这一个字符
+        termSendKeys(seq);
+        return;
+      }
+      if (el.tagName === 'INPUT' && seq.length === 1) return;   // 交给下面的 input 事件
+      termSendKeys(seq);
+    }
+    function onInput() {
+      // 输入框里的普通字符（含输入法上屏）在 input 事件里一次性取走再清空，
+      // value 不攒东西，不会出现「打了 abc 但屏幕上显示 abc 越来越长」
+      if (!el._termIt) return;
+      var v = el.value;
+      if (!v) return;
+      el.value = '';
+      termSendKeys(v);
+    }
+    function onPaste(e) {
+      if (!el._termIt) return;
+      var t = (e.clipboardData || window.clipboardData);
+      var s = t ? t.getData('text') : '';
+      if (!s) return;
+      e.preventDefault();
+      termSendKeys(s);
+    }
+    function onCompositionEnd(e) {
+      // 输入框里的走 input 事件（上屏时也会触发），这里只管网格
+      if (!el._termIt || el.tagName === 'INPUT') return;
+      if (e.data) termSendKeys(e.data);
+    }
+    el.addEventListener('keydown', onKey);
+    el.addEventListener('paste', onPaste);
+    el.addEventListener('compositionend', onCompositionEnd);
+    var onFocus = function () { el.value = ''; };
+    if (el.tagName === 'INPUT') {
+      // 鼠标点进来就聚焦，点哪都一样（光标位置无所谓，value 一直是空的）
+      el.addEventListener('input', onInput);
+      el.addEventListener('focus', onFocus);
+    }
+    // 解绑器：整块重画前统一拆掉，免得同一个节点重复叠监听
+    return function () {
+      el.removeEventListener('keydown', onKey);
+      el.removeEventListener('paste', onPaste);
+      el.removeEventListener('compositionend', onCompositionEnd);
+      if (el.tagName === 'INPUT') {
+        el.removeEventListener('input', onInput);
+        el.removeEventListener('focus', onFocus);
+      }
+      el._termIt = null;
+    };
+  }
+
+  // 面板命令在后端被包成 "stty ...; script -qefc '原命令' /dev/null"，
+  // 卸载这层壳，标题才显示用户敲的原文
+  function termUnwrapCmd(cmd) {
+    var m = /script -qefc '([\s\S]*)' \/dev\/null$/.exec(cmd || '');
+    if (!m) return '';
+    return m[1].replace(/'\\''/g, "'");
+  }
+
+  // 结束后停留多久开始消散，消散动画本身 0.9s
+  var TERM_DIE_DELAY = 5000;
+  var TERM_DIE_ANIM = 900;
+
+  function termStatusText(it) {
+    if (it.running) return '<span class="st run">执行中<span class="tm-dots"><i></i><i></i><i></i></span></span>';
+    if (it.background) return '<span class="st ok">已转后台</span>';
+    if (it.exit === 0 || it.exit === null || it.exit === undefined) return '<span class="st ok">完成</span>';
+    return '<span class="st bad">退出 ' + it.exit + '</span>';
+  }
+
+  function termRenderOne(it) {
+    var box = document.createElement('div');
+    box.className = 'tm' + (it.running ? ' running' : '') + (it.collapsed ? ' collapsed' : '');
+    // 已退出的命令到点自动消散。diedAt 在状态翻转为结束时打点；
+    // 重画每 800ms 重建节点会让动画从头重播，按「已消散时长」设负 delay 续播
+    var dieAge = it.diedAt ? Date.now() - it.diedAt : -1;
+    if (dieAge >= TERM_DIE_DELAY) {
+      box.classList.add('dying');
+      box.style.animationDelay = (-Math.min(dieAge - TERM_DIE_DELAY, TERM_DIE_ANIM)) / 1000 + 's';
+      if (dieAge - TERM_DIE_DELAY >= TERM_DIE_ANIM) it.dieGone = true;
+    }
+    var head = document.createElement('div');
+    head.className = 'tm-head';
+    head.title = (it.reason ? it.reason + '\n' : '') + (it.cmdText || it.cmd);
+    var who = document.createElement('span');
+    who.className = 'who' + (it.who === 'me' ? ' me' : '');
+    who.textContent = it.who === 'me' ? '我' : 'AI';
+    var cmd = document.createElement('span');
+    cmd.className = 'cmd';
+    cmd.textContent = it.cmdText || it.cmd;
+    var st = document.createElement('span');
+    st.innerHTML = termStatusText(it);
+    head.appendChild(who);
+    head.appendChild(cmd);
+    head.appendChild(st);
+    // 终止按钮：还跟着后端这条命令（term.trackIdx 指向它）就一直留着，
+    // 面板敲的命令在这种情况下会一直挂在 /api/terminal/run 里等进程退出，
+    // 按钮是唯一能把它从外面停掉的办法，不能因为「状态看着像完成」就藏起来。
+    // 已经跟丢的老记录才按 running 决定：跑完了就收掉
+    var tracked = term.items[term.trackIdx] === it;
+    if (it.running || tracked) {
+      var stopBtn = document.createElement('button');
+      stopBtn.className = 'stop';
+      stopBtn.type = 'button';
+      stopBtn.textContent = it.running ? '终止' : '已结束';
+      stopBtn.title = it.running ? '停止这条命令' : '这条命令已经跑完了';
+      stopBtn.disabled = !it.running;
+      if (it.running) {
+        stopBtn.addEventListener('click', function (e) {
+          e.stopPropagation();    // 别顺手把整条折叠了
+          termStopCmd(it, stopBtn);
+        });
+      }
+      head.appendChild(stopBtn);
+    }
+    // 放大：和文件预览一样弹全屏浮层，点遮罩 / Esc 关掉
+    var zoomBtn = document.createElement('button');
+    zoomBtn.className = 'zoom';
+    zoomBtn.type = 'button';
+    zoomBtn.textContent = '⤢';
+    zoomBtn.title = '放大查看';
+    zoomBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      termOpenBig(it);
+    });
+    head.appendChild(zoomBtn);
+    head.addEventListener('click', function () {
+      it.collapsed = !it.collapsed;
+      box.classList.toggle('collapsed', it.collapsed);
+    });
+    var out;
+    if (it.running || it.termscreen) {
+      // 全屏程序：按终端网格画，不显示控制序列。
+      // 外面这层负责滚动，里面那层按列数撑宽并给绝对定位的格子当锚点
+      it.termscreen = true;
+      out = document.createElement('div');
+      out.className = 'tm-term';
+      // 点一下就能直接按键操作（ncdu / top）。tabindex 让它能收键盘焦点，
+      // 放大浮层里还有一个输入框，触屏上更好点
+      out.tabIndex = 0;
+      out.title = '点这里后可以直接按键操作';
+      var inner = document.createElement('div');
+      inner.className = 'tm-term-in';
+      out.appendChild(inner);
+      out._inner = inner;
+      if (it.running) {
+        out._termIt = it;
+        term._unbind.push(termBindKeys(out));
+        // 轮询每 800ms 整块重画，用户刚点进来的焦点会随旧节点一起没掉，
+        // 那时 document.activeElement 已经是 body，靠它记不回来。
+        // 所以在聚焦时打一个标记，重画时据此把焦点还回去。
+        // 只有用户真把焦点移到别处（键盘 Tab 走、点到别的输入框）才清掉；
+        // 旧节点被 remove 时浏览器也会发 blur，但那时 activeElement 是 body，
+        // 不作为「用户主动放弃」处理，否则每轮重画都会自毁标记
+        out.addEventListener('focus', function () { it.wantFocus = true; });
+        out.addEventListener('blur', function () {
+          var a = document.activeElement;
+          if (a && a !== document.body) it.wantFocus = false;
+        });
+      }
+    } else {
+      out = document.createElement('pre');
+      out.className = 'tm-out';
+      out.textContent = it.out || (it.running ? '' : '（无输出）');
+      out.style.borderTop = '1px solid var(--line)';
+    }
+    box.appendChild(head);
+    box.appendChild(out);
+    if (it.termscreen) {
+      // 插进文档后再量字宽，量出来的才是真实值
+      requestAnimationFrame(function () { termPaintScreen(it, out._inner, 8); });
+    }
+    return box;
+  }
+
+  // 放大浮层：复用文件预览那套 #fbViewer
+  var termBig = null;   // 当前放大的是哪一条（null 表示浮层里是文件预览）
+  var termBigAnsi = false;   // 这条是不是终端网格（决定重绘走哪条路）
+
+  function termCloseBig() {
+    rbEl('fbViewer').classList.remove('show');
+    rbEl('fbViewer').classList.remove('term-mode');
+    rbEl('fvBody').classList.remove('term-body');
+    rbEl('fvBody').innerHTML = '';
+    rbEl('fvRef').style.display = '';
+    // 浮层是复用节点，按键绑定和它指向的那条命令必须一起摘掉，
+    // 否则下次预览文件时按键还会往已经退出的命令里写
+    if (termBig && termBig.unbind) {
+      termBig.unbind.forEach(function (f) { try { f(); } catch (e) {} });
+      termBig.unbind = null;
+    }
+    rbEl('fvKeys')._termIt = null;
+    termBig = null;
+    termBigAnsi = false;
+  }
+
+  function termOpenBig(it) {
+    // 浮层是共用的，先确保没点着别的预览残留
+    fbClosePreview();
+    termBig = { it: it };
+    var hideRef = rbEl('fvRef');
+    hideRef.style.display = 'none';   // 终端没有「引用到对话」
+    rbEl('fbViewer').classList.add('show', 'term-mode');
+    rbEl('fvName').textContent = it.cmdText || it.cmd;
+    var meta = it.termscreen || ansiHasEsc(it.out) ? '终端画面' : '普通输出';
+    if (it.running) meta += ' · 执行中';
+    rbEl('fvMeta').textContent = meta;
+    var body = rbEl('fvBody');
+    body.innerHTML = '';
+    body.classList.add('term-body');
+    var host = document.createElement('div');
+    host.className = 'term-big';
+    host.tabIndex = 0;
+    body.appendChild(host);
+    // 放大浮层里也挂按键：画面本身和顶上的输入框都能收
+    var keys = rbEl('fvKeys');
+    // 重复挂监听会叠出 N 份，一次按键发 N 遍，先换一个新节点再绑
+    var fresh = keys.cloneNode(true);
+    keys.parentNode.replaceChild(fresh, keys);
+    keys = rbEl('fvKeys');
+    keys.value = '';
+    // 输入框里敲的字符会同时进 value，不拦着的话越积越长；真正的内容
+    // 已经通过 /api/terminal/input 发给命令了，这里只当键盘收口用
+    keys._termIt = it.running ? it : null;
+    if (it.running) {
+      host._termIt = it;
+      // 浮层节点是复用的，解绑器挂到浮层这一份上，别混进面板重画那批
+      if (termBig.unbind) { termBig.unbind.forEach(function (f) { try { f(); } catch (e) {} }); }
+      termBig.unbind = [termBindKeys(host), termBindKeys(keys)];
+      // 打开就聚焦输入框：用户点放大就是为了接着操作，省一次点击
+      setTimeout(function () { if (termBig) keys.focus(); }, 30);
+    }
+    keys.style.display = it.running ? '' : 'none';
+    termBigAnsi = it.termscreen || ansiHasEsc(it.out);
+    requestAnimationFrame(function () {
+      if (!termBig) return;   // 量尺寸这一帧之前就被关掉了
+      var ansi = termBigAnsi;
+      // 字号按「整个画面刚好装进这块区域」反推：宽高两个方向都要满足，
+      // 取更小的那个（网页终端的通用做法：fit-to-box，不是先给个字号再缩）。
+      // 侧栏缩略图同理，只是上限换成面板宽度
+      var size = ansi ? termAnsiSize(it) : null;
+      var availW = body.getBoundingClientRect().width - 26;
+      var availH = body.getBoundingClientRect().height - 22;
+      // 高度按「实际写了多少行」算，别拿 50 行的空壳把字号压小
+      var rows = size ? size.rows : 24;
+      if (ansi) {
+        var probe = ansiNewScreen(size.rows, size.cols);
+        ansiFeed(probe, it.out || '');
+        rows = termContentRows(probe);
+      }
+      termPaintScreen(it, host,
+        termFitFont(host, { cols: size ? size.cols : 80, rows: rows },
+                    availW, availH, 20, 9, 20),
+        size, !ansi);
+    });
+  }
+
+  // 放大浮层里的画面跟着轮询一起刷新：不然 ncdu 在浮层里按了键，
+  // 画面要等用户关掉再打开才变。量好字号后直接重画同一块 host
+  function termRefreshBig() {
+    if (!termBig) return;
+    var it = termBig.it;
+    var host = rbEl('fvBody').querySelector('.term-big');
+    if (!host) return;
+    if (termBigAnsi) {
+      var fs = host._fs || 20;
+      termPaintScreen(it, host, fs, termAnsiSize(it));
+    } else {
+      var pre = host.querySelector('pre');
+      if (pre) pre.textContent = it.out || '';
+    }
+  }
+
+  // 终止当前这条：后端砍进程树 + 取消正在等它的对话轮次
+  function termStopCmd(it, btn) {
+    if (!token) return;
+    if (btn) btn.disabled = true;
+    fetch('/api/terminal/stop?token=' + encodeURIComponent(token), { method: 'POST' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        // 进程已经砍掉了，这里立刻把状态落到界面上；后端 CURRENT_CMD 的
+        // running 标志要等 /api/terminal/run 那个请求自己收尾才更新，
+        // 干等轮询的话按钮会一直亮着
+        it.running = false;
+        it.exit = it.exit === undefined || it.exit === null ? -1 : it.exit;
+        it.diedAt = Date.now();
+        if (!it.out) it.out = '';
+        it.out += '\n[已终止]';
+        if (d && d.killed === 0) it.out += ' （没有找到在跑的进程）';
+        termRenderAll();
+        termStopPoll();
+      })
+      .catch(function () {
+        if (btn) btn.disabled = false;
+      });
+  }
+
+  function termRenderAll() {
+    var list = rbEl('termList');
+    // 每次重画会新造节点，旧的按键绑定跟着一起没了：先把记下的解绑器跑一遍，
+    // 不然每 800ms 轮询重画一次就漏一个监听（节点被回收所以肉眼看不出来，
+    // 但放大浮层是复用的节点，会越叠越多）
+    if (term._unbind) { term._unbind.forEach(function (f) { try { f(); } catch (e) {} }); }
+    term._unbind = [];
+    if (!term.items.length) {
+      list.innerHTML = '<div class="fb-note">AI 执行的命令会实时出现在这里<br>也可以在下方输入框直接跑一条</div>';
+      return;
+    }
+    var nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 60;
+    // 整块重画会把键盘焦点一起丢掉：用户正对着 ncdu 按方向键时，
+    // 轮询每 800ms 重画一次，第二次按键就落到 body 上了，等于只能按一下。
+    // 先看有没有带标记的（用户点进来过的那条），没有再看当前焦点
+    var focusIt = null;
+    var ae = document.activeElement;
+    if (ae && ae._termIt) focusIt = ae._termIt;
+    if (!focusIt) {
+      for (var k = 0; k < term.items.length; k++) {
+        if (term.items[k].wantFocus && term.items[k].running) { focusIt = term.items[k]; break; }
+      }
+    }
+    list.innerHTML = '';
+    // 消散动画播完的（diedAt + 停留 + 动画时长）从列表里真正移除；
+    // 停轮询后没人重画就不会走到这里，所以放进 termRenderAll 每次重画时清
+    var gone = 0;
+    for (var g = 0; g < term.items.length; g++) {
+      var x = term.items[g];
+      if (!x.running && x.diedAt && Date.now() - x.diedAt > TERM_DIE_DELAY + TERM_DIE_ANIM + 100) {
+        gone++;
+      } else if (gone) {
+        term.items[g - gone] = x;
+      }
+    }
+    if (gone) {
+      term.items.length -= gone;
+      if (term.trackIdx >= term.items.length) term.trackIdx = term.items.length - 1;
+    }
+    term.items.forEach(function (it) { list.appendChild(termRenderOne(it)); });
+    // 用户往上翻看旧输出时不要把他拽回底部
+    if (nearBottom) list.scrollTop = list.scrollHeight;
+    // 输入框里正在打字的不抢：那时用户是在往命令框里敲东西
+    if (focusIt && ae !== rbEl('termCmd') && ae !== rbEl('fvKeys')) {
+      // 放大浮层里正开着这条：焦点还给浮层的按键框
+      if (termBig && termBig.it === focusIt && rbEl('fbViewer').classList.contains('show')) {
+        var ks = rbEl('fvKeys');
+        if (ks._termIt) ks.focus();
+      } else {
+        var hit = list.querySelectorAll('.tm-term');
+        for (var i = 0; i < hit.length; i++) {
+          if (hit[i]._termIt === focusIt) { hit[i]._termIt.wantFocus = true; hit[i].focus(); break; }
+        }
+      }
+    }
+    if (termBig) termRefreshBig();
+  }
+
+  function termAdd(who, cmd, reason, sentAt) {
+    var it = { id: ++term.seq, who: who, cmd: cmd, reason: reason || '',
+               sent: sentAt || 0, out: '', running: true, exit: null,
+               background: false, collapsed: false };
+    term.items.push(it);
+    // 只留最近 60 条：面板是「现场直播」，不是历史归档
+    if (term.items.length > 60) term.items.splice(0, term.items.length - 60);
+    term.trackIdx = term.items.length - 1;
+    termRenderAll();
+    termStartPoll();
+    return it;
+  }
+
+  function termApplyState(state) {
+    if (!state || term.trackIdx < 0) return;
+    var it = term.items[term.trackIdx];
+    if (!it) return;
+    // 面板敲的命令后端会包一层伪终端，CURRENT_CMD.cmd 是
+    // "stty ...; script -qefc '原命令' /dev/null"。要剥掉这层壳再和输入框
+    // 里的原文比：命令本身带单引号时后端会转成 '\''，子串比对必然失配，
+    // 「对不上」就把输出全丢了，面板一直停在第一帧、也挂不上键盘
+    var unwrapped = termUnwrapCmd(state.command || '');
+    var isMine = unwrapped ? unwrapped === it.cmd
+                           : (state.cmd || '').indexOf(it.cmd) >= 0;
+    // 轮询拿到的是「后端当前那条命令」，不一定是这一行。
+    // AI 那条是先推 term_start 再真正开跑，等面板拿到状态时命令往往已经跑完、
+    // CURRENT_CMD 也换了；对不上就说明不是它的，别乱套输出，也别一直转圈
+    if (it.sent) {
+      if (!state.started || state.started < it.sent - 60) {
+        if (it.running) {
+          it.running = false;
+          it.exit = null;
+          it.background = true;
+          termRenderAll();
+        }
+        termStopPoll();
+        return;
+      }
+    } else if (!isMine) {
+      return;
+    }
+    // 后端把原命令用单引号包起来、里面的单引号换成 '\''，标题还是显示
+    // 用户敲的原文；.cmd 保持不变，轮询时还要拿它和后端那条对账
+    if (it.sent) {
+      // AI 的命令不走面板输入框，标题是模型原样给的，不需要改
+      it.cmdText = it.cmd;
+    } else if (typeof state.command === 'string') {
+      it.cmdText = termUnwrapCmd(state.command) || it.cmd;
+    }
+
+    var changed = false;
+    if (typeof state.output === 'string') {
+      // 后端的输出首行是 "exit=N"：那是给模型看的退出码摘要，面板已经有
+      // 「完成 / 退出 N」徽章了，再打一行出来纯属噪音
+      var shown = state.output.replace(/^exit=-?\d+\r?\n/, '');
+      if (shown !== it.out) {
+        it.out = shown;
+        changed = true;
+      }
+    }
+    if (!state.running && it.running) {
+      it.running = false;
+      it.exit = state.exit;
+      it.background = !!state.background;
+      // 从现在起算 5 秒停留 + 0.9 秒消散，到点从面板里移除（见 termRenderOne）
+      it.diedAt = Date.now();
+      // 结束时轮询也停了，没人再重画：到点补一次重画把 dying 类带上（动画开始），
+      // 播完再补一次把它从列表里真正移除
+      setTimeout(function () { termRenderAll(); }, TERM_DIE_DELAY + 50);
+      setTimeout(function () { termRenderAll(); }, TERM_DIE_DELAY + TERM_DIE_ANIM + 150);
+      changed = true;
+    }
+    if (changed) termRenderAll();
+    // 这里的 it.running 是面板这一行的，不是后端的：套完还是「真在跑」才停轮询。
+    // 原来按 it.running 停，可开头「对不上号」那段会把它置成 false（进入面板时
+    // 后端那条更早的命令还没收尾），于是第一次轮询就把定时器关了——用户随后
+    // 敲的命令一条状态也拿不到，面板永远停在「完成」和空画面上
+    if (!state.running) termStopPoll();
+  }
+
+  function termPoll() {
+    if (!token) return;
+    fetch('/api/terminal?token=' + encodeURIComponent(token))
+      .then(function (r) { return r.json(); })
+      .then(function (d) { termApplyState(d.state); })
+      .catch(function () {});
+  }
+
+  function termStartPoll() {
+    if (term.pollTimer) return;
+    termPoll();
+    term.pollTimer = setInterval(termPoll, 800);
+  }
+
+  function termStopPoll() {
+    if (!term.pollTimer) return;
+    clearInterval(term.pollTimer);
+    term.pollTimer = null;
+  }
+
+  // 轮询开着却没东西可跟时，termApplyState 会直接 return（没有任何一条能收尾，
+  // 也就没人去停它）；再叠上一重保险，不然一个 800ms 的定时器会挂一整天
+  setInterval(function () {
+    if (!term.pollTimer) return;
+    if (term.trackIdx < 0) { termStopPoll(); return; }
+    var cur = term.items[term.trackIdx];
+    if (cur && !cur.running) termStopPoll();
+  }, 5000);
+
+  function termRunCmd() {
+    var inp = rbEl('termCmd');
+    var cmd = inp.value.trim();
+    if (!cmd || !token) return;
+    inp.value = '';
+    var it = termAdd('me', cmd, '');
+    rbEl('termRun').disabled = true;
+    fetch('/api/terminal/run?token=' + encodeURIComponent(token), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: cmd })
+    }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+      .then(function (res) {
+        var d = res.d || {};
+        if (d.pending) {
+          // 需要审批：交给对话里那句「确认」，面板这边只把结果写清楚
+          it.running = false;
+          it.exit = 1;
+          it.diedAt = Date.now();
+          it.out = '这条命令需要你确认：' + (d.description || cmd) + '\n在对话里回复「确认」后才会执行。';
+          termRenderAll();
+          termStopPoll();
+          return;
+        }
+        if (!res.ok) {
+          it.running = false;
+          it.exit = 1;
+          it.diedAt = Date.now();
+          it.out = d.detail || '执行失败';
+          termRenderAll();
+          termStopPoll();
+          return;
+        }
+        if (d.state) {
+          termApplyState(d.state);
+        } else {
+          it.running = false;
+          it.exit = 0;
+          it.diedAt = Date.now();
+          it.out = d.output || '';
+          termRenderAll();
+          termStopPoll();
+        }
+      })
+      .catch(function (e) {
+        it.running = false;
+        it.exit = 1;
+        it.diedAt = Date.now();
+        it.out = '请求失败：' + e;
+        termRenderAll();
+        termStopPoll();
+      })
+      .then(function () { rbEl('termRun').disabled = false; });
+  }
+
+  rbEl('termRun').addEventListener('click', termRunCmd);
+  rbEl('termCmd').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); termRunCmd(); }
+  });
+
+  // 恢复上次的布局 / 标签页
+  try {
+    var savedRb = JSON.parse(localStorage.getItem('deckmeido_rb') || '{}');
+    if (savedRb.tab) RB.tab = savedRb.tab;
+    RB.collapsed = !!savedRb.collapsed;
+    var savedSb = JSON.parse(localStorage.getItem('deckmeido_sb') || '{}');
+    SB.collapsed = !!savedSb.collapsed;
+  } catch (e) {}
+  window.addEventListener('resize', function () { rbApplyLayout(); sbApplyLayout(); });
+  sbApplyLayout();
+  // 首屏只走 rbShowTab 这一条路：它里面按 tab 决定要不要 fbLoad。
+  // 之前这里另起一次 fbLoad，两路并发后到的会把先到的列表覆盖成「加载中…」
+  rbShowTab(RB.tab || 'file');
+
+  // 工作区路径：点文件时判断能不能用 @{...} 引用，先取一次
+  fetch('/api/files?token=' + encodeURIComponent(token))
+    .then(function (r) { return r.json(); })
+    .then(function (res) { window.__wsPath = res.workspace || ''; })
+    .catch(function () {});
+
+
   function turnCacheText() {
     var all = turnCache.segs.slice();
     if (turnCache.cur) all.push(turnCache.cur);
@@ -2754,6 +4667,13 @@
           break;
         case 'tool_activity':
           showTyping(msg.text);
+          break;
+        case 'fs_follow':
+          // AI 读写/列目录：文件面板跟过去（用户手动点过别处就不跟，只更新横幅）
+          if (msg.path) fbFocusAi(msg.path, msg.is_dir);
+          break;
+        case 'term_start':
+          if (msg.command) termAdd('ai', msg.command, msg.reason, msg.ts_sent || msg.ts || 0);
           break;
         case 'status':
           renderStatus(msg.data || {});
@@ -3414,6 +5334,9 @@
     if (!t) { authErr.textContent = '请先输入令牌'; return; }
     token = t;
     localStorage.setItem('deckmeido_token', t);
+    // 右侧工具栏的首次加载发生在脚本末尾，那时可能还没有令牌；
+    // 这里补一次，免得登录后文件面板一直是「加载中…」
+    if (!fb.path) fbLoad(fb.follow ? fb.aiPath : '');
     // 旧连接（用的是被拒的旧令牌）还挂在 ws 上，readyState 是 0/1，
     // 直接 connect() 会被防重入挡掉，主人看到的就是「输对了令牌却一直转圈」
     reconnectNow();
@@ -3566,6 +5489,8 @@
     // 要看分区导航，点顶栏那颗「菜单」
     document.body.classList.add('settings-mode');
     document.body.classList.remove('sb-open');
+    // 设置页保留右栏，宽度和收起态跟着同一个 RB 走
+    rbApplyLayout();
     document.title = '设置 · DeckMeido';
     // 顶栏是共用的一条，标题跟着换；关掉设置时 closeSettings 会还回去
     setHdrTitle('设置');
@@ -3878,6 +5803,8 @@
   function closeSettings() {
     document.body.classList.remove('settings-mode');
     document.body.classList.remove('sb-open');
+    // 退回对话页：右栏的显示/抽屉状态重新按对话页规则算一遍
+    rbApplyLayout();
     document.title = 'DeckMeido';
     // 顶栏是共用的：「设置」只是临时借用，回到对话就把会话名还回来
     setHdrTitle(curSessTitle);
@@ -4396,15 +6323,23 @@
   });
 
   // 拖拽：整页接收，拖到窗口任意位置都能加附件
+  // 文件面板里拖出来的行带 PANEL_MIME：那不是外部文件，是直接引用路径，不走上传
+  var PANEL_MIME = 'application/x-deckmeido-file';
+  function dragHasPanelFile(dt) {
+    return !!dt && Array.prototype.indexOf.call(dt.types, PANEL_MIME) >= 0;
+  }
   var dropHint = document.getElementById('dropHint');
   var dragDepth = 0;
   window.addEventListener('dragenter', function (e) {
+    if (dragHasPanelFile(e.dataTransfer)) return;   // 面板内拖拽不弹「松手添加附件」
     if (!e.dataTransfer || Array.prototype.indexOf.call(e.dataTransfer.types, 'Files') < 0) return;
     dragDepth++;
     dropHint.classList.add('show');
   });
   window.addEventListener('dragover', function (e) {
-    if (e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types, 'Files') >= 0) {
+    if (!e.dataTransfer) return;
+    if (dragHasPanelFile(e.dataTransfer) ||
+        Array.prototype.indexOf.call(e.dataTransfer.types, 'Files') >= 0) {
       e.preventDefault();
       e.dataTransfer.dropEffect = 'copy';
     }
@@ -4415,6 +6350,15 @@
   });
   window.addEventListener('drop', function (e) {
     if (!e.dataTransfer) return;
+    // 文件面板拖来的：路径已经在 dataTransfer 里，直接插 @{相对路径}
+    if (dragHasPanelFile(e.dataTransfer)) {
+      e.preventDefault();
+      dragDepth = 0;
+      dropHint.classList.remove('show');
+      var ref = e.dataTransfer.getData(PANEL_MIME) || e.dataTransfer.getData('text/plain');
+      if (ref) fbQuote(ref);
+      return;
+    }
     var files = e.dataTransfer.files;
     if (!files || !files.length) return;
     e.preventDefault();
@@ -4687,6 +6631,10 @@
   });
 
   connect();
+  // 连上之后才知道有没有令牌；文件面板首屏在这里补加载一次
+  setTimeout(function () {
+    if (fb.follow && !fb.aiPath && RB.tab === 'file') fbLoad('');
+  }, 500);
 
   // ---------- / 快捷命令 ----------
   var COMMANDS = [
