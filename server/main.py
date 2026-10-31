@@ -275,9 +275,10 @@ def _build_llm_msgs(hist: list[dict], sys_prompt: str, sid: str = "") -> list[di
         # 网关对请求体有上限，超了会被上游截断并返回 503，整轮提问跟着失败；
         # 这些图只是当时那一轮的参考，用一句说明代替即可
         content = _shrink_oversized_images(content)
-        # DeepSeek 没有视觉接口，历史里那几张旧画面本来也看不见：
-        # 换成固定文案，省输入费的同时让前缀每轮都一模一样
-        if llm.is_deepseek and isinstance(content, list):
+        # 不支持视觉的模型（DeepSeek 纯文本系列），历史里那几张旧画面本来也看不见：
+        # 换成固定文案，省输入费的同时让前缀每轮都一模一样。
+        # 支持视觉的（deepseek-v4-pro、GPT/Claude/Qwen 等）保留原图，别再误替换
+        if not llm.supports_vision and isinstance(content, list):
             content = [_restale_image_part(p) for p in content]
         # 历史里还存了 ts / events 供界面回放，发给模型时只保留 role 和 content
         msgs.append({"role": m["role"], "content": content,
@@ -396,7 +397,7 @@ def _drop_orphan_tools(msgs: list[dict]) -> list[dict]:
             if m.get("tool_call_id") not in called:
                 continue
             content = m.get("content")
-            if keep_reasoning and isinstance(content, list):
+            if keep_reasoning and not llm.supports_vision and isinstance(content, list):
                 content = [_restale_image_part(p) for p in content]
             m = {"role": "tool", "tool_call_id": m["tool_call_id"], "content": content}
             out.append(m)
@@ -2520,6 +2521,82 @@ async def api_models(base_url: str = "", api_key: str = ""):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"拉取模型列表失败：{exc}")
     return {"models": names}
+
+
+@app.get("/api/llm/capabilities", dependencies=[Depends(check_token)])
+async def api_llm_capabilities(base_url: str = "", api_key: str = "", model: str = ""):
+    """真实探测当前模型能力（vision / tools / reasoning），供校验页展示。
+
+    带上 base_url/api_key/model 时用面板里刚填的值临时探测（不落盘），
+    否则探测运行中的那套配置。探测是真实发 1×1 图 + 空工具的小请求，
+    结果告诉前端「这个模型到底支不支持看图/调工具」，而不是靠猜模型名。
+    """
+    try:
+        if base_url.strip() or model.strip():
+            probe = LLMClient(
+                base_url=_norm_base_url(base_url or llm.base_url),
+                api_key=(api_key or llm.api_key).strip(),
+                model=(model or llm.model).strip(),
+                timeout=30.0,
+            )
+            try:
+                caps = await probe.probe_capabilities()
+            finally:
+                await probe.close()
+        else:
+            caps = await llm.probe_capabilities()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"能力探测失败：{exc}")
+    return {"model": model or llm.model, **caps}
+
+
+@app.get("/api/llm/capabilities/all", dependencies=[Depends(check_token)])
+async def api_llm_capabilities_all(base_url: str = "", api_key: str = ""):
+    """拉取该地址下所有模型，并逐个探测能力，返回带能力标签的清单。
+
+    设置页「保存」后调用，让主人一眼看清每个模型支不支持看图/调工具/思考。
+    逐个探测太慢（几十个模型串行要几分钟），用信号量限制并发 + 单模型短超时，
+    且探测请求 max_tokens=1，token 开销几乎为 0。
+    """
+    try:
+        if base_url.strip() or api_key.strip():
+            probe = LLMClient(
+                base_url=_norm_base_url(base_url or llm.base_url),
+                api_key=(api_key or llm.api_key).strip(),
+                model=llm.model,
+                timeout=20.0,
+            )
+            use = probe
+        else:
+            use = llm
+        names = await use.list_models()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"拉取模型列表失败：{exc}")
+
+    sem = asyncio.Semaphore(5)
+    results: dict[str, dict] = {}
+
+    async def _one(mid: str):
+        async with sem:
+            c = LLMClient(
+                base_url=use.base_url, api_key=use.api_key,
+                model=mid, timeout=15.0,
+            )
+            try:
+                caps = await c.probe_capabilities()
+                results[mid] = {"id": mid, **caps}
+            except Exception as exc:
+                results[mid] = {"id": mid, "vision": False, "tools": False,
+                                "reasoning": False, "error": str(exc)}
+            finally:
+                await c.close()
+
+    await asyncio.gather(*(_one(m) for m in names))
+    if use is not llm:
+        await use.close()
+    # 按模型名排序，展示稳定
+    ordered = sorted(results.values(), key=lambda r: r["id"].lower())
+    return {"models": ordered}
 
 
 @app.post("/api/retry", dependencies=[Depends(check_token)])

@@ -92,6 +92,22 @@ class LLMClient:
         """是不是 DeepSeek 官方接口（决定要不要发它的专属参数）"""
         return "deepseek" in self.base_url.lower()
 
+    @property
+    def supports_vision(self) -> bool:
+        """模型能不能看图（多模态 image_url）
+
+        DeepSeek 官方早期只有纯文本（deepseek-chat / reasoner / v3），
+        新出的 v4 系列（v4-pro 等）才带视觉。以前这里一刀切用 is_deepseek
+        判断，把所有 DeepSeek 的历史图都换成占位文案，导致 v4-pro 明明能读图
+        却回「我看不到图片」。现在按模型名细分：
+        - DeepSeek：模型名带 vision / vl / v4 / pro 视为支持视觉
+        - 其他服务商（OpenAI / Claude / Qwen / Gemini 等）：默认支持
+        """
+        m = (self.model or "").strip().lower()
+        if self.is_deepseek:
+            return any(k in m for k in ("vision", "vl", "v4", "pro", "qwen"))
+        return True
+
     def normalize(self) -> None:
         """把「照抄别人家的写法」纠正成 DeepSeek 认的写法
 
@@ -141,6 +157,99 @@ class LLMClient:
             if mid:
                 names.append(mid)
         return sorted(set(names))
+
+    # 1×1 透明 PNG，探测视觉能力用：真实发一张图看服务商收不收，
+    # 而不是靠模型名猜。base64 极短，几乎不占 token。
+    _PROBE_PNG = (
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
+        "AAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    )
+
+    async def probe_capabilities(self) -> dict:
+        """真实探测模型能力：vision / tools / reasoning
+
+        不猜模型名，而是分别发极简请求看服务商是否接受：
+        - vision：带一张 1×1 图，成功返回或报「不支持图片」以外的错都算有图
+        - tools：带一个空工具定义，看服务商认不认 tools 参数
+        - reasoning：DeepSeek 专属参数 reasoner_effort 之外，直接按模型名判
+
+        max_tokens=1，token 消耗几乎为 0；结果缓存，校验页反复点不重复花钱。
+        """
+        if getattr(self, "_probe_cache", None) is not None:
+            return self._probe_cache
+
+        out = {"vision": False, "tools": False, "reasoning": False, "error": ""}
+
+        # 1) 视觉：带图请求。中转站（OneAPI/new-api 等聚合站）对图片格式兼容不一，
+        #    标准 OpenAI 用 image_url 包一层 data URL，部分站要裸 base64（image）或
+        #    input_image。这里挨个试，只要有一种被接受（HTTP < 400）就算支持看图。
+        #    判定不用关键词猜错误信息——那对中转站的「模型路由错误/参数非法」
+        #    这类通用报错完全不成立，会误判成不支持。
+        vision_variants = [
+            {"type": "image_url", "image_url": {"url": self._PROBE_PNG}},
+            {"type": "input_image", "image_url": {"url": self._PROBE_PNG}},
+            {"type": "input_image", "image_url": self._PROBE_PNG},
+            {"type": "image", "source": {"type": "base64",
+                                         "media_type": "image/png",
+                                         "data": self._PROBE_PNG.split(",", 1)[1]}},
+        ]
+        last_vision_err = ""
+        for part in vision_variants:
+            try:
+                payload = {
+                    "model": self.model,
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "看到这张图了吗？只回“是”。"},
+                        part,
+                    ]}],
+                }
+                resp = await self._client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json=payload,
+                )
+                if resp.status_code < 400:
+                    out["vision"] = True
+                    break
+                last_vision_err = (resp.text or "")[:200]
+            except Exception as exc:
+                last_vision_err = str(exc)[:200]
+        if not out["vision"] and last_vision_err:
+            out["error"] = out["error"] or f"视觉探测失败：{last_vision_err}"
+
+        # 2) 工具调用：带一个空工具
+        try:
+            payload = {
+                "model": self.model,
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "ping"}],
+                "tools": [{"type": "function", "function": {
+                    "name": "ping", "description": "测试",
+                    "parameters": {"type": "object", "properties": {}}}}],
+                "tool_choice": "none",
+            }
+            resp = await self._client.post(
+                f"{self.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json=payload,
+            )
+            if resp.status_code < 400:
+                out["tools"] = True
+            else:
+                out["error"] = out["error"] or f"工具探测失败：{(resp.text or '')[:200]}"
+        except Exception as exc:
+            out["error"] = out["error"] or f"工具探测失败：{exc}"
+
+        # 3) 推理：DeepSeek 系靠 reasoning_effort 参数；其余按模型名里的推理标记
+        m = (self.model or "").lower()
+        out["reasoning"] = bool(
+            self.is_deepseek and self.reasoning_effort in ("high", "max")
+            or any(k in m for k in ("o1", "o3", "o4", "reasoner", "thinking", "reason"))
+        )
+
+        self._probe_cache = out
+        return out
 
     async def chat(self, messages: list[dict]) -> str:
         # 摘要/收尾这类一次性调用也走流式：DeepSeek 每次非流式请求都会把整段
