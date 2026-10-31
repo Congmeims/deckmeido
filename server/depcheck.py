@@ -28,9 +28,10 @@ CACHE_TTL = 60.0
 #   label    中文短名
 #   critical 坏了就等于「没法替你在桌面上动手」
 CONTROLS = [
+    # wtype 并入 ydotool：两者都是输入注入（一个 X11/全局、一个 Wayland 原生），
+    # 对用户来说是同一件事「能不能替我打字/点击」，拆两行只会让 6/6 看着臃肿
     ("ydotool", "点击输入", True),
     ("kdotool", "窗口聚焦", True),
-    ("wtype", "原生打字", False),
     ("espeak", "语音播报", False),
     ("fakeroot", "构建依赖", False),
     ("spectacle", "截图工具", False),
@@ -82,7 +83,13 @@ def _probe_ydotool() -> tuple[bool, str]:
     finally:
         s.close()
     # 这里不再发 mousemove 之类的探针命令：那会把用户的光标真的挪走
-    return True, ""
+    ok = True
+    note = ""
+    # wtype 并入这条一起看：它管 Wayland 原生窗口的打字，缺了不点灯，
+    # 只在备注里提一句（ydotool 本身还能点，属于降级而非故障）
+    if not shutil.which("wtype"):
+        ok, note = True, "；wtype 未安装，Wayland 原生窗口打字不可用（bash install.sh check --fix 可补）"
+    return ok, note
 
 
 def _probe_kdotool() -> tuple[bool, str]:

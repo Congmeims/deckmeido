@@ -3,9 +3,26 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<script>
+  // 手机竖屏强制横屏（雀魂式）：在 CSS 布局计算前、body 渲染前就判断，
+  // 给 <html> 打上 force-ls 标记。viewport 保持 device-width 不动——
+  // 字 1:1 不缩小（之前反复栽在「改 viewport 缩放」上，Chrome 会忽略运行时改的
+  // initial-scale）。旋转和断点覆盖全部交给 CSS 里的 html.force-ls 规则完成。
+  (function () {
+    try {
+      var touch = window.matchMedia('(hover: none)').matches;
+      var portrait = window.innerHeight > window.innerWidth;
+      if (touch && portrait) {
+        document.documentElement.classList.add('force-ls');
+      }
+    } catch (e) {}
+  })();
+</script>
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0f1117">
 <link rel="icon" type="image/png" href="/favicon.png">
+<link rel="apple-touch-icon" href="/logo.png">
+<link rel="manifest" href="/manifest.json">
 <title>DeckMeido</title>
 <style>
   :root {
@@ -33,6 +50,42 @@
     overflow: hidden;
   }
 
+  /* 手机竖屏强制横屏：像雀魂网页版一样，竖着拿手机时整个界面旋转 90° 渲染。
+     viewport 保持 device-width（字 1:1，绝不碰 shrink-to-fit），
+     缩放/旋转全靠 #app 的 transform。
+     force-ls 这个 class 由 <head> 里的同步脚本按「触屏 + 竖屏」打上，
+     所以这里直接用 html.force-ls 选择器，不再重复 media 查询（桌面浏览器
+     hover:none 恒 false，套 media 会让规则失效、也没法自测）。
+     几何：竖屏时 100vw=屏幕短边(如 421px)、100vh=屏幕长边(如 927px)。
+     #app 按「横屏」尺寸布局——宽取长边(100vh)、高取短边(100vw)，
+     再 rotate(90deg) 旋转，927×421 变成 421×927，正好铺满竖屏，字不变形。
+     transform-origin: top left 后向左下方旋转，用 translate 把它拉回可视区 */
+  html.force-ls {
+    /* 用 dvh/dvw 而不是 vh/vw：Chrome 安卓的 100vh 含地址栏收起后的高度，
+       比可视区大，旋转后两端会被裁掉；dvh 跟随实际可视区 */
+    width: 100dvh;
+    height: 100dvw;
+    overflow: hidden;
+  }
+  html.force-ls body {
+    width: 100dvh;
+    height: 100dvw;
+    overflow: hidden;
+  }
+  html.force-ls #app {
+    position: fixed;
+    left: 100dvw;
+    top: 0;
+    width: 100dvh;
+    height: 100dvw;
+    transform-origin: top left;
+    transform: rotate(90deg);
+  }
+  /* 旋转后 #main 的 100dvh 仍按竖屏视口算（927px 高），而旋转后可视高只有
+     竖屏宽（421px），#messages 被撑到 927 高、滚不出可视区，触摸滚动失效。
+     改成 100% 跟随 #app 的固定高度，滚动容器才拿到正确高度 */
+  html.force-ls #main { height: 100%; }
+
   /* 顶部状态栏 */
   header {
     flex: 0 0 auto;
@@ -48,14 +101,6 @@
           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 230px; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--danger); flex: 0 0 auto; }
   .dot.on { background: #2ecc71; }
-  .status-text {
-    /* 与右侧「桌面模式」等徽章同一套圆角底色，视觉上对齐 */
-    color: var(--muted); font-size: 12px;
-    background: var(--surface-2);
-    padding: 4px 10px; border-radius: 999px;
-    flex: 0 1 auto; min-width: 0;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
   .badge {
     font-size: 12px; color: var(--muted);
     background: var(--surface-2);
@@ -1051,24 +1096,9 @@
     resize: vertical;
   }
   .field-hint { font-size: 12px; color: var(--muted); margin-top: 6px; min-height: 16px; }
-  /* 模型能力清单：每个模型一行，右侧能力标签胶囊 */
-  .model-caps { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow-y: auto; }
-  .model-caps-row {
-    display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px;
-    padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px;
-    background: var(--surface); font-size: 13px;
-  }
-  .model-caps-row .mc-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, monospace; }
-  .model-caps-row .mc-tags { display: flex; gap: 4px; flex: 0 0 auto; }
-  .model-caps-row .mc-err {
-    flex: 1 1 100%; font-size: 11px; color: var(--danger);
-    word-break: break-all; line-height: 1.4;
-  }
-  .mc-tag { font-size: 11px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
-  .mc-tag.on { color: var(--brand); border-color: var(--brand); background: rgba(26, 159, 255, .1); }
-  .mc-tag.off { opacity: .45; }
-  .model-caps .mc-loading { font-size: 12px; color: var(--muted); }
   /* 设置页里的下拉框：和输入框同一套外观，别再各写一份内联样式 */
+  /* 设置页里的模型选择下拉：和上面输入框同宽，别继承工具栏下拉的固定 240px */
+  #modelCapsSelect { width: 100%; max-width: none; }
   .cfg-select {
     width: 100%; padding: 12px 14px;
     border: 1px solid var(--line); border-radius: 10px;
@@ -1465,8 +1495,6 @@
   @media (max-width: 560px) {
     header { gap: 7px; padding: 8px 10px; padding-top: calc(8px + env(safe-area-inset-top)); }
     .logo { font-size: 15px; }
-    /* 状态文案只留“已连接 / 重连中”，避免和右侧徽章抢宽度 */
-    .status-text { max-width: 4em; }
     .hdr-right { gap: 5px; flex: 0 1 auto; min-width: 0; flex-wrap: nowrap; }
     .badge { padding: 3px 8px; font-size: 11px; }
     /* 手机竖屏顶栏只留模式徽章：上下文用量移进侧栏状态卡（见 #ctxRow）。
@@ -1504,15 +1532,6 @@
     #send { min-width: 48px; padding: 0 12px; font-size: 14px; }
     .cb-btn { padding: 0 8px; }
   }
-  /* 控件自检面板：点右上角徽章弹出 */
-  #ctrlPanel {
-    position: fixed; inset: 0;
-    background: var(--overlay);
-    display: none;
-    align-items: flex-end;
-    z-index: 22;
-  }
-  #ctrlPanel.show { display: flex; }
   #ctrlBadge { cursor: pointer; }
   #ctrlBadge:active { opacity: .7; }
   .ctrl-list { display: flex; flex-direction: column; gap: 2px; margin-bottom: 12px; }
@@ -1653,6 +1672,22 @@
   #fbFollow.show { display: flex; }
   #fbFollow .p { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     direction: rtl; text-align: left; }
+  /* AI 切换目录的跟踪提示：占自己的一行（不叠在别的元素上，之前 absolute
+     会把面包屑路径盖住，看起来文字重叠），出现时把下方内容推开、消失时收起 */
+  #fbTrackTip {
+    display: none; align-items: center; gap: 6px;
+    padding: 7px 10px; font-size: 11.5px; color: #1a9fff;
+    background: rgba(26,159,255,.12); border-bottom: 1px solid rgba(26,159,255,.25);
+  }
+  #fbTrackTip.show { display: flex; animation: fbTipIn .28s ease; }
+  @keyframes fbTipIn { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+  #fbTrackTip .ico { color: #1a9fff; }
+  #fbTrackTip .p { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    direction: rtl; text-align: left; }
+  /* AI 跟随跳转时列表的一次淡入过渡：替换「清空→闪白→重绘」的生硬切换 */
+  #fbList.fb-anim { animation: fbListIn .34s ease; }
+  @keyframes fbListIn { from { opacity: .2; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) { #fbList.fb-anim, #fbTrackTip { animation: none !important; transition: none !important; } }
   #fbBar {
     flex: 0 0 auto; display: flex; align-items: center; gap: 4px;
     padding: 6px 8px; border-bottom: 1px solid var(--line);
@@ -2105,6 +2140,43 @@
   body.settings-mode.rb-collapsed #rbPaneFile,
   body.settings-mode.rb-collapsed #rbPaneTerm { display: none !important; }
 
+  /* ===== 手机竖屏强制横屏：三栏断点反向覆盖 =====
+     viewport 仍是 device-width（如 421px），所以 @media(max-width:760/1080px)
+     的抽屉断点会命中，把三栏塌成抽屉、顶栏收窄。但 force-ls 旋转后 #app 的
+     实际渲染宽度是 100vh（≈927px，横屏长边），足以放下一整套三栏。
+     这里用 html.force-ls 更高优先级，把断点对三栏布局的副作用全部撤销，
+     恢复桌面三栏（字 1:1）。 */
+  /* 左栏：撤销 760px 断点的抽屉化，回到桌面 flex 三栏 */
+  html.force-ls #sidebar {
+    position: relative; z-index: auto; left: auto; top: auto; bottom: auto;
+    width: auto; flex: 0 0 15%;
+    transform: none; box-shadow: none;
+  }
+  html.force-ls #main { flex: 1 1 62.5%; }
+  html.force-ls #sbToggle { display: inline-flex; }
+  html.force-ls #btnMenu { display: none; }
+
+  /* 右栏：撤销 1080px 断点的抽屉化，回到桌面 flex 三栏 */
+  html.force-ls #rightbar {
+    position: relative; z-index: auto; right: auto; top: auto; bottom: auto;
+    width: auto !important; flex: 0 0 22.5%;
+    transform: none; box-shadow: none;
+  }
+  html.force-ls #btnRight { display: none; }
+  html.force-ls #rbToggle { display: none; }
+
+  /* 撤销 560px 断点对顶栏/消息/输入框的字号与间距收窄 */
+  html.force-ls header { gap: 10px; padding: 10px 14px; padding-top: calc(10px + env(safe-area-inset-top)); }
+  html.force-ls .logo { font-size: 17px; }
+  html.force-ls .hdr-right { gap: 8px; flex-wrap: wrap; }
+  html.force-ls .badge { padding: 4px 10px; font-size: 12px; }
+  html.force-ls #ctxBadge { display: inline-flex !important; }
+  html.force-ls #modeBadge { padding: 4px 10px; font-size: 12px; }
+  html.force-ls #messages { padding: 14px; gap: 10px; }
+  html.force-ls .msg { max-width: 85%; font-size: 15.5px; padding: 10px 14px; }
+  html.force-ls #composer { padding: 8px 14px; gap: 8px; }
+  html.force-ls #input { font-size: 15px; padding: 10px 12px; min-height: 44px; }
+
 </style>
 <!-- xterm.js：真终端模拟器，替换自研 ANSI 网格渲染。
      本地文件（server/static/xterm.*），离线可用，不影响单文件部署 -->
@@ -2176,12 +2248,12 @@
   <button class="cb-btn" id="btnRight" title="文件 / 终端">工具</button>
   <span class="dot" id="dot"></span>
   <span class="logo" id="hdrTitle" title="DeckMeido">DeckMeido</span>
-  <span class="status-text" id="statusText">连接中…</span>
   <span class="spacer"></span>
   <div class="hdr-right">
     <span class="badge" id="ctxBadge" hidden></span>
     <span class="badge ctrl" id="ctrlBadge" hidden></span>
     <span class="badge" id="modeBadge" hidden></span>
+    <button class="menu-btn" id="btnFullscreen" title="全屏">⛶</button>
   </div>
 </header>
 
@@ -2270,13 +2342,13 @@
               <label>API Key</label>
               <div class="token-row">
                 <input id="cfgApiKey" type="password" placeholder="sk-…" autocomplete="off">
-                <button id="clearApiKey" class="mini-btn" type="button">验证</button>
+                <button id="clearApiKey" class="mini-btn" type="button">保存</button>
               </div>
               <div id="apiKeyHint" class="field-hint"></div>
             </div>
             <div class="field">
-              <label>模型能力清单（点「验证」或保存后自动探测）</label>
-              <div id="modelCaps" class="model-caps"></div>
+              <label>模型选择（保存后拉取，选中即当前对话模型）</label>
+              <select id="modelCapsSelect" class="cb-select" title="模型"></select>
             </div>
           </div>
         </section>
@@ -2415,6 +2487,17 @@
               <div id="qrBox" class="qr-box"></div>
             </div>
           </div>
+          <div class="card">
+            <div class="card-title">桌面控件自检</div>
+            <div class="ctrl-list" id="ctrlList"></div>
+            <div class="ctrl-yd" id="ctrlYd"></div>
+            <div class="ctrl-actions">
+              <button id="ctrlFix" type="button">修复守护进程</button>
+              <button id="ctrlReflash" class="mini-btn" type="button">重新实测</button>
+            </div>
+            <div id="ctrlHint" class="upd-note"></div>
+            <div id="ctrlLog" class="ctrl-log"></div>
+          </div>
         </section>
 
         <section class="set-pane" data-pane="about">
@@ -2498,6 +2581,8 @@
   <div class="rb-pane on" id="rbPaneFile">
     <!-- 用户手动点过别处后不再跟着 AI 跑，这条横幅就是「点此回到跟随」的入口 -->
     <div id="fbFollow"><span>AI 正在看：</span><span class="p" id="fbFollowPath"></span><span>· 点此跟随</span></div>
+    <!-- AI 主动切换目录时的跟踪提示：短暂淡入淡出，告诉用户面板是被 AI 拽过去的 -->
+    <div id="fbTrackTip"><span class="ico">◉</span><span>AI 正在定位</span><span class="p" id="fbTrackPath"></span></div>
     <div id="fbBar">
       <button id="fbUp" title="上一级"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg></button>
       <button id="fbHome" title="回到工作区"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/></svg></button>
@@ -2557,28 +2642,12 @@
   </div>
 </div>
 
-<div id="ctrlPanel">
-  <div class="sheet">
-    <h2>桌面控件自检</h2>
-    <div class="ctrl-list" id="ctrlList"></div>
-    <div class="ctrl-yd" id="ctrlYd"></div>
-    <div class="ctrl-actions">
-      <button id="ctrlFix" type="button">一键修复</button>
-      <button id="ctrlReflash" class="mini-btn" type="button">重新实测</button>
-    </div>
-    <div id="ctrlHint" class="upd-note"></div>
-    <div id="ctrlLog" class="ctrl-log"></div>
-    <button id="ctrlClose" class="mini-btn" type="button" style="margin-top:12px;width:100%">关闭</button>
-  </div>
-</div>
-
 <script>
 (function () {
   var messages = document.getElementById('messages');
   var input = document.getElementById('input');
   var sendBtn = document.getElementById('send');
   var dot = document.getElementById('dot');
-  var statusText = document.getElementById('statusText');
   var ctrlBadge = document.getElementById('ctrlBadge');
   var modeBadge = document.getElementById('modeBadge');
   var ctxBadge = document.getElementById('ctxBadge');
@@ -2890,8 +2959,12 @@
       el.appendChild(src);
     }
     var body = document.createElement('div');
-    body.innerHTML = renderMd(text);
+    // @{} 引用标记不进正文：整行剔掉（单独成行时），气泡末尾用胶囊展示
+    var shown = String(text || '').replace(/^[ \t]*@\{[^}\n]+\}[ \t]*$/gm, '')
+      .replace(/\n{3,}/g, '\n\n').trim();
+    body.innerHTML = renderMd(shown);
     el.appendChild(body);
+    appendRefChips(el, text);
     // 随提问附带的画面（截屏询问）：缩略图直接嵌在气泡正文下面。
     // 之前它被画成助手侧的一条「截图」时间线，看起来像是 AI 自己截的图
     (events || []).forEach(function (ev) {
@@ -2919,6 +2992,35 @@
     });
     addMsgFoot(el, ts, 'user');
     return el;
+  }
+
+  // 用户气泡里的 @{} 引用文件：渲染成附件胶囊（跟输入框上方的同款），
+  // 而不是一行裸 @{xxx} 文本。标记本身从正文里剔掉，不占对话正文
+  function appendRefChips(el, text) {
+    var re = /@\{([^}\n]+)\}/g, m, found = [];
+    while ((m = re.exec(String(text || ''))) !== null) found.push(m[1]);
+    if (!found.length) return;
+    found.forEach(function (ref) {
+      var name = ref.split('/').pop();
+      var chip = document.createElement('span');
+      chip.className = 'atchip';
+      var thumb = document.createElement('span');
+      thumb.className = 'at-thumb';
+      var ext = fileExt(name);
+      if (ext) {
+        var ex = document.createElement('span');
+        ex.className = 'at-ext';
+        ex.textContent = ext;
+        thumb.appendChild(ex);
+      }
+      var nm = document.createElement('span');
+      nm.className = 'at-name';
+      nm.textContent = name;
+      nm.title = ref;
+      chip.appendChild(thumb);
+      chip.appendChild(nm);
+      el.appendChild(chip);
+    });
   }
 
   // 点缩略图看原图：直接开一个覆盖层，不跳转页面（跳走会丢掉当前对话状态）
@@ -3322,8 +3424,22 @@
 
   function setConnected(ok) {
     dot.className = ok ? 'dot on' : 'dot';
-    statusText.textContent = ok ? '已连接' : '已断开，重连中…';
+    // 连接状态只看绿灯，不再占文字位（断线时由绿灯熄灭提示）
     sendBtn.disabled = !ok;
+    // 控件徽章里的「后端服务」一项跟随连接状态即时变色：
+    // 断线立刻红（带着 6/6 的旧绿灯缓存最误导人），重连后恢复
+    if (typeof renderControls === 'function' && lastControls) renderControls(lastControls);
+    // 文件面板的两条提示条与断线联动：
+    // - 断线时「AI 正在定位」的内容已经过期，立刻收掉；
+    //   「加载中…/读取失败」也是断线留下的死状态
+    // - 重连后按当前跟随状态重新拉一次列表，面板自动恢复，不用手动点
+    if (typeof rbEl === 'function') {
+      var tip = rbEl('fbTrackTip');
+      if (tip) tip.classList.remove('show');
+      if (ok && typeof fbLoad === 'function' && RB && RB.tab === 'file') {
+        fbLoad(fb.follow ? (fb.aiPath || fb.path || '') : (fb.path || ''));
+      }
+    }
   }
 
   var liveBox = null;      // 本轮对话的事件容器（实时渲染工具终端块）
@@ -3352,7 +3468,8 @@
   // term_start 事件让终端面板挂一条「执行中」并开始轮询实时输出。
   var RB = { tab: 'file', collapsed: false, open: false };
   var SB = { collapsed: false };
-  var fb = { path: '', parent: null, select: '', follow: true, aiPath: '', token_at: 0 };
+  var fb = { path: '', parent: null, select: '', follow: true, aiPath: '', token_at: 0,
+             aiDebounce: null };
   var term = {
     items: [],       // {id, who, cmd, reason, out, running, exit, background, collapsed}
     seq: 0,
@@ -3555,7 +3672,10 @@
     }
     // full 模式下引用工作区外文件：@{} 里只能放相对路径，外面的直接给绝对路径
     var ref = full.indexOf(wsPrefix) === 0 ? full.slice(wsPrefix.length) : full;
-    input.value += (input.value && !/\s$/.test(input.value) ? ' ' : '') + '@{' + ref + '}';
+    // 走附件胶囊：和上传的文件同一条渲染路，输入框里不再出现裸 @{...} 文本；
+    // 发送时由附件链路统一把标记拼进正文（见 pendingAttach）
+    pendingAttach.push({ mark: '@{' + ref + '}', name: ref.split('/').pop(), kind: 'file', url: '' });
+    renderAttach();
     input.focus();
   }
 
@@ -4000,6 +4120,15 @@
       fb.select = sel || data.select || '';
       fbRenderPath();
       fbRenderList(data);
+      // 数据到位才提示「AI 定位到…」，并给列表一次淡入过渡（AI 跟随跳转时才提示，
+      // 用户自己点的目录不打扰）
+      if (fb.follow) {
+        fbTrackTip(data.path || '');
+        var lst = rbEl('fbList');
+        lst.classList.remove('fb-anim');
+        void lst.offsetWidth;
+        lst.classList.add('fb-anim');
+      }
       return data;
     }).catch(function () {
       rbEl('fbList').innerHTML = '<div class="fb-note">读取失败</div>';
@@ -4197,7 +4326,29 @@
     }
     // 折叠状态下不抢版面：只是记下来，展开/切到文件页时再跳
     if (RB.collapsed && window.matchMedia('(max-width: 1080px)').matches) return;
-    fbLoad(path);
+    // 去抖：AI 一轮里往往连续读好几个文件，每个都触发一次 fs_follow。直接
+    // 逐次 fbLoad 会把列表反复清空重绘，肉眼看到的就是「一闪一闪」。这里把
+    // 300ms 内的连续跳转合并成最后一次，列表只平滑切换一次，不再闪。
+    if (fb.aiDebounce) clearTimeout(fb.aiDebounce);
+    fb.aiDebounce = setTimeout(function () {
+      fb.aiDebounce = null;
+      fbLoad(path);
+    }, 300);
+  }
+
+  // AI 切换目录时的「跟踪提示」：在列表顶部短暂弹出「AI 正在定位 → 路径」，
+  // 淡入淡出，让用户一眼知道面板是被 AI 拽过去的，而不是自己误触。
+  function fbTrackTip(path) {
+    var tip = rbEl('fbTrackTip');
+    if (!tip) return;
+    var p = rbEl('fbTrackPath');
+    if (p) p.textContent = path || '';
+    tip.classList.remove('show');
+    // 强制重排以重新触发 CSS 动画
+    void tip.offsetWidth;
+    tip.classList.add('show');
+    clearTimeout(tip._hide);
+    tip._hide = setTimeout(function () { tip.classList.remove('show'); }, 2200);
   }
 
   rbEl('rbTabFile').addEventListener('click', function () { rbShowTab('file'); });
@@ -5585,9 +5736,22 @@
   }
 
   function renderControls(c) {
-    // 控制类控件自检：绿/黄/红灯 + 「可用数/总数」，点开可看明细与修复
+    // 控制类控件自检：绿/黄/红灯 + 「可用数/总数」，点开可看明细与修复。
+    // 「后端服务」一项在这里合成：后端真掉线时 /api/controls 根本调不通，
+    // 徽章会停留在最后一次的绿色缓存上误导人，所以用 WS 连接状态兜底——
+    // 后端离线时整盏灯强制转红
     lastControls = c || null;
     if (!c || !c.total) { ctrlBadge.hidden = true; return; }
+    var backendOk = !!(ws && (ws.readyState === 0 || ws.readyState === 1));
+    var items = (c.items || []).slice();
+    items.push({ key: 'backend', label: '后端服务', ok: backendOk, na: false,
+                 critical: true, detail: backendOk ? '' : '连接已断开，界面处于离线缓存状态' });
+    var live = items.filter(function (i) { return !i.na; });
+    var okCount = live.filter(function (i) { return i.ok; }).length;
+    var total = live.length;
+    var level = okCount === total ? 'ok'
+      : live.some(function (i) { return !i.ok && i.critical; }) ? 'danger' : 'warn';
+    c = Object.assign({}, c, { items: items, ok: okCount, total: total, level: level });
     ctrlBadge.hidden = false;
     ctrlBadge.className = 'badge ctrl ' + (c.level || 'ok');
     var lamp = document.createElement('span');
@@ -5610,11 +5774,10 @@
         + (yd.enabled ? '（已设开机自启）' : '（未设开机自启）'));
     }
     ctrlBadge.title = lines.join('\n');
-    if (ctrlPanel.classList.contains('show')) fillCtrlPanel(c);
+    fillCtrlPanel(c);
   }
 
-  // ---------- 控件自检面板 ----------
-  var ctrlPanel = document.getElementById('ctrlPanel');
+  // ---------- 控件自检（挂在「设置 → 设备连接」子模块里） ----------
   var ctrlList = document.getElementById('ctrlList');
   var ctrlYd = document.getElementById('ctrlYd');
   var ctrlHint = document.getElementById('ctrlHint');
@@ -5656,12 +5819,13 @@
   }
 
   function openCtrlPanel() {
+    // 跳转到「设置 → 设备连接」里的自检子模块，而不是弹独立窗口
+    if (!document.body.classList.contains('settings-mode')) openSettings();
+    showSetPane('device');
     ctrlLog.textContent = '';
-    ctrlPanel.classList.add('show');
     ctrlHint.textContent = '正在实测…';
     fetchCtrl(true);
   }
-  function closeCtrlPanel() { ctrlPanel.classList.remove('show'); }
 
   function fetchCtrl(force) {
     return fetch('/api/controls?force=' + (force ? 1 : 0) + '&token=' + encodeURIComponent(token))
@@ -5694,8 +5858,6 @@
   }
 
   ctrlBadge.addEventListener('click', openCtrlPanel);
-  document.getElementById('ctrlClose').addEventListener('click', closeCtrlPanel);
-  ctrlPanel.addEventListener('click', function (e) { if (e.target === ctrlPanel) closeCtrlPanel(); });
   document.getElementById('ctrlReflash').addEventListener('click', function () {
     ctrlHint.textContent = '重新实测中…';
     fetchCtrl(true);
@@ -5752,6 +5914,7 @@
       // 命中率直接摆在徽章上，省得为了看一个数去悬停
       var cache = c.cache || null;
       var cachePct = (cache && cache.prompt) ? cache.percent : 0;
+      // 胶囊只显示上下文/缓存占用，不带会话编号（编号不好看，已移除）
       ctxBadge.textContent = '上下文 ' + pct + '%'
         + (cachePct > 0 ? (' · 缓存 ' + Math.round(cachePct) + '%') : '');
       // DeepSeek 的前缀缓存命中率：命中越高越便宜（命中部分按更低价计费）。
@@ -6280,6 +6443,7 @@
   var DEFAULT_BASE_URL = 'https://api.deepseek.com';
   var cfgApiKey = document.getElementById('cfgApiKey');
   var clearApiKey = document.getElementById('clearApiKey');
+  var modelCapsSelect = document.getElementById('modelCapsSelect');
   var apiKeyHint = document.getElementById('apiKeyHint');
   // 覆盖写时要不要显式清空 Key：点「清除」才置 true，其余情况一律按「不改」提交
   var apiKeyClear = false;
@@ -6773,14 +6937,9 @@
       .catch(function () { tokenHint.textContent = '生成失败'; });
   });
 
-  // 「验证」：用当前输入框里的地址 + Key 拉取全部模型并探测能力，
-  // 结果显示在下方「模型能力清单」区，一眼看清每个模型支不支持看图/调工具。
+  // 「保存」按钮（原 clearApiKey）：直接触发底部的保存逻辑，保存后拉取模型列表
   clearApiKey.addEventListener('click', function () {
-    var url = cfgBaseUrl.value.trim();
-    var key = cfgApiKey.value.trim();
-    if (!url) { apiKeyHint.textContent = '先填接口地址'; return; }
-    if (!key) { apiKeyHint.textContent = '先填 API Key（留空则用已保存的 Key）'; }
-    loadModelCaps(url, key);
+    saveCfg.click();
   });
   // 一旦重新输入内容，就撤销「清除」意图
   cfgApiKey.addEventListener('input', function () {
@@ -6862,8 +7021,6 @@
         return reloadModels().then(function (list) {
           cfgHint.textContent = list.length ? ('已保存并生效，共 ' + list.length + ' 个模型') : '已保存，但没拉到模型列表';
           loadToolbar();  // 刷新右上角当前模型显示
-          // 拉全部模型并逐个探测能力，展示成清单，一眼看清每个模型支不支持看图/调工具
-          loadModelCaps();
         });
       })
       .catch(function (err) {
@@ -7068,14 +7225,21 @@
     });
     // 按名字首字母排序，忽略大小写
     opts.sort(function (a, b) { return a.localeCompare(b, 'en', { sensitivity: 'base' }); });
-    modelSelect.innerHTML = '';
+    var html = '';
     opts.forEach(function (m) {
-      var o = document.createElement('option');
-      o.value = m; o.textContent = m;
-      modelSelect.appendChild(o);
+      html += '<option value="' + m.replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      }) + '">' + m + '</option>';
     });
-    if (cur) modelSelect.value = cur;
+    // 顶部工具栏的模型下拉，和设置页的模型选择下拉，用同一份列表
+    modelSelect.innerHTML = html;
+    if (modelCapsSelect) modelCapsSelect.innerHTML = html;
+    if (cur) {
+      modelSelect.value = cur;
+      if (modelCapsSelect) modelCapsSelect.value = cur;
+    }
     if (modelSelect._dd && modelSelect._dd.refresh) modelSelect._dd.refresh();
+    if (modelCapsSelect && modelCapsSelect._dd && modelCapsSelect._dd.refresh) modelCapsSelect._dd.refresh();
   }
 
   // 从服务商拉当前配置的模型列表：GET /models，OpenAI 兼容接口都支持
@@ -7088,61 +7252,6 @@
         .catch(function () { modelsPromise = null; return []; });
     }
     return modelsPromise;
-  }
-  // 真实探测模型能力（看图 / 调工具 / 深度思考），校验保存后展示
-  function probeCapabilities(cb) {
-    fetch('/api/llm/capabilities?token=' + encodeURIComponent(token))
-      .then(function (r) { return r.json(); })
-      .then(function (d) { cb(d && typeof d === 'object' ? d : null); })
-      .catch(function () { cb(null); });
-  }
-  // 拉取该 token 下的全部模型，逐个探测能力并渲染成清单。
-  // 传 url/key 时用输入框里正在填的值验证；不传则用已保存的配置。
-  function loadModelCaps(url, key) {
-    var box = document.getElementById('modelCaps');
-    if (!box) return;
-    box.innerHTML = '<div class="mc-loading">正在探测模型能力…</div>';
-    var qs = 'token=' + encodeURIComponent(token);
-    if (url) qs += '&base_url=' + encodeURIComponent(url);
-    if (key) qs += '&api_key=' + encodeURIComponent(key);
-    fetch('/api/llm/capabilities/all?' + qs)
-      .then(function (r) { return r.json(); })
-      .then(function (d) {
-        if (d && d.detail) {
-          box.innerHTML = '<div class="mc-loading" style="color:var(--danger)">' + d.detail + '</div>';
-          return;
-        }
-        var models = (d && d.models) || [];
-        if (!models.length) {
-          box.innerHTML = '<div class="mc-loading">没拉到任何模型</div>';
-          return;
-        }
-        var html = '';
-        models.forEach(function (m) {
-          var err = m.error;
-          var tags;
-          if (err) {
-            tags = '<span class="mc-tag off">探测失败</span>';
-          } else {
-            tags =
-              '<span class="mc-tag ' + (m.vision ? 'on' : 'off') + '">' + (m.vision ? '看图' : '无图') + '</span>' +
-              '<span class="mc-tag ' + (m.tools ? 'on' : 'off') + '">' + (m.tools ? '工具' : '无工具') + '</span>' +
-              '<span class="mc-tag ' + (m.reasoning ? 'on' : 'off') + '">' + (m.reasoning ? '思考' : '无思考') + '</span>';
-          }
-          var escErr = String(err || '').replace(/[&<>"']/g, function (c) {
-            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-          });
-          html += '<div class="model-caps-row" title="' + escErr + '">' +
-            '<span class="mc-name">' + (m.id || '') + '</span>' +
-            '<span class="mc-tags">' + tags + '</span>' +
-            (err ? '<div class="mc-err">' + escErr + '</div>' : '') +
-          '</div>';
-        });
-        box.innerHTML = html;
-      })
-      .catch(function () {
-        box.innerHTML = '<div class="mc-loading">探测失败，请检查地址 / Key</div>';
-      });
   }
   permSelect.addEventListener('change', function () {
     postConfig({ permission_mode: permSelect.value });
@@ -7220,7 +7329,18 @@
   modelSelect.addEventListener('change', function () {
     postConfig({ model: modelSelect.value });
     addSystem('模型已切换为 ' + modelSelect.value);
+    if (modelCapsSelect) modelCapsSelect.value = modelSelect.value;
   });
+
+  // 设置页的模型选择下拉：选中即等于前台模型下拉，两个保持同步
+  if (modelCapsSelect) {
+    modelCapsSelect.addEventListener('change', function () {
+      if (modelSelect.value === modelCapsSelect.value) return;
+      modelSelect.value = modelCapsSelect.value;
+      if (modelSelect._dd && modelSelect._dd.refresh) modelSelect._dd.refresh();
+      modelSelect.dispatchEvent(new Event('change'));
+    });
+  }
 
   // ＋ 附件菜单
   document.getElementById('btnPlus').addEventListener('click', function (e) {
@@ -7435,7 +7555,9 @@
           var b = document.createElement('button');
           b.textContent = f;
           b.addEventListener('click', function () {
-            input.value += (input.value ? ' ' : '') + '@{' + f + '}';
+            // 与文件面板「引用到对话」一致：进附件胶囊，不往输入框塞裸文本
+            pendingAttach.push({ mark: '@{' + f + '}', name: f.split('/').pop(), kind: 'file', url: '' });
+            renderAttach();
             fileList.classList.remove('show');
             input.focus();
           });
@@ -7477,7 +7599,7 @@
     wrap.appendChild(list);
     sel.parentNode.insertBefore(wrap, sel);
     wrap.appendChild(sel);
-    if (sel.id === 'modelSelect') wrap.classList.add('dd-model');
+    if (sel.id === 'modelSelect' || sel.id === 'modelCapsSelect') wrap.classList.add('dd-model');
     sel._dd = { wrap: wrap, trig: trig, label: label, list: list };
 
     function refreshLabel() {
@@ -7526,13 +7648,13 @@
     refreshLabel();
   }
   function ddInitAll() {
-    [['permSelect'], ['modelSelect'], ['memKind'], ['cfgPerm'], ['cfgUpdSource']]
+    [['permSelect'], ['modelSelect'], ['modelCapsSelect'], ['memKind'], ['cfgPerm'], ['cfgUpdSource']]
       .forEach(function (id) { ddSelect(document.getElementById(id)); });
   }
   // config/模型列表异步加载后，select.value 被恢复但 label 没跟着变，
   // 强刷会导致下拉框显示第一个选项。这里统一按各自 value 刷新一次 label
   function ddRefreshAll() {
-    ['permSelect', 'modelSelect', 'memKind', 'cfgPerm', 'cfgUpdSource']
+    ['permSelect', 'modelSelect', 'modelCapsSelect', 'memKind', 'cfgPerm', 'cfgUpdSource']
       .forEach(function (id) {
         var el = document.getElementById(id);
         if (el && el._dd && el._dd.refresh) el._dd.refresh();
@@ -7564,6 +7686,28 @@
   document.getElementById('btnMenu').addEventListener('click', function () {
     document.body.classList.toggle('sb-open');
   });
+  // 全屏按钮：进入/退出全屏。requestFullscreen 必须由用户手势触发才能成功，
+  // 所以做成按钮而不是页面加载时自动调用。
+  var btnFs = document.getElementById('btnFullscreen');
+  btnFs.addEventListener('click', function () {
+    var doc = document;
+    var el = doc.documentElement;
+    if (!doc.fullscreenElement && !doc.webkitFullscreenElement) {
+      var req = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen;
+      if (req) req.call(el);
+    } else {
+      var exit = doc.exitFullscreen || doc.webkitExitFullscreen || doc.mozCancelFullScreen || doc.msExitFullscreen;
+      if (exit) exit.call(doc);
+    }
+  });
+  // 全屏状态变化时更新按钮图标，让用户知道当前是否在全屏
+  function syncFsIcon() {
+    var fs = document.fullscreenElement || document.webkitFullscreenElement;
+    btnFs.textContent = fs ? '✕' : '⛶';
+    btnFs.title = fs ? '退出全屏' : '全屏';
+  }
+  document.addEventListener('fullscreenchange', syncFsIcon);
+  document.addEventListener('webkitfullscreenchange', syncFsIcon);
   // 点消息区 = 接着聊天，顺手收起抽屉
   messages.addEventListener('click', function () {
     document.body.classList.remove('sb-open');
@@ -7788,6 +7932,21 @@
 
   _xtLoad();   // 检测 xterm.js / FitAddon 是否就绪，就绪后放行排队里的会话创建
   connect();   // 主对话 / 事件 WebSocket
+
+  // ---------- 手机竖屏强制横屏（雀魂式） ----------
+  // 旋转/断点覆盖全部由 CSS 的 html.force-ls 规则完成（见 <head> 同步脚本 + CSS），
+  // 这里不再动态改 viewport 或 #app 尺寸——Chrome 会忽略运行时改的 initial-scale，
+  // 之前的坑就在这。只在转屏时刷新 force-ls 标记，让 CSS 媒体查询重新判定。
+  function syncForceLandscape() {
+    var portrait = window.innerHeight > window.innerWidth;
+    var touch = window.matchMedia('(hover: none)').matches;
+    document.documentElement.classList.toggle('force-ls', portrait && touch);
+  }
+  window.addEventListener('resize', syncForceLandscape);
+  window.addEventListener('orientationchange', function () {
+    setTimeout(syncForceLandscape, 120);
+  });
+
   // 连上之后才知道有没有令牌；文件面板首屏在这里补加载一次
   setTimeout(function () {
     if (fb.follow && !fb.aiPath && RB.tab === 'file') fbLoad('');

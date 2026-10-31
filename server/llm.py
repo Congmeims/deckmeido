@@ -92,21 +92,40 @@ class LLMClient:
         """是不是 DeepSeek 官方接口（决定要不要发它的专属参数）"""
         return "deepseek" in self.base_url.lower()
 
+    # 主流多模态（能看图）模型名关键词清单。命中即判定支持视觉。
+    # 之前「非 DeepSeek 服务商一律默认支持」太粗暴：中转站里一堆纯文本模型
+    # 也会被当成能看图，图发过去被上游过滤，模型就开始自我怀疑「我不是多模态」。
+    # 改成按模型名精确匹配清单，命中才发图，并在系统提示里明确告知能力，避免猜疑。
+    _VISION_KEYWORDS = (
+        # DeepSeek 视觉系列
+        "vision", "vl", "v4", "deepseek-pro",
+        # OpenAI
+        "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-4-vision", "o4",
+        # Claude（3/4 全系多模态）
+        "claude-3", "claude-4", "claude-sonnet-4", "claude-opus-4",
+        "claude-3.5", "claude-3.7", "claude-3-opus",
+        # Gemini
+        "gemini-1.5", "gemini-2", "gemini-2.5", "gemini-pro-vision", "gemini-flash",
+        # Qwen 视觉系列
+        "qwen-vl", "qwen2-vl", "qwen2.5-vl", "qwen3-vl", "qvq",
+        # 国内多模态
+        "glm-4v", "glm-4.5v", "glm-4.6", "internvl", "yi-vision",
+        "step-1v", "moonshot-v1-vision", "minimax-vl", "hunyuan-vision",
+        "doubao-vision", "ernie-4.0", "ernie-vl", "sensechat-vision",
+        # 通用
+        "multimodal", "image",
+    )
+
     @property
     def supports_vision(self) -> bool:
         """模型能不能看图（多模态 image_url）
 
-        DeepSeek 官方早期只有纯文本（deepseek-chat / reasoner / v3），
-        新出的 v4 系列（v4-pro 等）才带视觉。以前这里一刀切用 is_deepseek
-        判断，把所有 DeepSeek 的历史图都换成占位文案，导致 v4-pro 明明能读图
-        却回「我看不到图片」。现在按模型名细分：
-        - DeepSeek：模型名带 vision / vl / v4 / pro 视为支持视觉
-        - 其他服务商（OpenAI / Claude / Qwen / Gemini 等）：默认支持
+        按模型名精确匹配上面的主流多模态清单：命中即支持，不命中默认不支持。
+        不再「非 DeepSeek 一律默认 True」——那是 AI 自我怀疑的根因：纯文本模型
+        收到图被上游过滤后，会反复纠结自己到底能不能看图。
         """
         m = (self.model or "").strip().lower()
-        if self.is_deepseek:
-            return any(k in m for k in ("vision", "vl", "v4", "pro", "qwen"))
-        return True
+        return any(k in m for k in self._VISION_KEYWORDS)
 
     def normalize(self) -> None:
         """把「照抄别人家的写法」纠正成 DeepSeek 认的写法

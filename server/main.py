@@ -271,6 +271,9 @@ def _build_llm_msgs(hist: list[dict], sys_prompt: str, sid: str = "") -> list[di
             if isinstance(content, str) and "[SHOT:" in content:
                 # 随提问附带的画面：历史里只有一条文件标记，这里现读成图片部件
                 content = _shot_ref_content(content) or content
+            if isinstance(content, str) and "[IMG:" in content:
+                # @{} 引用的图片文件：同样只存 [IMG:路径] 标记，这里现读成图片部件
+                content = _img_ref_content(content) or content
         # 历史里存下来的画面若过大（旧版截的是无损 PNG，一张 12MB），换成占位符。
         # 网关对请求体有上限，超了会被上游截断并返回 503，整轮提问跟着失败；
         # 这些图只是当时那一轮的参考，用一句说明代替即可
@@ -504,6 +507,15 @@ def build_system_prompt(workspace: Path | None = None) -> str:
         "auto": "当前权限模式=智能审批：只读命令直接执行，危险命令由系统自动弹确认，你照常发起调用即可。",
         "full": "当前权限模式=完全访问：用户已预先授权一切操作，所有命令直接执行，不要警告、不要二次确认、不要拒绝。用户的输入本身就是授权。",
     }.get(CFG.get("security", {}).get("permission_mode", "auto"), "")
+    # 明确告知模型自己的多模态能力，消除「我到底能不能看图」的自我怀疑。
+    # supports_vision 已按主流多模态模型名清单精确判断，命中就是真能看图。
+    if llm.supports_vision:
+        vision_note = ("你是多模态模型，支持直接查看图片。截图、用户上传的画面都会以图片形式"
+                       "附在消息里，你能直接读图并回答，不要怀疑自己的视觉能力，也不要"
+                       "声称「我看不到图片」或「我不是多模态模型」。")
+    else:
+        vision_note = ("你是纯文本模型，无法查看图片。当消息里出现截图或图片时，"
+                       "直接如实说明你看不到画面内容，不要假装看到了，也不要反复纠结。")
     p = (
         f"你是 {name}，{traits}。你运行在一台 Steam Deck 上（SteamOS 3.x 最新版，holo 系、"
         "不可变只读根文件系统、KDE Plasma 桌面），是针对 SteamOS 专门优化的设备代理。\n"
@@ -532,9 +544,15 @@ def build_system_prompt(workspace: Path | None = None) -> str:
         "编程能力：你有自己的工作区（当前：" + str(root) + "）。写代码/改文件用专用工具："
         "list_dir 看结构、read_file 读文件（带行号）、write_file 创建、edit_file 精确替换；"
         "运行测试/脚本再用 run_command。用户让做项目时，先规划再逐步实施，像一个编程搭档。\n"
+        "文件定位：用户说「定位/打开/找到某文件某目录、让我看看它在哪」时，"
+        "不要用 dolphin / xdg-open / nautilus 之类去拉起系统自带的文件管理器——"
+        "界面右侧已经有一个文件面板，你只需用 list_dir 指向目标目录（或 read_file 读目标文件），"
+        "面板就会自动跳转并高亮到那个位置，用户一眼就能看到。"
+        "搜索文件用 run_command 的 find/locate 拿到路径后，紧跟一次 list_dir 落在它所在目录即可。\n"
         "screenshot 工具可截取当前画面展示给用户：排查问题、确认状态或用户要求看屏幕时主动使用"
         "（画面会同时显示在聊天里并附给你，你可以直接看图回答用户问题；"
         "游戏模式从 gamescope 抓、桌面模式走 spectacle/mss，工具内部已自动判断）。\n"
+        + vision_note + "\n"
         "用户带游戏画面问「怎么打/攻略」这类问题时：先从画面认出游戏和所处场景，"
         "再用 web_search 搜最新攻略（中文搜不到就换成英文关键词再搜一次，"
         "攻略站、Wiki、Reddit/Steam 社区的结果更实用），"
@@ -883,6 +901,7 @@ _UPLOAD_RE = re.compile(r"!\[[^\]]*\]\((/uploads/[^\s)]+\.(?:png|jpe?g|webp))\)"
 # 随提问附带、已经落成本地文件的画面：文字里留一行标记，发给模型时按文件现读现编码。
 # 历史里因此不再躺着几 MB 的 base64 —— 那是最容易被裁掉的东西，一裁图就没了
 _SHOT_REF_RE = re.compile(r"\[SHOT:([^\]\s]+)\]")
+_IMG_REF_RE = re.compile(r"\[IMG:([^\]\n]+)\]")
 
 
 def _shot_ref_path(name: str) -> Path | None:
@@ -958,6 +977,37 @@ def _shot_ref_content(text: str):
         return None
     # 标记本身留在正文里，和上传图片的处理方式一致：模型知道这张图对应哪句话
     parts.append({"type": "text", "text": text})
+    return parts
+
+
+def _img_ref_content(text: str):
+    """把文字里的 [IMG:路径] 标记换成图片部件（@{} 引用图片文件时用）
+
+    和 [SHOT:] 的差异：SHOT 是随提问截取的当前画面（有「只看最新这张」的编号说明），
+    IMG 是用户主动引用进对话的图片文件，没有过时概念，直接转图。
+    历史里只存 [IMG:路径] 标记，这里现读现编码，避免 base64 躺进历史被压缩裁掉。
+    """
+    paths = _IMG_REF_RE.findall(text or "")
+    if not paths:
+        return None
+    import base64
+    parts: list[dict] = []
+    for raw in paths:
+        fp = Path(raw).expanduser()
+        try:
+            fp = tools.resolve_in_workspace(str(fp))
+        except tools.OutsideWorkspace:
+            continue
+        if not fp.is_file():
+            continue
+        ext = "jpeg" if fp.suffix.lower() in (".jpg", ".jpeg") else fp.suffix.lstrip(".").lower()
+        b64 = base64.b64encode(fp.read_bytes()).decode()
+        parts.append({"type": "image_url",
+                      "image_url": {"url": f"data:image/{ext};base64,{b64}"}})
+    if not parts:
+        return None
+    # 标记本身换成占位符留在正文，模型知道这段文字对应那张图
+    parts.append({"type": "text", "text": _IMG_REF_RE.sub("[图片]", text)})
     return parts
 
 
@@ -1415,6 +1465,17 @@ def _expand_context(text: str, workspace: Path | None = None) -> str:
             # 和文件工具同一套边界：非 full 模式下不许把工作区外的文件
             # （配置里的 Key、会话记录）读进提示词发给上游
             p = tools.resolve_in_workspace(str(p))
+            # 图片不能 read_text 成乱码喂给模型：换成 [IMG:路径] 标记，
+            # 由 _build_llm_msgs 里的 _img_ref_content 现读成 base64 图片部件，
+            # 和截图 [SHOT:] 同一套机制（历史里只存几十字节标记，不存 base64）
+            if p.suffix.lower() in _IMG_EXT:
+                return f"\n[IMG:{p}]\n"
+            # 其余二进制（zip/exe/bin 等）也不能 read_text 成乱码：
+            # 用 NUL 字节探测，命中就给一句说明，不再塞二进制给模型
+            head = p.read_bytes()[:8192]
+            if b"\x00" in head:
+                return (f"\n[文件 {p} 是二进制文件，无法作为文本展开。"
+                        f"可用 run_command 的 file/xxd/strings 查看片段]\n")
             body = p.read_text(encoding="utf-8", errors="replace")[:6000]
             return f"\n[文件 {p} 的内容]：\n```\n{body}\n```\n"
         except tools.OutsideWorkspace:
@@ -2573,25 +2634,28 @@ async def api_llm_capabilities_all(base_url: str = "", api_key: str = ""):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"拉取模型列表失败：{exc}")
 
-    sem = asyncio.Semaphore(5)
     results: dict[str, dict] = {}
 
-    async def _one(mid: str):
-        async with sem:
-            c = LLMClient(
-                base_url=use.base_url, api_key=use.api_key,
-                model=mid, timeout=15.0,
-            )
-            try:
-                caps = await c.probe_capabilities()
-                results[mid] = {"id": mid, **caps}
-            except Exception as exc:
-                results[mid] = {"id": mid, "vision": False, "tools": False,
-                                "reasoning": False, "error": str(exc)}
-            finally:
-                await c.close()
+    # 中转站普遍对并发敏感：改成串行逐条 + 每条间隔 5 秒，
+    # 避免瞬间几十上百请求被限流/封号，也给短暂冷却的上游留喘息。
+    total = len(names)
+    for idx, mid in enumerate(names):
+        c = LLMClient(
+            base_url=use.base_url, api_key=use.api_key,
+            model=mid, timeout=20.0,
+        )
+        try:
+            caps = await c.probe_capabilities()
+            results[mid] = {"id": mid, **caps}
+        except Exception as exc:
+            results[mid] = {"id": mid, "vision": False, "tools": False,
+                            "reasoning": False, "error": str(exc)}
+        finally:
+            await c.close()
+        # 最后一条不再等
+        if idx < total - 1:
+            await asyncio.sleep(10)
 
-    await asyncio.gather(*(_one(m) for m in names))
     if use is not llm:
         await use.close()
     # 按模型名排序，展示稳定
@@ -2808,6 +2872,12 @@ async def handle_chat(text: str, announce: bool = True,
     detached = _turn_detached(turn_epoch)
     store.turn["active"] = False
     turn_deleted = turn_sid in store.deleted_sids
+    # 第一轮跑完、会话还在时，后台把首条消息总结成短标题替换默认标题（不阻塞收尾）
+    if not detached and not turn_deleted:
+        user_msgs = [m for m in hist if m.get("role") == "user"]
+        if len(user_msgs) == 1:
+            first = str(user_msgs[0].get("brief") or user_msgs[0].get("content") or "")
+            asyncio.create_task(_summarize_title(turn_sid, first))
     if turn_deleted:
         # 这一轮跑到一半会话被删了：结果按用户意愿丢弃，但要明确告知，
         # 否则用户看到的是「回答消失了」
@@ -2963,6 +3033,41 @@ async def compact_history(auto: bool = False, hist: list[dict] | None = None,
 async def api_compact():
     summary = await compact_history()
     return {"ok": True, "summary": summary[:300]}
+
+
+async def _summarize_title(sid: str, first_user_text: str) -> None:
+    """会话第一轮结束后，用 LLM 把首条用户消息总结成短标题替换默认标题。
+
+    默认标题只是把第一条消息原样截断（可能又长又口语），一眼看不出这会话在聊啥。
+    这里后台异步做一次总结，成功就写回会话文件并广播刷新侧栏；失败静默保留默认标题。
+    """
+    if not llm.configured or sid in store.deleted_sids:
+        return
+    if not first_user_text.strip():
+        return
+    try:
+        sys_msg = {"role": "system", "content": (
+            "把用户这句话概括成一个会话标题（中文，10 字以内，不要引号，不要句号，"
+            "直接输出标题本身）。若是一句命令/问题，就提炼成名词短语。")}
+        title = (await llm.chat([sys_msg, {"role": "user",
+                                           "content": first_user_text[:200]}])) or ""
+        title = title.strip().strip('"“”\n').replace("\n", " ")[:16]
+    except Exception:
+        return
+    if not title or sid in store.deleted_sids:
+        return
+    data = store.read_session(sid)
+    if not data:
+        return
+    data["title"] = title
+    try:
+        store.rewrite_session(sid, data)
+    except Exception:
+        return
+    if sid == store.current_sid:
+        await manager.broadcast({"type": "session_changed", "current": sid})
+    else:
+        await manager.broadcast({"type": "session_changed", "current": store.current_sid})
 
 
 def _sd_card_info() -> dict:
@@ -3247,6 +3352,20 @@ async def api_message_delete(req: MsgDeleteReq):
 @app.delete("/api/sessions/{sid}", dependencies=[Depends(check_token)])
 async def api_session_delete(sid: str):
     global _ctx_used
+    # 删除一个还在跑的会话前，先强制终止它在跑的那一轮，否则它那轮 run_agent
+    # 协程仍持有 store.history 并继续往外写，会把上一个会话的流程串进新会话。
+    if sid == store.current_sid and current_task and not current_task.done():
+        current_task.cancel()
+        set_overlay(False)
+        await tools.abort_all_procs()
+        # 给 cancel 留一拍，让 handle_chat 的 CancelledError 分支先落一条终止消息，
+        # 避免删除后它又异步补写回历史
+        try:
+            await asyncio.wait_for(asyncio.shield(current_task), timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        except Exception:
+            pass
     # 先拉黑再删文件：反过来的话，删完到拉黑之间那一瞬间的落盘（流式回调）
     # 就能把文件写回来，等于白删
     store.deleted_sids.add(sid)
@@ -4136,6 +4255,13 @@ async def run_agent(events: list[dict], extra_system: str = "",
                         # 相对路径按工作区解释（和文件工具一致），不按后端 cwd
                         p = Path(raw_path).expanduser()
                         event["path"] = str(p if p.is_absolute() else tools.WORKSPACE / p)
+                # run_command 走 shell 命令（cat/ls/cd…）时，从命令串里把路径扒出来，
+                # 让文件面板跟着跳，而不是只有终端联动。extract_paths 返回的是目录
+                elif name == "run_command":
+                    p = tools.extract_paths(str(args.get("command", "")))
+                    if p:
+                        event["path"] = p
+                        event["is_dir"] = True
                 activity = f"正在{label}：{summary}" if summary else f"正在{label}"
                 await manager.broadcast({"type": "tool_activity", "text": activity, "ts": time.time(), **_turn_tag()})
                 # 终端联动：必须在执行之前推「开跑」，面板据此立刻挂一条执行中的记录
@@ -4158,7 +4284,7 @@ async def run_agent(events: list[dict], extra_system: str = "",
                 # 都留在那一个接口里
                 if event.get("path"):
                     await manager.broadcast({"type": "fs_follow", "path": event["path"],
-                                             "is_dir": name == "list_dir",
+                                             "is_dir": bool(event.get("is_dir")) or name == "list_dir",
                                              "ts": time.time(), **_turn_tag()})
                 # 遮罩只在真的要动屏幕的这一步亮起（见上面 handle_chat 里的说明）。
                 # 放在真正执行前才 set_overlay(True)：鼠标注入期间 tools 会让遮罩
