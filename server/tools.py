@@ -870,8 +870,276 @@ async def feed_tty_input(data: str) -> bool:
         return False
 
 
+# ---------- 真 PTY 会话（xterm.js 专用） ----------
+# 以前面板里的终端是「script -qefc 包一层伪终端 + 自己渲染 ANSI 网格 +
+# 自己翻译键盘序列」，认识不全的转义就跳过。换成 ptyprocess 开真 PTY +
+# xterm.js 渲染后，终端模拟这层整层外包给社区实现，vim/htop/ncdu 的鼠标、
+# 备用屏、bracketed paste 全好使。
+#
+# 一个 PTY 会话 = 一个 ptyprocess.PtyProcess + 一条 asyncio 读循环任务。
+# 读循环把 PTY 的输出字节原样推进一个 asyncio.Queue，WebSocket 端点从
+# 队列取出来发给前端 xterm.js；前端敲的按键经 WebSocket 原样写回 PTY。
+import ptyprocess as _pty
+
+# 活跃的 PTY 会话。面板同一时间只用一条（_LIVE_PTY_SESSIONS 的最后一项），
+# 但按进程 id 记，避免「终止旧命令→起新命令」时旧会话的收尾把新的清掉
+_LIVE_PTY_SESSIONS: list["PtySession"] = []
+
+
+class PtySession:
+    """一个真 PTY 会话：ptyprocess 子进程 + asyncio 读循环
+
+    用法：
+        s = await start_pty_session(cmd, cwd, cols, rows)
+        # 前端 xterm.js 的 onData → ws → s.write(bytes)
+        # s 的输出 → ws → xterm.js.write()
+        # 结束：s.stop()
+    """
+    def __init__(self, proc: _pty.PtyProcess, cmd: str, cwd: str,
+                 cols: int, rows: int, reason: str):
+        self.proc = proc
+        self.cmd = cmd
+        self.cwd = cwd
+        self.cols = cols
+        self.rows = rows
+        self.reason = reason
+        self.started = time.time()
+        self.ended: float | None = None
+        self.exit_code: int | None = None
+        # 输出字节队列：读循环往里 put，WebSocket 从里 get
+        self.out_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=256)
+        self._reader: asyncio.Task | None = None
+        self._closed = False
+        # tmux 会话名（tmux 方案用）；非 tmux 会话时为 None
+        self.tmux_name: str | None = None
+        # 给 CURRENT_CMD 兼容用的累积输出（截断，避免内存爆）
+        self._output_buf = ""
+
+    def write(self, data: bytes) -> None:
+        """前端按键 → PTY stdin。ptyprocess 的 write 是同步的，量小不阻塞"""
+        if self._closed or self.exit_code is not None:
+            return
+        try:
+            self.proc.write(data)
+        except (OSError, EOFError):
+            pass
+
+    def resize(self, cols: int, rows: int) -> None:
+        """窗口大小变化时通知终端
+
+        tmux 会话：用 tmux resize-window 强制网格尺寸（tmux 自己把 SIGWINCH
+        转发给里面的程序，重绘对齐由 tmux 保证，不依赖 ioctl 时序）。
+        非 tmux：直接 ioctl TIOCSWINSZ。
+        """
+        if self._closed or self.exit_code is not None:
+            return
+        self.cols, self.rows = cols, rows
+        if self.tmux_name:
+            try:
+                subprocess.run(
+                    ["tmux", "resize-window", "-t", self.tmux_name,
+                     "-x", str(cols), "-y", str(rows)],
+                    timeout=2, capture_output=True,
+                )
+            except Exception:
+                pass
+            return
+        try:
+            import struct, fcntl, termios
+            fcntl.ioctl(self.proc.fd, termios.TIOCSWINSZ,
+                        struct.pack("HHHH", rows, cols, 0, 0))
+        except Exception:
+            pass
+
+    async def _read_loop(self) -> None:
+        """持续读 PTY 输出，推进队列和 CURRENT_CMD 的 output 字段"""
+        loop = asyncio.get_running_loop()
+        while not self._closed:
+            try:
+                chunk = await loop.run_in_executor(None, self._read_chunk)
+            except (EOFError, OSError):
+                break
+            if not chunk:
+                break
+            # 推进队列（满了就丢最旧的一块，别阻塞读循环）
+            try:
+                self.out_q.put_nowait(chunk)
+            except asyncio.QueueFull:
+                try:
+                    self.out_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                self.out_q.put_nowait(chunk)
+            # 同步推进 CURRENT_CMD.output（兼容旧轮询端点，过渡期保留）
+            self._output_buf = (self._output_buf + chunk.decode("utf-8", "replace"))[-8000:]
+            if CURRENT_CMD and CURRENT_CMD.get("_pty") is self:
+                CURRENT_CMD["output"] = self._output_buf
+        # 进程退出
+        self._finish()
+
+    def _read_chunk(self) -> bytes:
+        """在 executor 里同步读 PTY，一次最多 4KB"""
+        try:
+            return self.proc.read(4096)
+        except (EOFError, OSError):
+            return b""
+
+    def _finish(self) -> None:
+        """PTY 子进程退出后的收尾"""
+        if self._closed:
+            return
+        self._closed = True
+        self.ended = time.time()
+        try:
+            self.exit_code = self.proc.poll()
+        except Exception:
+            self.exit_code = -1
+        try:
+            self.proc.close()
+        except Exception:
+            pass
+        # 推一个哨兵让 WebSocket 读循环知道该结束了
+        try:
+            self.out_q.put_nowait(b"")
+        except asyncio.QueueFull:
+            pass
+        if CURRENT_CMD and CURRENT_CMD.get("_pty") is self:
+            CURRENT_CMD["running"] = False
+            CURRENT_CMD["exit"] = self.exit_code
+
+    def stop(self) -> None:
+        """外部终止：先 SIGTERM，再 SIGKILL"""
+        if self._closed:
+            return
+        # tmux 会话：kill-session 直接连 tmux 带里面的程序一起收掉，
+        # 比只 kill tmux 父进程更干净（子进程不会被孤儿化）
+        if self.tmux_name:
+            try:
+                subprocess.run(["tmux", "kill-session", "-t", self.tmux_name],
+                               timeout=2, capture_output=True)
+            except Exception:
+                pass
+        try:
+            import os as _os
+            _os.kill(self.proc.pid, signal.SIGTERM)
+        except Exception:
+            pass
+        # 给一点时间优雅退出
+        try:
+            self.proc.wait(timeout=1.0)
+        except Exception:
+            try:
+                import os as _os
+                _os.kill(self.proc.pid, signal.SIGKILL)
+            except Exception:
+                pass
+        self._finish()
+
+    def is_alive(self) -> bool:
+        return not self._closed and self.exit_code is None
+
+
+async def start_pty_session(command: str, cwd: str = "",
+                            cols: int = 120, rows: int = 36,
+                            reason: str = "面板手动执行") -> "PtySession":
+    """起一个真 PTY 会话，返回 PtySession
+
+    这是终端面板的「起命令」入口。和 run_command 不同：
+    - 不走 asyncio.subprocess，而是 ptyprocess 直接 spawn，拿到真 PTY fd；
+    - 不设超时、不阻塞等待——面板命令的生命周期由用户决定；
+    - 输出实时流式推给前端，不是攒完一次性返回。
+    """
+    env = dict(os.environ)
+    _fix_display_env(env)
+    env["TERM"] = "xterm-256color"
+    env["COLUMNS"] = str(cols)
+    env["LINES"] = str(rows)
+    work_dir = cwd or str(Path.home())
+    # 用 tmux 接管 PTY：tmux 自己维护网格、scrollback、全屏程序（ncdu/htop）
+    # 的重绘对齐。前端 xterm.js 只当「显示 + 报尺寸」的角色，不用再靠测量
+    # 字体宽度来算列数——这套手工同步是之前乱码/错位/残影的根源。
+    # 关键：status/mouse 选项用内联 `\;` 命令序列关闭。tmux 3.7 的 -f 配置
+    # 文件里 `set -g status off` 不会应用到 server（server 读的是默认配置），
+    # 只有内联 `new-session ... \; set -g status off` 才真正写入 server 全局
+    # 选项。先 -d 分离启动（此时关状态栏），再 exec attach 前台接管本 PTY。
+    # session 名带进程无关的随机后缀，避免并发起会话时撞名。
+    sess_name = f"dm{int(time.time() * 1000) % 100000}"
+    quoted_cmd = shlex.quote(command)
+    shell_cmd = (
+        f"tmux new-session -d -s {sess_name} -x {cols} -y {rows} {quoted_cmd} "
+        "\\; set -g status off \\; set -g mouse off "
+        "\\; set -g window-size manual "
+        "\\; set -g default-terminal xterm-256color "
+        "\\; set -g history-limit 5000 "
+        f"&& exec tmux attach-session -t {sess_name}"
+    )
+    proc = _pty.PtyProcess.spawn(["bash", "-c", shell_cmd], cwd=work_dir, env=env,
+                                 dimensions=(rows, cols))
+    sess = PtySession(proc, command, work_dir, cols, rows, reason)
+    sess.tmux_name = sess_name
+    sess._reader = asyncio.create_task(sess._read_loop())
+    _LIVE_PTY_SESSIONS.append(sess)
+    # 按进程记，不存「全局最后一条」：面板点「终止」之后再敲命令时，
+    # 旧命令的收尾会把旧指针清掉，新命令的按键就全丢了
+    global CURRENT_CMD
+    CURRENT_CMD = {
+        "_pty": sess,
+        "cmd": command, "command": command, "reason": reason, "cwd": work_dir,
+        "started": sess.started, "running": True,
+        "output": "", "exit": None, "pid": proc.pid,
+        "background": False,
+    }
+    return sess
+
+
+def get_active_pty() -> "PtySession | None":
+    """当前面板该操作的那条 PTY 会话：列表里最后一条还活着的"""
+    for s in reversed(_LIVE_PTY_SESSIONS):
+        if s.is_alive():
+            return s
+    # 清掉已结束的
+    _LIVE_PTY_SESSIONS[:] = [s for s in _LIVE_PTY_SESSIONS if not s._closed]
+    return None
+
+
+async def stop_active_pty() -> bool:
+    """终止面板里正在跑的那条 PTY 会话"""
+    sess = get_active_pty()
+    if sess is None:
+        return False
+    sess.stop()
+    # 清理列表
+    _LIVE_PTY_SESSIONS[:] = [s for s in _LIVE_PTY_SESSIONS if s.is_alive()]
+    return True
+
+
+async def write_pty(data: bytes) -> bool:
+    """前端按键 → 当前活跃 PTY 的 stdin"""
+    sess = get_active_pty()
+    if sess is None:
+        return False
+    sess.write(data)
+    return True
+
+
+async def resize_pty(cols: int, rows: int) -> bool:
+    """窗口大小变化"""
+    sess = get_active_pty()
+    if sess is None:
+        return False
+    sess.resize(cols, rows)
+    return True
+
+
 async def abort_all_procs(grace: float = 2.0) -> int:
     """杀掉所有登记在案的子进程树，返回处理条数（终止按钮的第二道保险）"""
+    # 先关 PTY 会话
+    pty_count = 0
+    for s in list(_LIVE_PTY_SESSIONS):
+        if s.is_alive():
+            s.stop()
+            pty_count += 1
+    _LIVE_PTY_SESSIONS.clear()
     # 先关写端再杀：留着这条管道，被杀的 shell 收尾时可能还挂在写端上
     for w in list(_TTY_STDIN.values()):
         try:

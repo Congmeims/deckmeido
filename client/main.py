@@ -367,8 +367,11 @@ def main() -> int:
     view.setWindowIcon(icon)
     view.load(QUrl(f"{API}/?token={load_token()}&native=1"))
     view.show()
-    # 只放大这个网页，不影响系统里其他 Qt 程序；网页端（浏览器打开）保持原样
-    view.setZoomFactor(1.2)
+    # 缩放只作用于这个网页，不影响系统里其他 Qt 程序；网页端（浏览器打开）保持原样。
+    # 取 1.1 而非 1.2：右终端栏的隐藏断点是 max-width:1080px，1.2 时 CSS 视口
+    # ≈1240/1.2=1033px 会掉进断点把右栏收成抽屉；1.1 时 CSS 视口≈1127px，
+    # 稳过断点，三栏布局（1.5:6.25:2.25）在客户端里才和网页端一致。
+    view.setZoomFactor(1.1)
 
     # ---- 系统托盘：最小化后仍可在托盘找回 ----
     tray = QSystemTrayIcon(icon, app)

@@ -1506,6 +1506,52 @@ async def api_upload(file: UploadFile):
     return {"url": f"/uploads/{keep.name}", "path": rel, "kind": kind, "name": fn.name}
 
 
+@app.post("/api/upload-to", dependencies=[Depends(check_token)])
+async def api_upload_to(file: UploadFile, dir: str = ""):
+    """文件管理器里的拖放上传：把文件原样写到指定目录（不是工作区附件）。
+
+    和 /api/upload 不同，这里不做文本抽取、不塞进对话上下文，就是纯搬运，
+    给「从 Windows 把一个大文件拖到 Deck 某个目录」用。exe/zip 等大文件
+    也走这里，所以上限放宽到 500MB（分块流式写盘，不整块读进内存）。
+    """
+    target_dir = Path(dir).expanduser() if (dir or "").strip() else tools.WORKSPACE
+    if not target_dir.is_absolute():
+        target_dir = tools.WORKSPACE / target_dir
+    try:
+        target_dir = target_dir.resolve()
+    except OSError:
+        raise HTTPException(status_code=400, detail="目标目录无效")
+    if not target_dir.is_dir():
+        raise HTTPException(status_code=400, detail="目标目录不存在")
+    fn = Path(file.filename or "file").name
+    dest = target_dir / fn
+    if dest.exists():
+        raise HTTPException(status_code=409, detail=f"已存在同名文件：{fn}")
+    _UPLOAD_TO_MAX = 500 * 1024 * 1024
+    written = 0
+    try:
+        with open(dest, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > _UPLOAD_TO_MAX:
+                    out.close()
+                    dest.unlink(missing_ok=True)
+                    raise HTTPException(status_code=413, detail="文件超过 500MB")
+                out.write(chunk)
+    except HTTPException:
+        raise
+    except Exception as e:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail=f"写入失败：{e}") from e
+    return {"ok": True, "name": fn, "dir": str(target_dir)}
+
+
 @app.get("/api/files", dependencies=[Depends(check_token)])
 async def api_files():
     """列出工作区文件（@ 引用候选）"""
@@ -1632,6 +1678,68 @@ async def api_browse(path: str = ""):
     return {"path": str(target), "parent": parent, "entries": entries, "select": select}
 
 
+class _FsReq(BaseModel):
+    op: str
+    path: str
+    path2: str = ""
+
+
+@app.post("/api/fs", dependencies=[Depends(check_token)])
+async def api_fs(req: _FsReq):
+    """文件面板的右键操作：rename / delete / copy / move / mkdir。
+
+    面板本来就能浏览任意目录（/api/browse、/api/preview 都认绝对路径），
+    所以这里同样不做工作区限制——这些是用户在面板上手动点的操作，
+    不是 AI 越权读文件。仅做基础防护：目标不能是根目录、不能覆盖自身。
+    """
+    op = req.op
+    try:
+        p = Path(req.path).expanduser().resolve()
+    except OSError:
+        return {"ok": False, "error": "路径无效"}
+    # 根目录和家目录本身不给动，防止手滑把整个盘删了
+    if op in ("delete", "rename", "move") and (p == Path(p.anchor) or p == Path.home()):
+        return {"ok": False, "error": "不允许对根目录/家目录执行此操作"}
+
+    try:
+        if op == "delete":
+            if p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p)
+            else:
+                p.unlink(missing_ok=True)
+        elif op == "mkdir":
+            # path 是父目录，path2 是目录名
+            name = (req.path2 or "").strip()
+            if not name or "/" in name or name in (".", ".."):
+                return {"ok": False, "error": "目录名不合法"}
+            (p / name).mkdir(parents=False, exist_ok=False)
+        elif op in ("rename", "move", "copy"):
+            p2 = Path(req.path2).expanduser().resolve()
+            if p2 == p:
+                return {"ok": False, "error": "源和目标相同"}
+            if p2.exists():
+                return {"ok": False, "error": "目标已存在"}
+            p2.parent.mkdir(parents=True, exist_ok=True)
+            if op == "rename" or op == "move":
+                shutil.move(str(p), str(p2))
+            else:
+                if p.is_dir():
+                    shutil.copytree(p, p2)
+                else:
+                    shutil.copy2(p, p2)
+        else:
+            return {"ok": False, "error": "未知操作"}
+    except FileNotFoundError:
+        return {"ok": False, "error": "文件不存在"}
+    except FileExistsError:
+        return {"ok": False, "error": "目标已存在"}
+    except PermissionError:
+        return {"ok": False, "error": "没有权限"}
+    except OSError as e:
+        return {"ok": False, "error": f"操作失败：{e}"}
+    return {"ok": True}
+
+
 @app.get("/api/terminal", dependencies=[Depends(check_token)])
 async def api_terminal():
     """当前正在跑（或刚跑完）的那条命令，给右侧终端面板轮询
@@ -1685,7 +1793,12 @@ async def api_terminal_input(payload: dict):
 
 @app.post("/api/terminal/run", dependencies=[Depends(check_token)])
 async def api_terminal_run(payload: dict):
-    """面板里手动执行一条命令（终端 tab 的输入框）"""
+    """面板里手动执行一条命令（终端 tab 的输入框）
+
+    改造后：起一个真 PTY 会话（ptyprocess），不再走 script -qefc 模拟。
+    命令的生命周期由前端 /ws/terminal WebSocket 接管——输出实时推流，
+    按键实时写回。这里只负责「起命令 + 审批」，不阻塞等待输出。
+    """
     cmd = str(payload.get("command") or "").strip()
     if not cmd:
         raise HTTPException(status_code=400, detail="命令为空")
@@ -1705,20 +1818,89 @@ async def api_terminal_run(payload: dict):
                           "device": store.turn.get("device") or ""}
         return {"ok": False, "pending": True,
                 "description": pending_action["description"]}
-    # 串行执行：面板和后端共用一份 CURRENT_CMD，两条命令并行会互相覆盖状态
+    # 串行执行：面板同一时间只有一条 PTY 会话
     lock = _term_lock_get()
     if lock.locked():
         raise HTTPException(status_code=409, detail="上一条命令还在执行")
     async with lock:
         try:
-            # tty=True：面板里敲的命令起伪终端。不开的话 stdin 是 /dev/null，
-            # 编辑器、ssh、带确认的安装器都会报「stdin is not a TTY」直接退出
-            out = await tools.execute("run_command",
-                                      {"command": cmd, "reason": "面板手动执行", "tty": True})
+            cols = int(payload.get("cols") or 120)
+            rows = int(payload.get("rows") or 36)
+            sess = await tools.start_pty_session(
+                cmd, cols=cols, rows=rows, reason="面板手动执行")
         except Exception as e:
             return {"ok": False, "output": f"执行失败：{e}"}
-    # 面板靠轮询 /api/terminal 收尾，这里顺带把最终状态带回去，省一次往返
-    return {"ok": True, "output": out, "state": tools.CURRENT_CMD}
+    # 返回会话 id（用 pid），前端拿它连 WebSocket
+    return {"ok": True, "pid": sess.proc.pid,
+            "state": {k: v for k, v in tools.CURRENT_CMD.items() if k != "_pty"}}
+
+
+@app.websocket("/ws/terminal")
+async def ws_terminal(ws: WebSocket, token: str = Query(default="")):
+    """终端专用 WebSocket：PTY ↔ xterm.js 双向字节流透传
+
+    协议（JSON 帧）：
+      前端 → 后端：
+        {"type":"input","data":"<base64 字节>"}   按键写入 PTY stdin
+        {"type":"resize","cols":N,"rows":N}        窗口尺寸变化
+        {"type":"stop"}                            终止当前 PTY 会话
+      后端 → 前端：
+        {"type":"output","data":"<base64 字节>"}   PTY stdout 推流
+        {"type":"exited","code":N}                 PTY 进程退出
+        {"type":"error","msg":"..."}               出错
+
+    用 base64 传字节：WebSocket 文本帧不能塞任意字节，二进制帧又不好混 JSON 头。
+    """
+    if not _norm_token(TOKEN) or _norm_token(token) != _norm_token(TOKEN):
+        await ws.accept()
+        await ws.close(code=4401)
+        return
+    await ws.accept()
+    sess = tools.get_active_pty()
+    if sess is None:
+        await ws.send_json({"type": "error", "msg": "没有活跃的终端会话"})
+        await ws.close()
+        return
+    import base64
+
+    async def _push_output():
+        """从 PTY 输出队列取字节，推给前端"""
+        while sess.is_alive() or not sess.out_q.empty():
+            chunk = await sess.out_q.get()
+            if not chunk:
+                # 哨兵：PTY 已退出
+                break
+            await ws.send_json({"type": "output",
+                                "data": base64.b64encode(chunk).decode("ascii")})
+        # 推退出码
+        await ws.send_json({"type": "exited", "code": sess.exit_code})
+
+    push_task = asyncio.create_task(_push_output())
+    try:
+        while True:
+            data = await ws.receive_json()
+            t = data.get("type")
+            if t == "input":
+                raw = base64.b64decode(data.get("data") or "")
+                if raw:
+                    sess.write(raw)
+            elif t == "resize":
+                cols = int(data.get("cols") or 120)
+                rows = int(data.get("rows") or 36)
+                sess.resize(cols, rows)
+            elif t == "stop":
+                sess.stop()
+                break
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        push_task.cancel()
+        try:
+            await push_task
+        except asyncio.CancelledError:
+            pass
 
 
 @app.get("/files/{path:path}", dependencies=[Depends(check_token)])
@@ -2742,6 +2924,42 @@ async def api_sysinfo():
     return await asyncio.to_thread(_read_sysinfo)
 
 
+def _battery_minutes(status: str, capacity: str) -> int | None:
+    """估算「还有多久充满 / 还能用多久」，单位分钟，估不出来返回 None
+
+    优先用内核导出的 time_to_full_now / time_to_empty_now（单位分钟）；
+    SteamOS 的 BAT1 没这两个文件，就退回到 charge_now / current_now 自己算。
+    充满（Full）或数值不合理时返回 None，让前端显示「已充满」或干脆不显示。
+    """
+    try:
+        if status == "Full":
+            return 0
+        field = "time_to_full_now" if status == "Charging" else "time_to_empty_now"
+        raw = read_first(f"/sys/class/power_supply/BAT1/{field}")
+        if raw.lstrip("-").isdigit() and int(raw) > 0:
+            return int(raw)
+
+        cur = int(read_first("/sys/class/power_supply/BAT1/current_now") or 0)
+        if cur <= 0:
+            return None
+        if status == "Charging":
+            now = int(read_first("/sys/class/power_supply/BAT1/charge_now") or 0)
+            full = int(read_first("/sys/class/power_supply/BAT1/charge_full") or 0)
+            remain = full - now
+        else:
+            # 放电：用当前电量除以电流。capacity 是百分比，用 charge_full
+            # 折算成实际容量，比直接拿 charge_now 更抗驱动单位差异
+            now = int(read_first("/sys/class/power_supply/BAT1/charge_now") or 0)
+            remain = now
+        if remain <= 0:
+            return None
+        minutes = int(remain / cur * 60)
+        # 超过 20 小时基本是读数异常（刚插上电流极小），不如不显示
+        return minutes if 0 < minutes <= 20 * 60 else None
+    except Exception:
+        return None
+
+
 def _read_sysinfo() -> dict:
     try:
         import psutil
@@ -2749,7 +2967,6 @@ def _read_sysinfo() -> dict:
         data = {
             "cpu": psutil.cpu_percent(),
             "mem_pct": vm.percent, "mem_used": vm.used, "mem_total": vm.total,
-            "uptime": int(time.time() - psutil.boot_time()),
             "ip": _lan_ip(),
             # 设备名：优先用户自己设的 hostname（SteamOS 默认 deck@steamdeck）
             "hostname": socket.gethostname(),
@@ -2764,6 +2981,11 @@ def _read_sysinfo() -> dict:
         charging = read_first("/sys/class/power_supply/BAT1/status")
         data["battery"] = int(battery) if battery.isdigit() else None
         data["charging"] = charging or None
+        # 剩余时间：SteamOS 的 BAT1 驱动不导出 time_to_full_now / time_to_empty_now，
+        # 只给 charge_now / charge_full / current_now（单位 µAh、µA），
+        # 所以自己按「待补/待放容量 ÷ 电流」估算，结果换回秒。
+        # current_now 在充满或拔插瞬间可能为 0 或异常小，除零和天文数字都要挡掉。
+        data["battery_minutes"] = _battery_minutes(charging, battery)
         data.update(_sd_card_info())
         return data
     except Exception as e:
